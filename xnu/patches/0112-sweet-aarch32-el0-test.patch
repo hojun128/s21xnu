@@ -1,0 +1,62 @@
+--- a/osfmk/arm64/locore.s
++++ b/osfmk/arm64/locore.s
+@@ -284,6 +284,30 @@
+ 	MAP_KERNEL
+ 	BRANCH_TO_KVA_VECTOR el0_serror_vector_64_long, 11
+ 
++
++	.text
++	.align 7
++Lel0_synchronous_vector_32:
++	MAP_KERNEL
++	BRANCH_TO_KVA_VECTOR el0_synchronous_vector_64_long, 8
++
++	.text
++	.align 7
++Lel0_irq_vector_32:
++	MAP_KERNEL
++	BRANCH_TO_KVA_VECTOR el0_irq_vector_64_long, 9
++
++	.text
++	.align 7
++Lel0_fiq_vector_32:
++	MAP_KERNEL
++	BRANCH_TO_KVA_VECTOR el0_fiq_vector_64_long, 10
++
++	.text
++	.align 7
++Lel0_serror_vector_32:
++	MAP_KERNEL
++	BRANCH_TO_KVA_VECTOR el0_serror_vector_64_long, 11
+ 	/* Fill out the rest of the page */
+ 	.align 12
+ 
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -694,11 +694,26 @@
+ 	}
+ 
+ 	switch (class) {
++	case ESR_EC_SVC_32:
++		kprintf("SWEET: svc32 enter\n");
++		if (!is_saved_state64(state) || !is_user) {
++			panic("Invalid SVC_32 context");
++		}
++		saved_state64(state)->x[16] = (uint64_t)(int64_t)(int32_t)saved_state64(state)->x[12];
++		handle_svc(state);
++		break;
++
+ 	case ESR_EC_SVC_64:
+ 		if (!is_saved_state64(state) || !is_user) {
+ 			panic("Invalid SVC_64 context");
+ 		}
+ 
++		if (saved_state64(state)->x[16] == 0x53570001ULL) { /* SWEET test: enter AArch32 */
++			kprintf("SWEET: to aarch32\n");
++			set_saved_state_pc(state, saved_state64(state)->x[0]);
++			set_saved_state_cpsr(state, PSR64_USER32_DEFAULT);
++			break;
++		}
+ 		handle_svc(state);
+ 		break;
+ 
