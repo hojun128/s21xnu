@@ -1,0 +1,45 @@
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index 1161432..ab182c2 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -133,2 +133,6 @@
+ #include <kern/backtrace.h>
++#if defined(__arm64__)
++#include <mach/machine/thread_status.h>
++#include <arm/thread.h>
++#endif
+ 
+@@ -1819,2 +1823,24 @@ proc_handle_critical_exit(proc_t p, int rv)
+ 
++	char sweet_ufd[320];
++	sweet_ufd[0] = 0;
++#if defined(__arm64__)
++	{
++		/* SWEET UFAULT diag: user fault state of the dying initproc thread */
++		arm_saved_state_t *sweet_ss = get_user_regs(current_thread());
++		if (sweet_ss != NULL && is_saved_state64(sweet_ss)) {
++			uint32_t sweet_ins[4] = {0, 0, 0, 0};
++			(void)copyin((user_addr_t)get_saved_state_pc(sweet_ss), sweet_ins, sizeof(sweet_ins));
++			snprintf(sweet_ufd, sizeof(sweet_ufd),
++				"SWEET UFAULT pc 0x%llx lr 0x%llx sp 0x%llx far 0x%llx esr 0x%x x0 0x%llx x1 0x%llx x2 0x%llx x16 0x%llx code %08x %08x %08x %08x",
++				(unsigned long long)get_saved_state_pc(sweet_ss), (unsigned long long)get_saved_state_lr(sweet_ss),
++				(unsigned long long)get_saved_state_sp(sweet_ss), (unsigned long long)get_saved_state_far(sweet_ss),
++				(unsigned)get_saved_state_esr(sweet_ss),
++				(unsigned long long)get_saved_state_reg(sweet_ss, 0), (unsigned long long)get_saved_state_reg(sweet_ss, 1),
++				(unsigned long long)get_saved_state_reg(sweet_ss, 2), (unsigned long long)get_saved_state_reg(sweet_ss, 16),
++				sweet_ins[0], sweet_ins[1], sweet_ins[2], sweet_ins[3]);
++			printf("%s\n", sweet_ufd);
++		}
++	}
++#endif
++
+ 	proc_crash_coredump(p);
+@@ -1827,6 +1853,6 @@ proc_handle_critical_exit(proc_t p, int rv)
+ 	} else {
+-		panic_with_options(0, NULL, DEBUGGER_OPTION_INITPROC_PANIC, "%s %s -- exit reason namespace %d subcode 0x%llx description: %." LAUNCHD_PANIC_REASON_STRING_MAXLEN "s",
++		panic_with_options(0, NULL, DEBUGGER_OPTION_INITPROC_PANIC, "%s %s -- exit reason namespace %d subcode 0x%llx description: %." LAUNCHD_PANIC_REASON_STRING_MAXLEN "s [%s]",
+ 		    ((proc_getcsflags(p) & CS_KILLED) ? "CS_KILLED" : ""),
+ 		    prefix_str, p->p_exit_reason->osr_namespace, p->p_exit_reason->osr_code,
+-		    exit_reason_desc ? exit_reason_desc : "none");
++		    exit_reason_desc ? exit_reason_desc : "none", sweet_ufd);
+ 	}
