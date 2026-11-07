@@ -379,6 +379,11 @@ void shim_main(uint64_t dtb)
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
+	{
+		uint64_t t0 = now();
+		while (now() - t0 < 26000000UL * 25)	/* keep the loader result on screen ~25 s */
+			;
+	}
 
 	stage = "fill off";
 	uint64_t fill_off = ticks_fill(RED);
