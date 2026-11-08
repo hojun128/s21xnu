@@ -1,7 +1,16 @@
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -401,9 +401,384 @@
+@@ -244,7 +244,7 @@
+ 
+ static struct bbi2c ts_i2c, pmic_i2c;
+ 
+-static char summary[1024];
++static char summary[3072];
+ static void note(const char *fmt, ...) __printflike(1, 2);
+ static void
+ note(const char *fmt, ...)
+@@ -401,9 +401,405 @@
  			    last[0], last[1], last[2], last[3], last[4], last[5], last[6], last[7]);
  		}
  		ts_block_us(ts_g_poll_us ? ts_g_poll_us : 8000U);
@@ -33,7 +42,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	if (bus_idle_high(b)) {
 +		ts_pud_used[which] = orig;
 +		return 1; /* already high */
-+	}
+ 	}
 +	for (int w = 2; w <= 4; w += 2) {
 +		uint32_t v = orig, m = (1U << w) - 1U;
 +		uint32_t pins[2] = { b->scl_bit, b->sda_bit };
@@ -50,8 +59,8 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	*(volatile uint32_t *)(b->bank_va + REG_PUD) = orig;
 +	ts_pud_used[which] = orig;
 +	return 0;
-+}
-+
+ }
+ 
 +/* free a slave that is holding SDA low: up to 9 SCL pulses, then STOP */
 +static void
 +bus_recover(struct bbi2c *b)
@@ -223,7 +232,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	if (io < 0 || av < 0) {
 +		note("rails: acpm read failed (io=%d av=%d)", io, av);
 +		return;
- 	}
++	}
 +	if (!force && ((io & 0x3F) != 0x2C || (av & 0x3F) != 0x30)) {
 +		note("rails: unexpected vsel, not writing (touch_rail=2 forces)");
 +		return;
@@ -234,8 +243,8 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	sleep_us(30000);
 +	note("rails on ret %d/%d after io=%02x av=%02x", r1 < 0 ? -1 : (int)((r1 >> 24) & 0xFF),
 +	    r2 < 0 ? -1 : (int)((r2 >> 24) & 0xFF), acpm_read(0, 0x5F) & 0xFF, acpm_read(1, 0x54) & 0xFF);
- }
- 
++}
++
 +/* ------------------------------------------------------------------------ */
 +/* ------------------------------------------------------------------------ */
 +/* GPU step 4 (gpu_diag=3): the GPU's MMU and one WRITE_VALUE job. Page      */
@@ -248,65 +257,84 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +#define GJ_VA_JOB   0x10000000ULL
 +#define GJ_VA_OUT   0x10001000ULL
 +
++/* one job: identity (no page tables) or paged; NULL (type 1) or WRITE_VALUE (type 2) */
 +static void
-+s21_gpu_job(vm_offset_t g, uint64_t sp, uint32_t shp)
++gj_run(vm_offset_t g, volatile uint32_t *w, uint64_t sp, uint32_t shp, int identity, int jobtype, const char *tag)
 +{
-+	vm_offset_t m = ml_io_map((vm_offset_t)sp, 0x10000);
-+	volatile uint32_t *w = (volatile uint32_t *)m;
 +	uint32_t i, t0, stat = 0;
-+	uint64_t pgd = sp, pud = sp + 0x1000, pmd = sp + 0x2000, pt = sp + 0x3000;
 +	uint64_t jobpa = sp + 0x4000, outpa = sp + 0x5000;
-+	const uint64_t ATTR = (3ULL << 8) | (1ULL << 10) | (1ULL << 6) | 3ULL; /* inner-shared, AF, RW, page */
++	uint64_t jobva = identity ? jobpa : GJ_VA_JOB, outva = identity ? outpa : GJ_VA_OUT;
++	const uint64_t ATTR = (3ULL << 8) | (1ULL << 10) | (1ULL << 6) | 3ULL;
 +
 +	for (i = 0; i < 0x6000 / 4; i++) {
 +		w[i] = 0;
 +	}
 +	#define PUT64(off, v) do { w[(off) / 4] = (uint32_t)(v); w[(off) / 4 + 1] = (uint32_t)((uint64_t)(v) >> 32); } while (0)
-+	PUT64(0x0000U, pud | 3ULL);                      /* L0[0]  -> L1  */
-+	PUT64(0x1000U, pmd | 3ULL);                      /* L1[0]  -> L2  */
-+	PUT64(0x2000U + 8U * 0x80U, pt | 3ULL);          /* L2[128] -> L3 (VA 0x10000000) */
-+	PUT64(0x3000U + 8U * 0U, jobpa | ATTR);          /* L3[0]  job page */
-+	PUT64(0x3000U + 8U * 1U, outpa | ATTR);          /* L3[1]  output page */
-+	/* WRITE_VALUE job: 32-byte header + {address, type, reserved, value} */
-+	w[0x4000 / 4 + 4] = (2U << 1) | 1U;              /* byte 16: 64-bit descriptor, type WRITE_VALUE */
-+	PUT64(0x4000U + 24U, 0ULL);                      /* next job */
-+	PUT64(0x4000U + 32U, GJ_VA_OUT);                 /* where to write */
-+	w[0x4000 / 4 + 10] = 6U;                         /* value type: immediate 32 */
-+	PUT64(0x4000U + 48U, 0xC0FFEE01ULL);
++	PUT64(0x0000U, (sp + 0x1000) | 3ULL);
++	PUT64(0x1000U, (sp + 0x2000) | 3ULL);
++	PUT64(0x2000U + 8U * 0x80U, (sp + 0x3000) | 3ULL);
++	PUT64(0x3000U + 8U * 0U, jobpa | ATTR);
++	PUT64(0x3000U + 8U * 1U, outpa | ATTR);
++	w[0x4000 / 4 + 4] = ((uint32_t)jobtype << 1) | 1U;
++	if (jobtype == 2) {
++		PUT64(0x4000U + 32U, outva);
++		w[0x4000 / 4 + 10] = 6U;
++		PUT64(0x4000U + 48U, 0xC0FFEE01ULL);
++	}
 +	w[0x5000 / 4] = 0xDEADBEEFU;
 +	#undef PUT64
 +	__asm__ volatile ("dsb sy" ::: "memory");
-+	note("gpu4: tables+job built at %llx, out before=%08x", sp, w[0x5000 / 4]);
 +
-+	/* address space 0: LPAE translation table, write-back attributes */
-+	GJ_GR(g, GJ_AS0 + 0x00) = (uint32_t)(pgd | 3ULL | (1ULL << 2));
-+	GJ_GR(g, GJ_AS0 + 0x04) = (uint32_t)(pgd >> 32);
++	if (identity) {
++		GJ_GR(g, GJ_AS0 + 0x00) = 2U;                /* LPAE ADRMODE_IDENTITY */
++		GJ_GR(g, GJ_AS0 + 0x04) = 0;
++	} else {
++		GJ_GR(g, GJ_AS0 + 0x00) = (uint32_t)(sp | 3ULL | (1ULL << 2));
++		GJ_GR(g, GJ_AS0 + 0x04) = (uint32_t)(sp >> 32);
++	}
 +	GJ_GR(g, GJ_AS0 + 0x08) = 0x00008D88U;
 +	GJ_GR(g, GJ_AS0 + 0x0C) = 0x00008D88U;
 +	for (t0 = 0; t0 < 100 && (GJ_GR(g, GJ_AS0 + 0x28) & 1U); t0++) { sleep_us(100); }
-+	GJ_GR(g, GJ_AS0 + 0x18) = 1U;                    /* AS_COMMAND_UPDATE */
++	GJ_GR(g, GJ_AS0 + 0x18) = 1U;
 +	for (t0 = 0; t0 < 100 && (GJ_GR(g, GJ_AS0 + 0x28) & 1U); t0++) { sleep_us(100); }
-+	note("gpu4: as0 status=%08x mmu raw=%08x", GJ_GR(g, GJ_AS0 + 0x28), GJ_GR(g, 0x2000));
-+	GJ_GR(g, 0x2004) = 0xFFFFFFFFU;                  /* MMU_INT_CLEAR */
-+	GJ_GR(g, 0x1004) = 0xFFFFFFFFU;                  /* JOB_INT_CLEAR */
++	GJ_GR(g, 0x2004) = 0xFFFFFFFFU;
++	GJ_GR(g, 0x1004) = 0xFFFFFFFFU;
++	GJ_GR(g, 0x024) = 0xFFFFFFFFU;
 +
-+	/* slot 1: head, affinity (lowest present core), config, start */
-+	GJ_GR(g, GJ_JS1 + 0x40) = (uint32_t)GJ_VA_JOB;
-+	GJ_GR(g, GJ_JS1 + 0x44) = (uint32_t)(GJ_VA_JOB >> 32);
++	GJ_GR(g, GJ_JS1 + 0x40) = (uint32_t)jobva;
++	GJ_GR(g, GJ_JS1 + 0x44) = (uint32_t)(jobva >> 32);
 +	GJ_GR(g, GJ_JS1 + 0x50) = shp & (~shp + 1U);
 +	GJ_GR(g, GJ_JS1 + 0x54) = 0;
-+	GJ_GR(g, GJ_JS1 + 0x58) = 0U /* AS0 */ | (3U << 8) | (1U << 10) | (3U << 12) | (8U << 16);
-+	GJ_GR(g, GJ_JS1 + 0x60) = 1U;                    /* JS_COMMAND_NEXT = START */
-+	for (t0 = 0; t0 < 500; t0++) {
-+		stat = GJ_GR(g, 0x1000);                     /* JOB_INT_RAWSTAT */
++	GJ_GR(g, GJ_JS1 + 0x58) = (3U << 8) | (1U << 10) | (3U << 12) | (8U << 16);
++	GJ_GR(g, GJ_JS1 + 0x60) = 1U;
++	for (t0 = 0; t0 < 100; t0++) {
++		stat = GJ_GR(g, 0x1000);
 +		if (stat & ((1U << 1) | (1U << 17))) { break; }
 +		sleep_us(1000);
 +	}
 +	__asm__ volatile ("dsb sy" ::: "memory");
-+	note("gpu4: job raw=%08x after %ums js1stat=%08x head=%08x", stat, t0, GJ_GR(g, GJ_JS1 + 0x24), GJ_GR(g, GJ_JS1 + 0x00));
-+	note("gpu4: mmu raw=%08x fault st=%08x addr=%08x", GJ_GR(g, 0x2000), GJ_GR(g, GJ_AS0 + 0x1C), GJ_GR(g, GJ_AS0 + 0x20));
-+	note("gpu4: job exc=%08x out after=%08x%s", w[0x4000 / 4], w[0x5000 / 4], w[0x5000 / 4] == 0xC0FFEE01U ? " THE GPU WROTE IT" : "");
-+	GJ_GR(g, GJ_AS0 + 0x00) = 0;                     /* leave AS0 unmapped */
++	note("%s: raw=%x %ums js=%x as=%x mmu=%x flt=%x/%x gpu=%x out=%x exc=%x", tag, stat, t0,
++	    GJ_GR(g, GJ_JS1 + 0x24), GJ_GR(g, GJ_AS0 + 0x28), GJ_GR(g, 0x2000),
++	    GJ_GR(g, GJ_AS0 + 0x1C), GJ_GR(g, GJ_AS0 + 0x20), GJ_GR(g, 0x020), w[0x5000 / 4], w[0x4000 / 4]);
++	if (!(stat & ((1U << 1) | (1U << 17)))) {
++		GJ_GR(g, GJ_JS1 + 0x60) = 3U;                /* HARD_STOP */
++		sleep_us(20000);
++		note("%s: after hard stop js=%x raw=%x", tag, GJ_GR(g, GJ_JS1 + 0x24), GJ_GR(g, 0x1000));
++	}
++	GJ_GR(g, 0x1004) = 0xFFFFFFFFU;
++}
++
++static void
++s21_gpu_job(vm_offset_t g, uint64_t sp, uint32_t shp)
++{
++	vm_offset_t m = ml_io_map((vm_offset_t)sp, 0x10000);
++	volatile uint32_t *w = (volatile uint32_t *)m;
++
++	gj_run(g, w, sp, shp, 1, 1, "id-null");
++	gj_run(g, w, sp, shp, 1, 2, "id-wr");
++	gj_run(g, w, sp, shp, 0, 1, "pg-null");
++	gj_run(g, w, sp, shp, 0, 2, "pg-wr");
++	GJ_GR(g, GJ_AS0 + 0x00) = 0;
 +	GJ_GR(g, GJ_AS0 + 0x04) = 0;
 +	GJ_GR(g, GJ_AS0 + 0x18) = 1U;
 +}
@@ -327,11 +355,13 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +		/* Mali GPU_CONTROL block, offsets from the SM-G991N kbase gpu_regmap.h; reads only */
 +		vm_offset_t g = ml_io_map(0x18500000U, 0x1000);
 +#define GR(o) (*(volatile uint32_t *)(g + (o)))
-+		note("gpu id=%08x l2f=%08x tilf=%08x memf=%08x", GR(0x000), GR(0x004), GR(0x00C), GR(0x010));
-+		note("mmuf=%08x as=%08x js=%08x stat=%08x raw=%08x", GR(0x014), GR(0x018), GR(0x01C), GR(0x034), GR(0x020));
-+		note("thr max=%08x wg=%08x bar=%08x feat=%08x", GR(0x0A0), GR(0x0A4), GR(0x0A8), GR(0x0AC));
-+		note("shader pres=%08x/%08x rdy=%08x tiler pres=%08x rdy=%08x", GR(0x100), GR(0x104), GR(0x140), GR(0x110), GR(0x150));
-+		note("l2 pres=%08x rdy=%08x coh=%08x js0f=%08x js1f=%08x", GR(0x120), GR(0x160), GR(0x300), GR(0x0C0), GR(0x0C4));
++		if (level < 3) {
++			note("gpu id=%08x l2f=%08x tilf=%08x memf=%08x", GR(0x000), GR(0x004), GR(0x00C), GR(0x010));
++			note("mmuf=%08x as=%08x js=%08x stat=%08x raw=%08x", GR(0x014), GR(0x018), GR(0x01C), GR(0x034), GR(0x020));
++			note("thr max=%08x wg=%08x bar=%08x feat=%08x", GR(0x0A0), GR(0x0A4), GR(0x0A8), GR(0x0AC));
++			note("shader pres=%08x/%08x rdy=%08x tiler pres=%08x rdy=%08x", GR(0x100), GR(0x104), GR(0x140), GR(0x110), GR(0x150));
++			note("l2 pres=%08x rdy=%08x coh=%08x js0f=%08x js1f=%08x", GR(0x120), GR(0x160), GR(0x300), GR(0x0C0), GR(0x0C4));
++		}
 +		if (level >= 2) {
 +			/* power-up of the GPU's own blocks through GPU_CONTROL, as panfrost does: */
 +			/* L2 first, then the core stack (if the GPU has one), tiler, shaders.      */
@@ -386,7 +416,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  void sweet_touch_init(void);
  
  void
-@@ -438,6 +813,39 @@
+@@ -438,6 +834,39 @@
  	/* ATTN as input, weak pull-up (matches the DTS's tsp_attn_input state) */
  	pin_func(attn_va, ATTN_BIT, FUNC_INPUT);
  
@@ -426,7 +456,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	if (touch_ts == 4) {
  		uint32_t tcon = *(volatile uint32_t *)(ts_bus_va + REG_CON);
  		uint32_t pcon = *(volatile uint32_t *)(pmic_bus_va + REG_CON);
-@@ -521,8 +929,12 @@
+@@ -521,8 +950,12 @@
  	for (tries = 0; tries < 4 && got; tries++) {
  		cmd = SEC_TS_READ_DEVICE_ID;
  		got = i2c_write_read(&ts_i2c, SEC_TS_ADDR, &cmd, 1, id, 5);
@@ -440,7 +470,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  			uint8_t w[2] = { S2DOS05_EN, 0 }, en;
  			if (!i2c_write_read(&pmic_i2c, S2DOS05_ADDR, w, 1, &en, 1)) {
  				w[1] = (uint8_t)(en & ~((1U << 1) | (1U << 2)));
-@@ -530,7 +942,7 @@
+@@ -530,7 +963,7 @@
  				sleep_us(100000);
  			}
  			s2dos05_power(1);
