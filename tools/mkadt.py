@@ -77,6 +77,11 @@ def node(name, props=(), children=()):
 def build(seed=None, qemu=False, highmem=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    if highmem and '--gpu-scratch' in sys.argv:
+        # keep the top 2 MiB of the dram window out of XNU: scratch RAM for GPU bring-up
+        # (page tables, job, output). Pass it to the kernel as boot-arg gpu_scratch=<phys>.
+        mem_size -= 0x200000
+        print(f'gpu_scratch=0x{phys_base + mem_size:x}', file=sys.stderr)
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
