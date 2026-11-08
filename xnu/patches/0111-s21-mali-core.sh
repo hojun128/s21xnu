@@ -1,0 +1,385 @@
+#!/bin/bash
+# S21 (Exynos 2100) Mali-G78 core driver (power, GPU page tables, job submit, self-test).
+# dxb runs patches/*.sh from the XNU source root before applying *.patch.
+set -euo pipefail
+
+[[ "${MACHINE_CONFIG:-}" == SWEET ]] || exit 0
+[[ -f bsd/conf/files ]] || exit 1
+
+cat > bsd/dev/sweet_mali.c <<'EOF_SWEET_MALI'
+/*
+ * S21 (Exynos 2100) Mali-G78 core driver, step A1: power, GPU page tables, job submit.
+ * Everything here was measured on the phone first (see the gpu_diag notes in
+ * sweet_touch.c): GPU_ID 0x92020010, 14 shader cores, 3 job slots (Job Manager),
+ * 8 address spaces, LPAE page-table mode. S-Boot leaves the G3D domain on and the
+ * GPU's L2/tiler/shaders off. Polling only (the three GPU IRQ lines stay masked).
+ *
+ * Boot-args: mali=1 (power on, self-test, leave powered), gpu_scratch=<phys> (RAM that
+ * XNU does not manage, mkadt --gpu-scratch), mali_pages=<n> (pool size in 4K pages).
+ */
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <kern/clock.h>
+#include <libkern/libkern.h>
+#include <pexpert/pexpert.h>
+#include <stdarg.h>
+
+extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern void s21_plog(const char *line);
+
+#define MALI_PHYS        0x18500000U
+#define MALI_SIZE        0x5000U
+#define R_GPU_ID         0x000U
+#define R_AS_PRESENT     0x018U
+#define R_JS_PRESENT     0x01CU
+#define R_GPU_IRQ_RAW    0x020U
+#define R_GPU_IRQ_CLEAR  0x024U
+#define R_GPU_IRQ_MASK   0x028U
+#define R_GPU_CMD        0x030U
+#define R_GPU_STATUS     0x034U
+#define R_SHADER_PRESENT 0x100U
+#define R_TILER_PRESENT  0x110U
+#define R_L2_PRESENT     0x120U
+#define R_SHADER_READY   0x140U
+#define R_TILER_READY    0x150U
+#define R_L2_READY       0x160U
+#define R_SHADER_PWRON   0x180U
+#define R_TILER_PWRON    0x190U
+#define R_L2_PWRON       0x1A0U
+#define R_SHADER_PWROFF  0x1C0U
+#define R_TILER_PWROFF   0x1D0U
+#define R_L2_PWROFF      0x1E0U
+#define R_JOB_IRQ_RAW    0x1000U
+#define R_JOB_IRQ_CLEAR  0x1004U
+#define R_JOB_IRQ_MASK   0x1008U
+#define R_MMU_IRQ_RAW    0x2000U
+#define R_MMU_IRQ_CLEAR  0x2004U
+#define R_MMU_IRQ_MASK   0x2008U
+#define R_AS(n, o)       (0x2400U + ((uint32_t)(n) << 6) + (o))
+#define R_JS(n, o)       (0x1800U + ((uint32_t)(n) << 7) + (o))
+
+#define GPU_CMD_SOFT_RESET 1U
+#define JS_COMMAND_START   1U
+#define JS_COMMAND_HARD_STOP 3U
+#define AS_COMMAND_UPDATE  1U
+
+/* page entry bits, Mali LPAE: table = pa|3, leaf = pa|1|AF|SH|R|W (leaf type is 1, not 3) */
+#define PTE_TABLE   3ULL
+#define PTE_LEAF    (1ULL | (1ULL << 6) | (1ULL << 7) | (1ULL << 10) | (3ULL << 8))
+
+struct mali_ctx {
+	uint64_t pgd_pa;
+	int      as;
+};
+
+static struct {
+	vm_offset_t reg;
+	vm_offset_t pool_va;
+	uint64_t    pool_pa;
+	uint32_t    pool_pages, pool_next;
+	uint32_t    shader_present, tiler_present, l2_present, as_present, js_present, gpu_id;
+	int         up, powered;
+} mali;
+
+static void mali_log(const char *fmt, ...) __printflike(1, 2);
+static void
+mali_log(const char *fmt, ...)
+{
+	char line[192];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	printf("sweet_mali: %s\n", line);
+	s21_plog(line);
+}
+
+static inline uint32_t
+rd(uint32_t off)
+{
+	return *(volatile uint32_t *)(mali.reg + off);
+}
+
+static inline void
+wr(uint32_t off, uint32_t v)
+{
+	*(volatile uint32_t *)(mali.reg + off) = v;
+}
+
+static void
+us(uint32_t n)
+{
+	delay_for_interval(n, NSEC_PER_USEC);
+}
+
+/* wait until (reg & mask) == want, in ms; returns elapsed ms or 0xFFFFFFFF on timeout */
+static uint32_t
+wait_reg(uint32_t off, uint32_t mask, uint32_t want, uint32_t ms)
+{
+	for (uint32_t t = 0; t < ms; t++) {
+		if ((rd(off) & mask) == want) {
+			return t;
+		}
+		us(1000);
+	}
+	return (rd(off) & mask) == want ? ms : 0xFFFFFFFFU;
+}
+
+/* ---- RAM pool: page tables and GPU buffers come from the unmanaged scratch window ---- */
+static uint64_t
+pool_alloc(void)
+{
+	if (mali.pool_next >= mali.pool_pages) {
+		return 0;
+	}
+	uint32_t i = mali.pool_next++;
+	volatile uint32_t *p = (volatile uint32_t *)(mali.pool_va + ((vm_offset_t)i << 12));
+	for (uint32_t k = 0; k < 1024; k++) {
+		p[k] = 0;
+	}
+	return mali.pool_pa + ((uint64_t)i << 12);
+}
+
+static volatile uint32_t *
+pa2va(uint64_t pa)
+{
+	return (volatile uint32_t *)(mali.pool_va + (vm_offset_t)(pa - mali.pool_pa));
+}
+
+/* ---- GPU contexts: one 4-level LPAE page table per address space ---- */
+static int
+ctx_init(struct mali_ctx *c, int as)
+{
+	c->as = as;
+	c->pgd_pa = pool_alloc();
+	return c->pgd_pa ? 0 : -1;
+}
+
+static uint64_t
+tbl_next(uint64_t table_pa, uint32_t idx)
+{
+	volatile uint32_t *t = pa2va(table_pa);
+	uint64_t e = (uint64_t)t[idx * 2] | ((uint64_t)t[idx * 2 + 1] << 32);
+	if (e & 1ULL) {
+		return e & 0x0000FFFFFFFFF000ULL;
+	}
+	uint64_t n = pool_alloc();
+	if (!n) {
+		return 0;
+	}
+	e = n | PTE_TABLE;
+	t[idx * 2] = (uint32_t)e;
+	t[idx * 2 + 1] = (uint32_t)(e >> 32);
+	return n;
+}
+
+/* map one 4 KiB page: va (48 bit) -> pa, read+write */
+static int
+ctx_map(struct mali_ctx *c, uint64_t va, uint64_t pa)
+{
+	uint64_t t1 = tbl_next(c->pgd_pa, (uint32_t)((va >> 39) & 0x1FF));
+	uint64_t t2 = t1 ? tbl_next(t1, (uint32_t)((va >> 30) & 0x1FF)) : 0;
+	uint64_t t3 = t2 ? tbl_next(t2, (uint32_t)((va >> 21) & 0x1FF)) : 0;
+	if (!t3) {
+		return -1;
+	}
+	uint32_t idx = (uint32_t)((va >> 12) & 0x1FF);
+	volatile uint32_t *t = pa2va(t3);
+	uint64_t e = (pa & 0x0000FFFFFFFFF000ULL) | PTE_LEAF;
+	t[idx * 2] = (uint32_t)e;
+	t[idx * 2 + 1] = (uint32_t)(e >> 32);
+	return 0;
+}
+
+static void
+ctx_activate(struct mali_ctx *c)
+{
+	uint32_t as = (uint32_t)c->as;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	wait_reg(R_AS(as, 0x28), 1U, 0U, 10);
+	wr(R_AS(as, 0x00), (uint32_t)(c->pgd_pa | 3ULL | (1ULL << 2)));
+	wr(R_AS(as, 0x04), (uint32_t)(c->pgd_pa >> 32));
+	wr(R_AS(as, 0x08), 0x8D88U);
+	wr(R_AS(as, 0x0C), 0x8D88U);
+	wr(R_AS(as, 0x18), AS_COMMAND_UPDATE);
+	wait_reg(R_AS(as, 0x28), 1U, 0U, 10);
+}
+
+static void
+ctx_deactivate(struct mali_ctx *c)
+{
+	uint32_t as = (uint32_t)c->as;
+	wr(R_AS(as, 0x00), 0);
+	wr(R_AS(as, 0x04), 0);
+	wr(R_AS(as, 0x18), AS_COMMAND_UPDATE);
+	wait_reg(R_AS(as, 0x28), 1U, 0U, 10);
+}
+
+/* ---- power ---- */
+static int
+power_block(uint32_t onreg, uint32_t rdyreg, uint32_t mask, int on, const char *name)
+{
+	if (on) {
+		wr(onreg, mask);
+	} else {
+		wr(onreg + 0x40U, mask);              /* PWROFF registers are PWRON + 0x40 */
+	}
+	uint32_t t = wait_reg(rdyreg, mask, on ? mask : 0U, 200);
+	if (t == 0xFFFFFFFFU) {
+		mali_log("%s %s timed out (ready=%x)", name, on ? "on" : "off", rd(rdyreg));
+		return -1;
+	}
+	return 0;
+}
+
+static int
+mali_power(int on)
+{
+	int r = 0;
+	if (on == mali.powered) {
+		return 0;
+	}
+	if (on) {
+		wr(R_GPU_IRQ_CLEAR, 0xFFFFFFFFU);
+		r |= power_block(R_L2_PWRON, R_L2_READY, mali.l2_present, 1, "l2");
+		r |= power_block(R_TILER_PWRON, R_TILER_READY, mali.tiler_present, 1, "tiler");
+		r |= power_block(R_SHADER_PWRON, R_SHADER_READY, mali.shader_present, 1, "shader");
+	} else {
+		r |= power_block(R_SHADER_PWRON, R_SHADER_READY, mali.shader_present, 0, "shader");
+		r |= power_block(R_TILER_PWRON, R_TILER_READY, mali.tiler_present, 0, "tiler");
+		r |= power_block(R_L2_PWRON, R_L2_READY, mali.l2_present, 0, "l2");
+	}
+	mali.powered = r ? mali.powered : on;
+	return r;
+}
+
+/* ---- job submission (polling) ---- */
+/* returns 0 on DONE, else the JS_STATUS exception code (or 0xFFFF on timeout) */
+static uint32_t
+mali_submit_wait(struct mali_ctx *c, uint32_t slot, uint64_t jc_va, uint32_t timeout_ms)
+{
+	uint32_t done = 1U << slot, fail = 1U << (slot + 16), raw = 0, t;
+	wr(R_JOB_IRQ_CLEAR, 0xFFFFFFFFU);
+	wr(R_MMU_IRQ_CLEAR, 0xFFFFFFFFU);
+	wr(R_JS(slot, 0x40), (uint32_t)jc_va);
+	wr(R_JS(slot, 0x44), (uint32_t)(jc_va >> 32));
+	wr(R_JS(slot, 0x50), mali.shader_present & (~mali.shader_present + 1U));
+	wr(R_JS(slot, 0x54), 0);
+	wr(R_JS(slot, 0x58), ((uint32_t)c->as) | (3U << 8) | (1U << 10) | (3U << 12) | (8U << 16));
+	wr(R_JS(slot, 0x60), JS_COMMAND_START);
+	for (t = 0; t < timeout_ms; t++) {
+		raw = rd(R_JOB_IRQ_RAW);
+		if (raw & (done | fail)) {
+			break;
+		}
+		us(1000);
+	}
+	if (!(raw & (done | fail))) {
+		uint32_t as = (uint32_t)c->as;
+		mali_log("job timeout slot %u js=%x mmu=%x fault=%x/%x", slot, rd(R_JS(slot, 0x24)), rd(R_MMU_IRQ_RAW),
+		    rd(R_AS(as, 0x1C)), rd(R_AS(as, 0x20)));
+		wr(R_JS(slot, 0x60), JS_COMMAND_HARD_STOP);
+		us(20000);
+		wr(R_JOB_IRQ_CLEAR, 0xFFFFFFFFU);
+		return 0xFFFFU;
+	}
+	uint32_t js = rd(R_JS(slot, 0x24));
+	wr(R_JOB_IRQ_CLEAR, 0xFFFFFFFFU);
+	if (raw & fail) {
+		uint32_t as = (uint32_t)c->as;
+		mali_log("job failed slot %u js=%x mmu=%x fault=%x/%x", slot, js, rd(R_MMU_IRQ_RAW), rd(R_AS(as, 0x1C)), rd(R_AS(as, 0x20)));
+		wr(R_MMU_IRQ_CLEAR, 0xFFFFFFFFU);
+		return js ? js : 0xFFFEU;
+	}
+	return 0;
+}
+
+/* ---- self-test: one WRITE_VALUE job through our own tables, must write 0xC0FFEE01 ---- */
+static int
+mali_selftest(void)
+{
+	struct mali_ctx c;
+	const uint64_t VA_JOB = 0x10000000ULL, VA_OUT = 0x10001000ULL;
+	uint64_t job_pa, out_pa;
+	if (ctx_init(&c, 0)) {
+		mali_log("selftest: pool empty (ctx)");
+		return -1;
+	}
+	job_pa = pool_alloc();
+	out_pa = pool_alloc();
+	if (!job_pa || !out_pa || ctx_map(&c, VA_JOB, job_pa) || ctx_map(&c, VA_OUT, out_pa)) {
+		mali_log("selftest: pool empty (map)");
+		return -1;
+	}
+	volatile uint32_t *j = pa2va(job_pa), *o = pa2va(out_pa);
+	j[4] = (2U << 1) | 1U;                 /* byte 16: 64-bit descriptor, type WRITE_VALUE */
+	j[8] = (uint32_t)VA_OUT;               /* payload: address */
+	j[9] = (uint32_t)(VA_OUT >> 32);
+	j[10] = 6U;                            /* immediate 32 */
+	j[12] = 0xC0FFEE01U;
+	o[0] = 0xDEADBEEFU;
+	ctx_activate(&c);
+	uint32_t r = mali_submit_wait(&c, 1, VA_JOB, 100);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	mali_log("selftest: status=%x out=%08x exc=%x%s", r, o[0], j[0], o[0] == 0xC0FFEE01U ? " OK THE GPU WROTE IT" : " FAIL");
+	ctx_deactivate(&c);
+	return o[0] == 0xC0FFEE01U ? 0 : -1;
+}
+
+void sweet_mali_boot(void);
+
+void
+sweet_mali_boot(void)
+{
+	uint64_t scratch = 0;
+	uint32_t pages = 256;
+	int on = 0;
+
+	if (!PE_parse_boot_argn("mali", &on, sizeof(on)) || !on) {
+		return;
+	}
+	if (!PE_parse_boot_argn("gpu_scratch", &scratch, sizeof(scratch)) || !scratch) {
+		mali_log("no gpu_scratch boot-arg");
+		return;
+	}
+	PE_parse_boot_argn("mali_pages", &pages, sizeof(pages));
+	if (pages > 512) {
+		pages = 512;                       /* the 2 MiB window */
+	}
+	mali.reg = ml_io_map(MALI_PHYS, MALI_SIZE);
+	mali.pool_pa = scratch;
+	mali.pool_pages = pages;
+	mali.pool_va = ml_io_map((vm_offset_t)scratch, (vm_size_t)pages << 12);
+	if (!mali.reg || !mali.pool_va) {
+		mali_log("map failed");
+		return;
+	}
+	mali.gpu_id = rd(R_GPU_ID);
+	if ((mali.gpu_id >> 16) != 0x9202U) {
+		mali_log("unexpected GPU_ID %08x, not touching it", mali.gpu_id);
+		return;
+	}
+	mali.shader_present = rd(R_SHADER_PRESENT);
+	mali.tiler_present = rd(R_TILER_PRESENT);
+	mali.l2_present = rd(R_L2_PRESENT);
+	mali.as_present = rd(R_AS_PRESENT);
+	mali.js_present = rd(R_JS_PRESENT);
+	wr(R_GPU_IRQ_MASK, 0);
+	wr(R_JOB_IRQ_MASK, 0);
+	wr(R_MMU_IRQ_MASK, 0);
+	mali_log("gpu %08x shaders %08x as %x js %x pool %u pages at %llx", mali.gpu_id, mali.shader_present,
+	    mali.as_present, mali.js_present, pages, scratch);
+	mali.up = 1;
+	if (mali_power(1)) {
+		mali_log("power on failed");
+		return;
+	}
+	mali_log("powered: shader=%x tiler=%x l2=%x", rd(R_SHADER_READY), rd(R_TILER_READY), rd(R_L2_READY));
+	mali_selftest();
+	mali_log("ready, left powered (pool used %u of %u pages)", mali.pool_next, mali.pool_pages);
+}
+#endif /* ARM64_BOARD_CONFIG_SWEET */
+EOF_SWEET_MALI
+
+grep -q 'bsd/dev/sweet_mali.c' bsd/conf/files || printf 'bsd/dev/sweet_mali.c\t\t\tstandard\n' >> bsd/conf/files
