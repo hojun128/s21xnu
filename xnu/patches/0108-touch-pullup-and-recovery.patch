@@ -10,7 +10,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  static void note(const char *fmt, ...) __printflike(1, 2);
  static void
  note(const char *fmt, ...)
-@@ -401,9 +401,405 @@
+@@ -401,6 +401,417 @@
  			    last[0], last[1], last[2], last[3], last[4], last[5], last[6], last[7]);
  		}
  		ts_block_us(ts_g_poll_us ? ts_g_poll_us : 8000U);
@@ -42,7 +42,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	if (bus_idle_high(b)) {
 +		ts_pud_used[which] = orig;
 +		return 1; /* already high */
- 	}
++	}
 +	for (int w = 2; w <= 4; w += 2) {
 +		uint32_t v = orig, m = (1U << w) - 1U;
 +		uint32_t pins[2] = { b->scl_bit, b->sda_bit };
@@ -59,8 +59,8 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	*(volatile uint32_t *)(b->bank_va + REG_PUD) = orig;
 +	ts_pud_used[which] = orig;
 +	return 0;
- }
- 
++}
++
 +/* free a slave that is holding SDA low: up to 9 SCL pulses, then STOP */
 +static void
 +bus_recover(struct bbi2c *b)
@@ -258,13 +258,18 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +#define GJ_VA_OUT   0x10001000ULL
 +
 +/* one job: identity (no page tables) or paged; NULL (type 1) or WRITE_VALUE (type 2) */
++static uint32_t gj_leaf = 1;          /* Mali LPAE leaf entries are TYPE_BLOCK (1), not PAGE (3) */
++static uint32_t gj_memattr = 0x8D88;
++static uint32_t gj_jscfg = (3U << 8) | (1U << 10) | (3U << 12) | (8U << 16);
++static uint32_t gj_tt = 3U | (1U << 2);
++
 +static void
 +gj_run(vm_offset_t g, volatile uint32_t *w, uint64_t sp, uint32_t shp, int identity, int jobtype, const char *tag)
 +{
 +	uint32_t i, t0, stat = 0;
 +	uint64_t jobpa = sp + 0x4000, outpa = sp + 0x5000;
 +	uint64_t jobva = identity ? jobpa : GJ_VA_JOB, outva = identity ? outpa : GJ_VA_OUT;
-+	const uint64_t ATTR = (3ULL << 8) | (1ULL << 10) | (1ULL << 6) | 3ULL;
++	const uint64_t ATTR = (3ULL << 8) | (1ULL << 10) | (1ULL << 6) | gj_leaf;
 +
 +	for (i = 0; i < 0x6000 / 4; i++) {
 +		w[i] = 0;
@@ -289,11 +294,11 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +		GJ_GR(g, GJ_AS0 + 0x00) = 2U;                /* LPAE ADRMODE_IDENTITY */
 +		GJ_GR(g, GJ_AS0 + 0x04) = 0;
 +	} else {
-+		GJ_GR(g, GJ_AS0 + 0x00) = (uint32_t)(sp | 3ULL | (1ULL << 2));
++		GJ_GR(g, GJ_AS0 + 0x00) = (uint32_t)(sp | gj_tt);
 +		GJ_GR(g, GJ_AS0 + 0x04) = (uint32_t)(sp >> 32);
 +	}
-+	GJ_GR(g, GJ_AS0 + 0x08) = 0x00008D88U;
-+	GJ_GR(g, GJ_AS0 + 0x0C) = 0x00008D88U;
++	GJ_GR(g, GJ_AS0 + 0x08) = gj_memattr;
++	GJ_GR(g, GJ_AS0 + 0x0C) = gj_memattr;
 +	for (t0 = 0; t0 < 100 && (GJ_GR(g, GJ_AS0 + 0x28) & 1U); t0++) { sleep_us(100); }
 +	GJ_GR(g, GJ_AS0 + 0x18) = 1U;
 +	for (t0 = 0; t0 < 100 && (GJ_GR(g, GJ_AS0 + 0x28) & 1U); t0++) { sleep_us(100); }
@@ -305,7 +310,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	GJ_GR(g, GJ_JS1 + 0x44) = (uint32_t)(jobva >> 32);
 +	GJ_GR(g, GJ_JS1 + 0x50) = shp & (~shp + 1U);
 +	GJ_GR(g, GJ_JS1 + 0x54) = 0;
-+	GJ_GR(g, GJ_JS1 + 0x58) = (3U << 8) | (1U << 10) | (3U << 12) | (8U << 16);
++	GJ_GR(g, GJ_JS1 + 0x58) = gj_jscfg;
 +	GJ_GR(g, GJ_JS1 + 0x60) = 1U;
 +	for (t0 = 0; t0 < 100; t0++) {
 +		stat = GJ_GR(g, 0x1000);
@@ -329,9 +334,19 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +{
 +	vm_offset_t m = ml_io_map((vm_offset_t)sp, 0x10000);
 +	volatile uint32_t *w = (volatile uint32_t *)m;
++	uint32_t a = 0, skipid = 1;
 +
-+	gj_run(g, w, sp, shp, 1, 1, "id-null");
-+	gj_run(g, w, sp, shp, 1, 2, "id-wr");
++	/* experiment knobs, so a different try needs no kernel rebuild */
++	if (PE_parse_boot_argn("gpu_leaf", &a, sizeof(a))) { gj_leaf = a; }
++	if (PE_parse_boot_argn("gpu_memattr", &a, sizeof(a))) { gj_memattr = a; }
++	if (PE_parse_boot_argn("gpu_jscfg", &a, sizeof(a))) { gj_jscfg = a; }
++	if (PE_parse_boot_argn("gpu_tt", &a, sizeof(a))) { gj_tt = a; }
++	if (PE_parse_boot_argn("gpu_identity", &a, sizeof(a))) { skipid = !a; }
++	note("gpu4: leaf=%u memattr=%x jscfg=%x tt=%x", gj_leaf, gj_memattr, gj_jscfg, gj_tt);
++	if (!skipid) {
++		gj_run(g, w, sp, shp, 1, 1, "id-null");
++		gj_run(g, w, sp, shp, 1, 2, "id-wr");
++	}
 +	gj_run(g, w, sp, shp, 0, 1, "pg-null");
 +	gj_run(g, w, sp, shp, 0, 2, "pg-wr");
 +	GJ_GR(g, GJ_AS0 + 0x00) = 0;
@@ -410,13 +425,10 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +#undef GR
 +	} else {
 +		note("g3d off; gpu regs not touched");
-+	}
-+}
-+
- void sweet_touch_init(void);
+ 	}
+ }
  
- void
-@@ -438,6 +834,39 @@
+@@ -438,6 +849,39 @@
  	/* ATTN as input, weak pull-up (matches the DTS's tsp_attn_input state) */
  	pin_func(attn_va, ATTN_BIT, FUNC_INPUT);
  
@@ -456,7 +468,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	if (touch_ts == 4) {
  		uint32_t tcon = *(volatile uint32_t *)(ts_bus_va + REG_CON);
  		uint32_t pcon = *(volatile uint32_t *)(pmic_bus_va + REG_CON);
-@@ -521,8 +950,12 @@
+@@ -521,8 +965,12 @@
  	for (tries = 0; tries < 4 && got; tries++) {
  		cmd = SEC_TS_READ_DEVICE_ID;
  		got = i2c_write_read(&ts_i2c, SEC_TS_ADDR, &cmd, 1, id, 5);
@@ -470,7 +482,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  			uint8_t w[2] = { S2DOS05_EN, 0 }, en;
  			if (!i2c_write_read(&pmic_i2c, S2DOS05_ADDR, w, 1, &en, 1)) {
  				w[1] = (uint8_t)(en & ~((1U << 1) | (1U << 2)));
-@@ -530,7 +963,7 @@
+@@ -530,7 +978,7 @@
  				sleep_us(100000);
  			}
  			s2dos05_power(1);
