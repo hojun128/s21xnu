@@ -1,0 +1,128 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -401,9 +401,80 @@
+ 			    last[0], last[1], last[2], last[3], last[4], last[5], last[6], last[7]);
+ 		}
+ 		ts_block_us(ts_g_poll_us ? ts_g_poll_us : 8000U);
++	}
++}
++
++/* ------------------------------------------------------------------------ */
++/* 0098-touch-pullup: S-Boot leaves the gpp pads pulled down / floating.     */
++/* Linux's pinctrl sets pull-ups on the i2c pads; bit-banging needs them     */
++/* too, otherwise SCL/SDA idle low, every address ACKs and every read is 0. */
++
++static uint32_t ts_pud_used[2];
++
++static int
++bus_idle_high(struct bbi2c *b)
++{
++	i2c_scl(b, 1);
++	i2c_sda(b, 1);
++	sleep_us(300);
++	return pin_get(b->bank_va, b->scl_bit) && pin_get(b->bank_va, b->sda_bit);
++}
++
++/* returns the PUD field width that made both lines idle high, or 0 */
++static int
++bus_pullup(struct bbi2c *b, int which)
++{
++	uint32_t orig = *(volatile uint32_t *)(b->bank_va + REG_PUD);
++
++	if (bus_idle_high(b)) {
++		ts_pud_used[which] = orig;
++		return 1; /* already high */
+ 	}
++	for (int w = 2; w <= 4; w += 2) {
++		uint32_t v = orig, m = (1U << w) - 1U;
++		uint32_t pins[2] = { b->scl_bit, b->sda_bit };
++		for (int i = 0; i < 2; i++) {
++			v = (v & ~(m << (pins[i] * (uint32_t)w))) | (3U << (pins[i] * (uint32_t)w));
++		}
++		*(volatile uint32_t *)(b->bank_va + REG_PUD) = v;
++		sleep_us(300);
++		if (bus_idle_high(b)) {
++			ts_pud_used[which] = v;
++			return w;
++		}
++	}
++	*(volatile uint32_t *)(b->bank_va + REG_PUD) = orig;
++	ts_pud_used[which] = orig;
++	return 0;
+ }
+ 
++/* free a slave that is holding SDA low: up to 9 SCL pulses, then STOP */
++static void
++bus_recover(struct bbi2c *b)
++{
++	i2c_sda(b, 1);
++	for (int i = 0; i < 9 && !pin_get(b->bank_va, b->sda_bit); i++) {
++		i2c_scl(b, 0); sleep_us(10);
++		i2c_scl(b, 1); sleep_us(10);
++	}
++	i2c_start(b);
++	i2c_stop(b);
++}
++
++static void
++s2dos05_cycle(void)
++{
++	uint8_t w[2] = { S2DOS05_EN, 0 };
++	uint8_t en;
++	if (!i2c_write_read(&pmic_i2c, S2DOS05_ADDR, w, 1, &en, 1)) {
++		en &= ~((1U << 1) | (1U << 2));
++		w[1] = en;
++		i2c_write(&pmic_i2c, S2DOS05_ADDR, w, 2);
++		sleep_us(100000);
++	}
++	s2dos05_power(1);
++}
++
+ void sweet_touch_init(void);
+ 
+ void
+@@ -438,6 +509,16 @@
+ 	/* ATTN as input, weak pull-up (matches the DTS's tsp_attn_input state) */
+ 	pin_func(attn_va, ATTN_BIT, FUNC_INPUT);
+ 
++	{
++		int wp = bus_pullup(&pmic_i2c, 0);
++		int wt = bus_pullup(&ts_i2c, 1);
++		note("pullup pmic w=%d pud=%08x ts w=%d pud=%08x idle pmic %d%d ts %d%d", wp, ts_pud_used[0], wt, ts_pud_used[1],
++		    pin_get(pmic_i2c.bank_va, pmic_i2c.scl_bit), pin_get(pmic_i2c.bank_va, pmic_i2c.sda_bit),
++		    pin_get(ts_i2c.bank_va, ts_i2c.scl_bit), pin_get(ts_i2c.bank_va, ts_i2c.sda_bit));
++		bus_recover(&pmic_i2c);
++		bus_recover(&ts_i2c);
++	}
++
+ 	if (touch_ts == 4) {
+ 		uint32_t tcon = *(volatile uint32_t *)(ts_bus_va + REG_CON);
+ 		uint32_t pcon = *(volatile uint32_t *)(pmic_bus_va + REG_CON);
+@@ -515,9 +596,23 @@
+ 	sleep_us(50000); /* controller boot time, generous first guess */
+ 
+ 	uint8_t cmd, id[5] = {0};
+-	cmd = SEC_TS_READ_DEVICE_ID;
+-	if (i2c_write_read(&ts_i2c, SEC_TS_ADDR, &cmd, 1, id, 5)) {
+-		note("device ID read failed (nak) -- bus or power problem");
++	int id_bad = 1;
++	for (int tries = 0; tries < 4; tries++) {
++		cmd = SEC_TS_READ_DEVICE_ID;
++		id_bad = i2c_write_read(&ts_i2c, SEC_TS_ADDR, &cmd, 1, id, 5);
++		if (!id_bad && id[0] != 0x00 && id[0] != 0xFF) {
++			break;
++		}
++		id_bad = 1;
++		note("device ID try %d bad (%02x %02x)", tries, id[0], id[1]);
++		bus_recover(&ts_i2c);
++		if (touch_pwr >= 1) {
++			s2dos05_cycle();
++		}
++		sleep_us(300000);
++	}
++	if (id_bad) {
++		note("device ID read failed (nak or all 0/ff) -- bus or power problem");
+ 		if (touch_ts == 2) {
+ 			panic("sweet_touch: %s", summary);
+ 		}
