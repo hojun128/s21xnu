@@ -130,6 +130,7 @@ bool
 SweetMali::start(IOService *provider)
 {
 	int on = 0;
+	sweet_mali_log_str("service: start() entered");
 	if (!PE_parse_boot_argn("mali", &on, sizeof(on)) || !on) {
 		return false;
 	}

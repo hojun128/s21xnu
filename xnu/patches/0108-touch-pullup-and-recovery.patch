@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -244,7 +244,40 @@
+@@ -244,7 +244,52 @@
  
  static struct bbi2c ts_i2c, pmic_i2c;
  
@@ -14,36 +14,48 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +static volatile uint8_t *plog_va;
 +static uint64_t plog_total;
 +
++extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
++static volatile int plog_lock;
++
 +void s21_plog(const char *line);
 +
++/* serialized: the Mali IOKit service, the touch init and user clients may all log at once */
 +void
 +s21_plog(const char *line)
 +{
 +	size_t n = strlen(line), i;
++	boolean_t ints = ml_set_interrupts_enabled(FALSE);
++	while (__sync_lock_test_and_set(&plog_lock, 1)) {
++		/* spin: holders run with interrupts off for a few microseconds */
++	}
 +	if (!plog_va) {
 +		vm_offset_t va = ml_io_map(PLOG_PHYS, PLOG_SIZE);
-+		if (!va) {
-+			return;
++		if (va) {
++			volatile uint32_t *h = (volatile uint32_t *)va;
++			h[0] = 0x43474244U;
++			h[1] = 0;
++			h[2] = 0;
++			plog_total = 0;
++			plog_va = (volatile uint8_t *)va;
 +		}
-+		plog_va = (volatile uint8_t *)va;
-+		((volatile uint32_t *)plog_va)[0] = 0x43474244U;
-+		((volatile uint32_t *)plog_va)[1] = 0;
-+		((volatile uint32_t *)plog_va)[2] = 0;
-+		plog_total = 0;
 +	}
-+	const uint64_t cap = PLOG_SIZE - PLOG_HDR;
-+	for (i = 0; i <= n; i++) {                       /* includes a trailing newline */
-+		plog_va[PLOG_HDR + (plog_total % cap)] = (uint8_t)(i < n ? line[i] : '\n');
-+		plog_total++;
++	if (plog_va) {
++		const uint64_t cap = PLOG_SIZE - PLOG_HDR;
++		for (i = 0; i <= n; i++) {                       /* includes a trailing newline */
++			plog_va[PLOG_HDR + (plog_total % cap)] = (uint8_t)(i < n ? line[i] : '\n');
++			plog_total++;
++		}
++		((volatile uint32_t *)plog_va)[1] = plog_total >= cap ? (uint32_t)(plog_total % cap) : 0;
++		((volatile uint32_t *)plog_va)[2] = plog_total >= cap ? (uint32_t)cap : (uint32_t)plog_total;
 +	}
-+	((volatile uint32_t *)plog_va)[1] = plog_total >= cap ? (uint32_t)(plog_total % cap) : 0;
-+	((volatile uint32_t *)plog_va)[2] = plog_total >= cap ? (uint32_t)cap : (uint32_t)plog_total;
++	__sync_lock_release(&plog_lock);
++	ml_set_interrupts_enabled(ints);
 +}
 +
  static void note(const char *fmt, ...) __printflike(1, 2);
  static void
  note(const char *fmt, ...)
-@@ -255,6 +288,7 @@
+@@ -255,6 +300,7 @@
  	vsnprintf(line, sizeof(line), fmt, ap);
  	va_end(ap);
  	printf("sweet_touch: %s\n", line);
@@ -51,10 +63,13 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	size_t used = strlen(summary);
  	if (used + strlen(line) + 2 < sizeof(summary)) {
  		strlcat(summary, line, sizeof(summary));
-@@ -404,6 +438,428 @@
- 	}
- }
- 
+@@ -401,9 +447,431 @@
+ 			    last[0], last[1], last[2], last[3], last[4], last[5], last[6], last[7]);
+ 		}
+ 		ts_block_us(ts_g_poll_us ? ts_g_poll_us : 8000U);
++	}
++}
++
 +/* ------------------------------------------------------------------------ */
 +/* 0098-touch-pullup: S-Boot leaves the gpp pads pulled down / floating.     */
 +/* Linux's pinctrl sets pull-ups on the i2c pads; bit-banging needs them     */
@@ -80,7 +95,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	if (bus_idle_high(b)) {
 +		ts_pud_used[which] = orig;
 +		return 1; /* already high */
-+	}
+ 	}
 +	for (int w = 2; w <= 4; w += 2) {
 +		uint32_t v = orig, m = (1U << w) - 1U;
 +		uint32_t pins[2] = { b->scl_bit, b->sda_bit };
@@ -97,8 +112,8 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	*(volatile uint32_t *)(b->bank_va + REG_PUD) = orig;
 +	ts_pud_used[which] = orig;
 +	return 0;
-+}
-+
+ }
+ 
 +/* free a slave that is holding SDA low: up to 9 SCL pulses, then STOP */
 +static void
 +bus_recover(struct bbi2c *b)
@@ -480,7 +495,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  void sweet_touch_init(void);
  
  void
-@@ -438,6 +894,43 @@
+@@ -438,6 +906,43 @@
  	/* ATTN as input, weak pull-up (matches the DTS's tsp_attn_input state) */
  	pin_func(attn_va, ATTN_BIT, FUNC_INPUT);
  
@@ -524,7 +539,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	if (touch_ts == 4) {
  		uint32_t tcon = *(volatile uint32_t *)(ts_bus_va + REG_CON);
  		uint32_t pcon = *(volatile uint32_t *)(pmic_bus_va + REG_CON);
-@@ -521,8 +1014,12 @@
+@@ -521,8 +1026,12 @@
  	for (tries = 0; tries < 4 && got; tries++) {
  		cmd = SEC_TS_READ_DEVICE_ID;
  		got = i2c_write_read(&ts_i2c, SEC_TS_ADDR, &cmd, 1, id, 5);
@@ -538,7 +553,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  			uint8_t w[2] = { S2DOS05_EN, 0 }, en;
  			if (!i2c_write_read(&pmic_i2c, S2DOS05_ADDR, w, 1, &en, 1)) {
  				w[1] = (uint8_t)(en & ~((1U << 1) | (1U << 2)));
-@@ -530,7 +1027,7 @@
+@@ -530,7 +1039,7 @@
  				sleep_us(100000);
  			}
  			s2dos05_power(1);

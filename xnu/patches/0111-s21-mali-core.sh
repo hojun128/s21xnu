@@ -399,6 +399,7 @@ sweet_mali_boot(void)
 	if (mali.up) {
 		return;                            /* already booted (IOKit service or touch init) */
 	}
+	mali_log("boot: entered");
 	if (!PE_parse_boot_argn("mali", &on, sizeof(on)) || !on) {
 		return;
 	}
