@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -401,9 +401,258 @@
+@@ -401,9 +401,265 @@
  			    last[0], last[1], last[2], last[3], last[4], last[5], last[6], last[7]);
  		}
  		ts_block_us(ts_g_poll_us ? ts_g_poll_us : 8000U);
@@ -106,7 +106,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +{
 +	if (acpm_ok) {
 +		return 0;
-+	}
+ 	}
 +	acpm_sram = ml_io_map(ACPM_SRAM_BASE, ACPM_SRAM_SIZE);
 +	acpm_mbox = ml_io_map(ACPM_MBOX_BASE, 0x1000);
 +	uint32_t chans = sram_rd(ACPM_INITDATA + 8);   /* acpm_framework.ipc_channels */
@@ -144,8 +144,8 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	}
 +	note("acpm: ch2 not found (apmax=%u)", apmax);
 +	return -1;
-+}
-+
+ }
+ 
 +/* one acpm-mfd request; -1 on IPC failure, else the reply's cmd[1] */
 +static int64_t
 +acpm_mfd(uint32_t mfd_ch, uint32_t type, uint32_t reg, uint32_t func, uint32_t val, uint32_t mask)
@@ -154,7 +154,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +
 +	if (acpm_init()) {
 +		return -1;
- 	}
++	}
 +	if (++acpm_seq >= 64) {
 +		acpm_seq = 1;
 +	}
@@ -199,8 +199,8 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	}
 +	note("acpm: no reply seq %u", acpm_seq);
 +	return -1;
- }
- 
++}
++
 +static int
 +acpm_read(uint32_t mfd_ch, uint32_t reg)
 +{
@@ -250,8 +250,15 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	uint32_t cfg = *(volatile uint32_t *)(pmu + 0x2300);
 +	note("g3d config=%x", cfg);
 +	if (st & 1U) {
++		/* Mali GPU_CONTROL block, offsets from the SM-G991N kbase gpu_regmap.h; reads only */
 +		vm_offset_t g = ml_io_map(0x18500000U, 0x1000);
-+		note("gpu id=%08x", *(volatile uint32_t *)(g + 0));
++#define GR(o) (*(volatile uint32_t *)(g + (o)))
++		note("gpu id=%08x l2f=%08x tilf=%08x memf=%08x", GR(0x000), GR(0x004), GR(0x00C), GR(0x010));
++		note("mmuf=%08x as=%08x js=%08x stat=%08x raw=%08x", GR(0x014), GR(0x018), GR(0x01C), GR(0x034), GR(0x020));
++		note("thr max=%08x wg=%08x bar=%08x feat=%08x", GR(0x0A0), GR(0x0A4), GR(0x0A8), GR(0x0AC));
++		note("shader pres=%08x/%08x rdy=%08x tiler pres=%08x rdy=%08x", GR(0x100), GR(0x104), GR(0x140), GR(0x110), GR(0x150));
++		note("l2 pres=%08x rdy=%08x coh=%08x js0f=%08x js1f=%08x", GR(0x120), GR(0x160), GR(0x300), GR(0x0C0), GR(0x0C4));
++#undef GR
 +	} else {
 +		note("g3d off; gpu regs not touched");
 +	}
@@ -260,7 +267,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  void sweet_touch_init(void);
  
  void
-@@ -438,6 +687,39 @@
+@@ -438,6 +694,39 @@
  	/* ATTN as input, weak pull-up (matches the DTS's tsp_attn_input state) */
  	pin_func(attn_va, ATTN_BIT, FUNC_INPUT);
  
@@ -300,7 +307,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	if (touch_ts == 4) {
  		uint32_t tcon = *(volatile uint32_t *)(ts_bus_va + REG_CON);
  		uint32_t pcon = *(volatile uint32_t *)(pmic_bus_va + REG_CON);
-@@ -521,8 +803,12 @@
+@@ -521,8 +810,12 @@
  	for (tries = 0; tries < 4 && got; tries++) {
  		cmd = SEC_TS_READ_DEVICE_ID;
  		got = i2c_write_read(&ts_i2c, SEC_TS_ADDR, &cmd, 1, id, 5);
@@ -314,7 +321,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  			uint8_t w[2] = { S2DOS05_EN, 0 }, en;
  			if (!i2c_write_read(&pmic_i2c, S2DOS05_ADDR, w, 1, &en, 1)) {
  				w[1] = (uint8_t)(en & ~((1U << 1) | (1U << 2)));
-@@ -530,7 +816,7 @@
+@@ -530,7 +823,7 @@
  				sleep_us(100000);
  			}
  			s2dos05_power(1);
