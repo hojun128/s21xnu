@@ -1,11 +1,10 @@
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -401,9 +401,80 @@
- 			    last[0], last[1], last[2], last[3], last[4], last[5], last[6], last[7]);
+@@ -402,8 +402,236 @@
  		}
  		ts_block_us(ts_g_poll_us ? ts_g_poll_us : 8000U);
-+	}
+ 	}
 +}
 +
 +/* ------------------------------------------------------------------------ */
@@ -22,8 +21,8 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	i2c_sda(b, 1);
 +	sleep_us(300);
 +	return pin_get(b->bank_va, b->scl_bit) && pin_get(b->bank_va, b->sda_bit);
-+}
-+
+ }
+ 
 +/* returns the PUD field width that made both lines idle high, or 0 */
 +static int
 +bus_pullup(struct bbi2c *b, int which)
@@ -33,7 +32,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	if (bus_idle_high(b)) {
 +		ts_pud_used[which] = orig;
 +		return 1; /* already high */
- 	}
++	}
 +	for (int w = 2; w <= 4; w += 2) {
 +		uint32_t v = orig, m = (1U << w) - 1U;
 +		uint32_t pins[2] = { b->scl_bit, b->sda_bit };
@@ -50,8 +49,8 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	*(volatile uint32_t *)(b->bank_va + REG_PUD) = orig;
 +	ts_pud_used[which] = orig;
 +	return 0;
- }
- 
++}
++
 +/* free a slave that is holding SDA low: up to 9 SCL pulses, then STOP */
 +static void
 +bus_recover(struct bbi2c *b)
@@ -65,24 +64,181 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	i2c_stop(b);
 +}
 +
-+static void
-+s2dos05_cycle(void)
++/* ------------------------------------------------------------------------ */
++/* S21 5G (o1s): tsp_io = S2MPS23 LDO27 (1.8 V), tsp_avdd = S2MPS24 LDO21    */
++/* (3.0 V). Both PMICs sit behind the APM firmware: ACPM IPC channel 2       */
++/* (acpm-mfd-bus), mfd channel 0 = S2MPS23, 1 = S2MPS24, type 1 = PMIC page. */
++/* Protocol from the SM-G991N kernel (drivers/soc/samsung/acpm/acpm_ipc.c,   */
++/* acpm_mfd.c); addresses from its exynos2100 DT (acpm_ipc node).            */
++
++#define ACPM_SRAM_BASE   0x02039000U
++#define ACPM_SRAM_SIZE   0x41000U
++#define ACPM_INITDATA    0x8000U
++#define ACPM_MBOX_BASE   0x15900000U
++#define ACPM_INTGR0      0x08U
++#define ACPM_INTCR1      0x20U
++#define ACPM_MFD_IPC_CH  2U
++#define ACPM_FUNC_READ   0U
++#define ACPM_FUNC_UPDATE 2U
++
++static vm_offset_t acpm_sram, acpm_mbox;
++static uint32_t acpm_seq;
++static int acpm_ok;
++static struct {
++	uint32_t id, txr, txf, txb, rxr, rxf, rxb, len, sz;
++} acpm_ch;
++
++static inline uint32_t
++sram_rd(uint32_t off)
 +{
-+	uint8_t w[2] = { S2DOS05_EN, 0 };
-+	uint8_t en;
-+	if (!i2c_write_read(&pmic_i2c, S2DOS05_ADDR, w, 1, &en, 1)) {
-+		en &= ~((1U << 1) | (1U << 2));
-+		w[1] = en;
-+		i2c_write(&pmic_i2c, S2DOS05_ADDR, w, 2);
-+		sleep_us(100000);
++	return *(volatile uint32_t *)(acpm_sram + off);
++}
++
++static inline void
++sram_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(acpm_sram + off) = v;
++}
++
++static int
++acpm_init(void)
++{
++	if (acpm_ok) {
++		return 0;
 +	}
-+	s2dos05_power(1);
++	acpm_sram = ml_io_map(ACPM_SRAM_BASE, ACPM_SRAM_SIZE);
++	acpm_mbox = ml_io_map(ACPM_MBOX_BASE, 0x1000);
++	uint32_t chans = sram_rd(ACPM_INITDATA + 8);   /* acpm_framework.ipc_channels */
++	uint32_t apmax = sram_rd(ACPM_INITDATA + 24);  /* acpm_framework.ipc_ap_max */
++	if (chans == 0 || chans >= ACPM_SRAM_SIZE || apmax == 0 || apmax > 32) {
++		note("acpm: bad initdata chans=%x apmax=%u", chans, apmax);
++		return -1;
++	}
++	for (uint32_t i = 0; i < apmax; i++) {
++		uint32_t e = chans + i * 72U;          /* sizeof(struct ipc_channel) */
++		if (e + 72U > ACPM_SRAM_SIZE) {
++			break;
++		}
++		if (sram_rd(e) != ACPM_MFD_IPC_CH) {
++			continue;
++		}
++		acpm_ch.id  = ACPM_MFD_IPC_CH;
++		/* AP -> APM goes into the APM's rx queue, replies come in its tx queue */
++		acpm_ch.txr = sram_rd(e + 16 + 0);
++		acpm_ch.txf = sram_rd(e + 16 + 4);
++		acpm_ch.txb = sram_rd(e + 16 + 8);
++		acpm_ch.rxr = sram_rd(e + 16 + 24);
++		acpm_ch.rxf = sram_rd(e + 16 + 28);
++		acpm_ch.rxb = sram_rd(e + 16 + 32);
++		acpm_ch.len = sram_rd(e + 16 + 36);
++		acpm_ch.sz  = sram_rd(e + 16 + 40);
++		if (acpm_ch.len == 0 || acpm_ch.len > 64 || acpm_ch.sz < 8 || acpm_ch.sz > 64 ||
++		    acpm_ch.txb >= ACPM_SRAM_SIZE || acpm_ch.rxb >= ACPM_SRAM_SIZE) {
++			note("acpm: ch2 bad q len=%u sz=%u", acpm_ch.len, acpm_ch.sz);
++			return -1;
++		}
++		acpm_ok = 1;
++		note("acpm: ch2 len=%u sz=%u", acpm_ch.len, acpm_ch.sz);
++		return 0;
++	}
++	note("acpm: ch2 not found (apmax=%u)", apmax);
++	return -1;
++}
++
++/* one acpm-mfd request; -1 on IPC failure, else the reply's cmd[1] */
++static int64_t
++acpm_mfd(uint32_t mfd_ch, uint32_t type, uint32_t reg, uint32_t func, uint32_t val, uint32_t mask)
++{
++	uint32_t cmd[4], front, next;
++
++	if (acpm_init()) {
++		return -1;
++	}
++	if (++acpm_seq >= 64) {
++		acpm_seq = 1;
++	}
++	cmd[0] = (reg & 0xFFU) | ((type & 0xFU) << 8) | ((mfd_ch & 0xFU) << 12) | ((acpm_seq & 0x3FU) << 16);
++	cmd[1] = (func & 0xFFU) | ((val & 0xFFU) << 8) | ((mask & 0xFFU) << 16);
++	cmd[2] = 0;
++	cmd[3] = 0;
++	front = sram_rd(acpm_ch.txf);
++	if (front >= acpm_ch.len) {
++		note("acpm: bad tx front %u", front);
++		return -1;
++	}
++	next = (front + 1) % acpm_ch.len;
++	for (int t = 0; t < 1000 && next == sram_rd(acpm_ch.txr); t++) {
++		sleep_us(100);
++	}
++	if (next == sram_rd(acpm_ch.txr)) {
++		note("acpm: tx full");
++		return -1;
++	}
++	for (uint32_t w = 0; w < acpm_ch.sz / 4; w++) {
++		sram_wr(acpm_ch.txb + acpm_ch.sz * front + w * 4, w < 4 ? cmd[w] : 0);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	sram_wr(acpm_ch.txf, next);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(acpm_mbox + ACPM_INTGR0) = (1U << acpm_ch.id) << 16;
++
++	for (int t = 0; t < 3000; t++) {       /* ~300 ms */
++		uint32_t f = sram_rd(acpm_ch.rxf), i = sram_rd(acpm_ch.rxr);
++		while (i != f && i < acpm_ch.len) {
++			uint32_t e = acpm_ch.rxb + acpm_ch.sz * i;
++			if (((sram_rd(e) >> 16) & 0x3FU) == (acpm_seq & 0x3FU)) {
++				uint32_t c1 = sram_rd(e + 4);
++				sram_wr(acpm_ch.rxr, (i + 1) % acpm_ch.len);
++				*(volatile uint32_t *)(acpm_mbox + ACPM_INTCR1) = 1U << acpm_ch.id;
++				return (int64_t)c1;
++			}
++			i = (i + 1) % acpm_ch.len;
++		}
++		sleep_us(100);
++	}
++	note("acpm: no reply seq %u", acpm_seq);
++	return -1;
++}
++
++static int
++acpm_read(uint32_t mfd_ch, uint32_t reg)
++{
++	int64_t r = acpm_mfd(mfd_ch, 1, reg, ACPM_FUNC_READ, 0, 0);
++	if (r < 0 || ((r >> 24) & 0xFF)) {
++		return -1;
++	}
++	return (int)((r >> 8) & 0xFF);
++}
++
++/* turn on tsp_io (S2MPS23 LDO27 = 0x5F, 1.8 V = vsel 0x2C) then tsp_avdd   */
++/* (S2MPS24 LDO21 = 0x54, 3.0 V = vsel 0x30); opmode 3 (always on) = 0xC0.  */
++/* Only writes when the voltage field already holds the expected code, so  */
++/* a different register map (EVT0 parts) cannot switch on the wrong rail.  */
++static void
++s21_touch_rails(int force)
++{
++	int io = acpm_read(0, 0x5F), av = acpm_read(1, 0x54);
++	note("rails before io=%02x av=%02x", io & 0xFF, av & 0xFF);
++	if (io < 0 || av < 0) {
++		note("rails: acpm read failed (io=%d av=%d)", io, av);
++		return;
++	}
++	if (!force && ((io & 0x3F) != 0x2C || (av & 0x3F) != 0x30)) {
++		note("rails: unexpected vsel, not writing (touch_rail=2 forces)");
++		return;
++	}
++	int64_t r1 = acpm_mfd(0, 1, 0x5F, ACPM_FUNC_UPDATE, 0xC0U | 0x2CU, 0xFF);
++	sleep_us(5000);
++	int64_t r2 = acpm_mfd(1, 1, 0x54, ACPM_FUNC_UPDATE, 0xC0U | 0x30U, 0xFF);
++	sleep_us(30000);
++	note("rails on ret %d/%d after io=%02x av=%02x", r1 < 0 ? -1 : (int)((r1 >> 24) & 0xFF),
++	    r2 < 0 ? -1 : (int)((r2 >> 24) & 0xFF), acpm_read(0, 0x5F) & 0xFF, acpm_read(1, 0x54) & 0xFF);
 +}
 +
  void sweet_touch_init(void);
  
  void
-@@ -438,6 +509,16 @@
+@@ -438,6 +666,33 @@
  	/* ATTN as input, weak pull-up (matches the DTS's tsp_attn_input state) */
  	pin_func(attn_va, ATTN_BIT, FUNC_INPUT);
  
@@ -96,10 +252,27 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +		bus_recover(&ts_i2c);
 +	}
 +
++	{
++		int touch_rail = 1;
++		PE_parse_boot_argn("touch_rail", &touch_rail, sizeof(touch_rail));
++		if (touch_rail) {
++			s21_touch_rails(touch_rail == 2);
++			/* the touch i2c pads have board pull-ups to tsp_io (DT pin-pud 0) */
++			uint32_t pud = *(volatile uint32_t *)(ts_bus_va + REG_PUD);
++			pud &= ~((0xFU << (TS_SCL_BIT * 4)) | (0xFU << (TS_SDA_BIT * 4)));
++			*(volatile uint32_t *)(ts_bus_va + REG_PUD) = pud;
++			int hi = bus_idle_high(&ts_i2c);
++			note("ts idle after rails %d (scl%d sda%d)", hi,
++			    pin_get(ts_i2c.bank_va, ts_i2c.scl_bit), pin_get(ts_i2c.bank_va, ts_i2c.sda_bit));
++			bus_recover(&ts_i2c);
++			sleep_us(100000); /* controller boot */
++		}
++	}
++
  	if (touch_ts == 4) {
  		uint32_t tcon = *(volatile uint32_t *)(ts_bus_va + REG_CON);
  		uint32_t pcon = *(volatile uint32_t *)(pmic_bus_va + REG_CON);
-@@ -521,8 +602,12 @@
+@@ -521,8 +776,12 @@
  	for (tries = 0; tries < 4 && got; tries++) {
  		cmd = SEC_TS_READ_DEVICE_ID;
  		got = i2c_write_read(&ts_i2c, SEC_TS_ADDR, &cmd, 1, id, 5);
@@ -113,7 +286,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  			uint8_t w[2] = { S2DOS05_EN, 0 }, en;
  			if (!i2c_write_read(&pmic_i2c, S2DOS05_ADDR, w, 1, &en, 1)) {
  				w[1] = (uint8_t)(en & ~((1U << 1) | (1U << 2)));
-@@ -530,7 +615,7 @@
+@@ -530,7 +789,7 @@
  				sleep_us(100000);
  			}
  			s2dos05_power(1);
