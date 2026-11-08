@@ -1,12 +1,12 @@
 #!/bin/bash
-# S21 (Exynos 2100) Mali-G78 core driver (power, GPU page tables, job submit, self-tests).
+# S21 Mali-G78 core driver (power, GPU page tables, job submit, self-tests, exported ctx API).
 # dxb runs patches/*.sh from the XNU source root before applying *.patch.
 set -euo pipefail
 
 [[ "${MACHINE_CONFIG:-}" == SWEET ]] || exit 0
 [[ -f bsd/conf/files ]] || exit 1
 
-cat > bsd/dev/sweet_mali.c <<'EOF_SWEET_MALI'
+cat > bsd/dev/sweet_mali.c <<'EOF_SWEET_SRC'
 /*
  * S21 (Exynos 2100) Mali-G78 core driver, step A1: power, GPU page tables, job submit.
  * Everything here was measured on the phone first (see the gpu_diag notes in
@@ -212,6 +212,20 @@ ctx_activate(struct mali_ctx *c)
 }
 
 static void
+as_flush(uint32_t as)
+{
+	wait_reg(R_AS(as, 0x28), 1U, 0U, 10);
+	wr(R_AS(as, 0x10), 46U);                  /* LOCKADDR: base 0, region width 2^47 */
+	wr(R_AS(as, 0x14), 0U);
+	wr(R_AS(as, 0x18), 2U);                   /* AS_COMMAND_LOCK */
+	wait_reg(R_AS(as, 0x28), 1U, 0U, 10);
+	wr(R_AS(as, 0x18), 5U);                   /* AS_COMMAND_FLUSH_MEM */
+	wait_reg(R_AS(as, 0x28), 1U, 0U, 10);
+	wr(R_AS(as, 0x18), 3U);                   /* AS_COMMAND_UNLOCK */
+	wait_reg(R_AS(as, 0x28), 1U, 0U, 10);
+}
+
+static void
 ctx_deactivate(struct mali_ctx *c)
 {
 	uint32_t as = (uint32_t)c->as;
@@ -382,6 +396,9 @@ sweet_mali_boot(void)
 	uint32_t pages = 256;
 	int on = 0;
 
+	if (mali.up) {
+		return;                            /* already booted (IOKit service or touch init) */
+	}
 	if (!PE_parse_boot_argn("mali", &on, sizeof(on)) || !on) {
 		return;
 	}
@@ -426,7 +443,115 @@ sweet_mali_boot(void)
 	mali_selftest_heap();
 	mali_log("ready, left powered (pool used %u of %u pages)", mali.pool_next, mali.pool_pages);
 }
+
+/* ---- exported API for the IOKit layer (iokit/Kernel/arm/SweetMali.cpp); the caller serializes ---- */
+#define MALI_MAX_CTX 8
+static struct mali_ctx ctxs[MALI_MAX_CTX];
+static int ctx_used[MALI_MAX_CTX];
+
+int sweet_mali_up(void);
+void sweet_mali_get_info(uint32_t out[6]);
+int sweet_mali_ctx_create(void);
+void sweet_mali_ctx_destroy(int id);
+int sweet_mali_ctx_map(int id, uint64_t va, uint64_t pa);
+void sweet_mali_ctx_unmap(int id, uint64_t va);
+uint32_t sweet_mali_submit(int id, uint32_t slot, uint64_t jc_va, uint32_t timeout_ms);
+void sweet_mali_log_str(const char *s);
+
+int
+sweet_mali_up(void)
+{
+	return mali.up && mali.powered;
+}
+
+void
+sweet_mali_get_info(uint32_t out[6])
+{
+	out[0] = mali.gpu_id;
+	out[1] = mali.shader_present;
+	out[2] = mali.tiler_present;
+	out[3] = mali.l2_present;
+	out[4] = mali.as_present;
+	out[5] = mali.js_present;
+}
+
+void
+sweet_mali_log_str(const char *s)
+{
+	mali_log("%s", s);
+}
+
+/* returns a context id (== its address space number) or -1 */
+int
+sweet_mali_ctx_create(void)
+{
+	for (int i = 0; i < MALI_MAX_CTX; i++) {
+		if (!ctx_used[i] && ((mali.as_present >> i) & 1U)) {
+			if (ctx_init(&ctxs[i], i)) {
+				return -1;
+			}
+			ctx_used[i] = 1;
+			return i;
+		}
+	}
+	return -1;
+}
+
+void
+sweet_mali_ctx_destroy(int id)
+{
+	if (id < 0 || id >= MALI_MAX_CTX || !ctx_used[id]) {
+		return;
+	}
+	ctx_deactivate(&ctxs[id]);
+	ctx_used[id] = 0;      /* table pages stay in the pool (no free list yet) */
+}
+
+int
+sweet_mali_ctx_map(int id, uint64_t va, uint64_t pa)
+{
+	if (id < 0 || id >= MALI_MAX_CTX || !ctx_used[id]) {
+		return -1;
+	}
+	return ctx_map(&ctxs[id], va, pa);
+}
+
+void
+sweet_mali_ctx_unmap(int id, uint64_t va)
+{
+	if (id < 0 || id >= MALI_MAX_CTX || !ctx_used[id]) {
+		return;
+	}
+	(void)ctx_map; /* leaf entry is rewritten to 0 by walking the existing tables */
+	uint64_t t = ctxs[id].pgd_pa;
+	uint32_t idx[3] = { (uint32_t)((va >> 39) & 0x1FF), (uint32_t)((va >> 30) & 0x1FF), (uint32_t)((va >> 21) & 0x1FF) };
+	for (int l = 0; l < 3; l++) {
+		volatile uint32_t *tb = pa2va(t);
+		uint64_t e = (uint64_t)tb[idx[l] * 2] | ((uint64_t)tb[idx[l] * 2 + 1] << 32);
+		if (!(e & 1ULL)) {
+			return;
+		}
+		t = e & 0x0000FFFFFFFFF000ULL;
+	}
+	volatile uint32_t *leaf = pa2va(t);
+	uint32_t li = (uint32_t)((va >> 12) & 0x1FF);
+	leaf[li * 2] = 0;
+	leaf[li * 2 + 1] = 0;
+}
+
+/* activate the context, flush its TLB, run one job chain; 0 = done, else the JS_STATUS code */
+uint32_t
+sweet_mali_submit(int id, uint32_t slot, uint64_t jc_va, uint32_t timeout_ms)
+{
+	if (id < 0 || id >= MALI_MAX_CTX || !ctx_used[id] || slot >= 3 || !mali.up || !mali.powered) {
+		return 0xFFFDU;
+	}
+	ctx_activate(&ctxs[id]);
+	as_flush((uint32_t)id);
+	uint32_t r = mali_submit_wait(&ctxs[id], slot, jc_va, timeout_ms);
+	return r;
+}
 #endif /* ARM64_BOARD_CONFIG_SWEET */
-EOF_SWEET_MALI
+EOF_SWEET_SRC
 
 grep -q 'bsd/dev/sweet_mali.c' bsd/conf/files || printf 'bsd/dev/sweet_mali.c\t\t\tstandard\n' >> bsd/conf/files
