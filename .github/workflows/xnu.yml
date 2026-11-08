@@ -68,6 +68,26 @@ jobs:
           xcodebuild -version
           xcrun --find iig
 
+      - name: Install KDK (with retries)
+        run: |
+          # build.sh downloads the KDK once and fails on a bad download (GitHub 5xx);
+          # install it here with retries so build.sh finds KDKROOT and skips its own.
+          KDKROOT=/Library/Developer/KDKs/KDK_13.5_22G74.kdk
+          [ -d "$KDKROOT" ] && exit 0
+          U=https://github.com/dortania/KdkSupportPkg/releases/download/22G74/Kernel_Debug_Kit_13.5_build_22G74.dmg
+          for i in $(seq 1 20); do
+            rm -f /tmp/KDK.dmg
+            if curl -fL --retry 3 --max-time 900 --connect-timeout 60 -o /tmp/KDK.dmg "$U" && hdiutil attach /tmp/KDK.dmg; then
+              sudo mkdir -p /Library/Developer/KDKs && sudo chmod 755 /Library/Developer/KDKs
+              sudo installer -pkg '/Volumes/Kernel Debug Kit/KernelDebugKit.pkg' -target /
+              hdiutil detach '/Volumes/Kernel Debug Kit'
+              ls -lah /Library/Developer/KDKs
+              exit 0
+            fi
+            echo "KDK download attempt $i failed; waiting"; sleep 60
+          done
+          exit 1
+
       - name: Build
         working-directory: dxb
         env:
