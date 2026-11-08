@@ -99,30 +99,26 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	if (touch_ts == 4) {
  		uint32_t tcon = *(volatile uint32_t *)(ts_bus_va + REG_CON);
  		uint32_t pcon = *(volatile uint32_t *)(pmic_bus_va + REG_CON);
-@@ -515,9 +596,23 @@
- 	sleep_us(50000); /* controller boot time, generous first guess */
- 
- 	uint8_t cmd, id[5] = {0};
--	cmd = SEC_TS_READ_DEVICE_ID;
--	if (i2c_write_read(&ts_i2c, SEC_TS_ADDR, &cmd, 1, id, 5)) {
--		note("device ID read failed (nak) -- bus or power problem");
-+	int id_bad = 1;
-+	for (int tries = 0; tries < 4; tries++) {
-+		cmd = SEC_TS_READ_DEVICE_ID;
-+		id_bad = i2c_write_read(&ts_i2c, SEC_TS_ADDR, &cmd, 1, id, 5);
-+		if (!id_bad && id[0] != 0x00 && id[0] != 0xFF) {
-+			break;
+@@ -521,8 +602,12 @@
+ 	for (tries = 0; tries < 4 && got; tries++) {
+ 		cmd = SEC_TS_READ_DEVICE_ID;
+ 		got = i2c_write_read(&ts_i2c, SEC_TS_ADDR, &cmd, 1, id, 5);
++		if (!got && (id[0] == 0x00 || id[0] == 0xFF)) {
++			got = 1; /* ACK but no data: bus stuck or chip not up */
 +		}
-+		id_bad = 1;
-+		note("device ID try %d bad (%02x %02x)", tries, id[0], id[1]);
-+		bus_recover(&ts_i2c);
-+		if (touch_pwr >= 1) {
-+			s2dos05_cycle();
-+		}
-+		sleep_us(300000);
-+	}
-+	if (id_bad) {
-+		note("device ID read failed (nak or all 0/ff) -- bus or power problem");
- 		if (touch_ts == 2) {
- 			panic("sweet_touch: %s", summary);
+ 		if (got) {
+-			note("device ID read failed (try %d), power-cycling", tries);
++			note("device ID read failed (try %d, id0=%02x), power-cycling", tries, id[0]);
++			bus_recover(&ts_i2c);
+ 			uint8_t w[2] = { S2DOS05_EN, 0 }, en;
+ 			if (!i2c_write_read(&pmic_i2c, S2DOS05_ADDR, w, 1, &en, 1)) {
+ 				w[1] = (uint8_t)(en & ~((1U << 1) | (1U << 2)));
+@@ -530,7 +615,7 @@
+ 				sleep_us(100000);
+ 			}
+ 			s2dos05_power(1);
+-			sleep_us(150000);
++			sleep_us(300000);
  		}
+ 	}
+ 	if (got) {
