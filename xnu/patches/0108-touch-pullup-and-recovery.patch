@@ -49,7 +49,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	size_t used = strlen(summary);
  	if (used + strlen(line) + 2 < sizeof(summary)) {
  		strlcat(summary, line, sizeof(summary));
-@@ -401,9 +433,426 @@
+@@ -401,9 +433,431 @@
  			    last[0], last[1], last[2], last[3], last[4], last[5], last[6], last[7]);
  		}
  		ts_block_us(ts_g_poll_us ? ts_g_poll_us : 8000U);
@@ -154,7 +154,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +{
 +	if (acpm_ok) {
 +		return 0;
-+	}
+ 	}
 +	acpm_sram = ml_io_map(ACPM_SRAM_BASE, ACPM_SRAM_SIZE);
 +	acpm_mbox = ml_io_map(ACPM_MBOX_BASE, 0x1000);
 +	uint32_t chans = sram_rd(ACPM_INITDATA + 8);   /* acpm_framework.ipc_channels */
@@ -192,8 +192,8 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	}
 +	note("acpm: ch2 not found (apmax=%u)", apmax);
 +	return -1;
-+}
-+
+ }
+ 
 +/* one acpm-mfd request; -1 on IPC failure, else the reply's cmd[1] */
 +static int64_t
 +acpm_mfd(uint32_t mfd_ch, uint32_t type, uint32_t reg, uint32_t func, uint32_t val, uint32_t mask)
@@ -271,7 +271,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	if (io < 0 || av < 0) {
 +		note("rails: acpm read failed (io=%d av=%d)", io, av);
 +		return;
- 	}
++	}
 +	if (!force && ((io & 0x3F) != 0x2C || (av & 0x3F) != 0x30)) {
 +		note("rails: unexpected vsel, not writing (touch_rail=2 forces)");
 +		return;
@@ -282,8 +282,8 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +	sleep_us(30000);
 +	note("rails on ret %d/%d after io=%02x av=%02x", r1 < 0 ? -1 : (int)((r1 >> 24) & 0xFF),
 +	    r2 < 0 ? -1 : (int)((r2 >> 24) & 0xFF), acpm_read(0, 0x5F) & 0xFF, acpm_read(1, 0x54) & 0xFF);
- }
- 
++}
++
 +/* ------------------------------------------------------------------------ */
 +/* ------------------------------------------------------------------------ */
 +/* GPU step 4 (gpu_diag=3): the GPU's MMU and one WRITE_VALUE job. Page      */
@@ -450,6 +450,11 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 +			int keep = 0;
 +			PE_parse_boot_argn("gpu_keep", &keep, sizeof(keep));
 +			if (keep) {
++				/* XNU has no handler for the GPU's three interrupt lines yet: mask and clear them */
++				note("gpu irq before: mask gpu=%x job=%x mmu=%x status gpu=%x job=%x mmu=%x", GR(0x028), GR(0x1008), GR(0x2008), GR(0x02C), GR(0x100C), GR(0x200C));
++				GR(0x028) = 0; GR(0x1008) = 0; GR(0x2008) = 0;
++				GR(0x024) = 0xFFFFFFFFU; GR(0x1004) = 0xFFFFFFFFU; GR(0x2004) = 0xFFFFFFFFU;
++				note("gpu irq after: mask gpu=%x job=%x mmu=%x status gpu=%x job=%x mmu=%x", GR(0x028), GR(0x1008), GR(0x2008), GR(0x02C), GR(0x100C), GR(0x200C));
 +				note("gpu: left powered on (gpu_keep=1)");
 +			} else {
 +			/* back to how S-Boot left it: off, in reverse order */
@@ -476,7 +481,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  void sweet_touch_init(void);
  
  void
-@@ -438,6 +887,39 @@
+@@ -438,6 +892,39 @@
  	/* ATTN as input, weak pull-up (matches the DTS's tsp_attn_input state) */
  	pin_func(attn_va, ATTN_BIT, FUNC_INPUT);
  
@@ -516,7 +521,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  	if (touch_ts == 4) {
  		uint32_t tcon = *(volatile uint32_t *)(ts_bus_va + REG_CON);
  		uint32_t pcon = *(volatile uint32_t *)(pmic_bus_va + REG_CON);
-@@ -521,8 +1003,12 @@
+@@ -521,8 +1008,12 @@
  	for (tries = 0; tries < 4 && got; tries++) {
  		cmd = SEC_TS_READ_DEVICE_ID;
  		got = i2c_write_read(&ts_i2c, SEC_TS_ADDR, &cmd, 1, id, 5);
@@ -530,7 +535,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
  			uint8_t w[2] = { S2DOS05_EN, 0 }, en;
  			if (!i2c_write_read(&pmic_i2c, S2DOS05_ADDR, w, 1, &en, 1)) {
  				w[1] = (uint8_t)(en & ~((1U << 1) | (1U << 2)));
-@@ -530,7 +1016,7 @@
+@@ -530,7 +1021,7 @@
  				sleep_us(100000);
  			}
  			s2dos05_power(1);
