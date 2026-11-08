@@ -1,5 +1,5 @@
 #!/bin/bash
-# S21 (Exynos 2100) Mali-G78 core driver (power, GPU page tables, job submit, self-test).
+# S21 (Exynos 2100) Mali-G78 core driver (power, GPU page tables, job submit, self-tests).
 # dxb runs patches/*.sh from the XNU source root before applying *.patch.
 set -euo pipefail
 
@@ -21,11 +21,16 @@ cat > bsd/dev/sweet_mali.c <<'EOF_SWEET_MALI'
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <kern/clock.h>
+#include <machine/machine_routines.h>
+#include <arm/caches_internal.h>
+#include <vm/pmap.h>
+#include <vm/vm_kern.h>
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 extern void s21_plog(const char *line);
 
 #define MALI_PHYS        0x18500000U
@@ -327,6 +332,47 @@ mali_selftest(void)
 	return o[0] == 0xC0FFEE01U ? 0 : -1;
 }
 
+/* ---- self-test 2: the GPU reads/writes ordinary kernel RAM (cacheable heap, not the scratch window) ---- */
+static int
+mali_selftest_heap(void)
+{
+	struct mali_ctx c;
+	const uint64_t VA_JOB = 0x20000000ULL, VA_OUT = 0x20001000ULL;
+	vm_offset_t buf = 0;
+	if (kmem_alloc_contig(kernel_map, &buf, 2 * PAGE_SIZE, PAGE_MASK, 0, 0,
+	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		mali_log("heap test: kmem_alloc_contig failed");
+		return -1;
+	}
+	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)buf);
+	if (!pn) {
+		mali_log("heap test: no physical page");
+		return -1;
+	}
+	uint64_t pa = ptoa_64(pn);
+	volatile uint32_t *j = (volatile uint32_t *)buf;
+	volatile uint32_t *o = (volatile uint32_t *)(buf + PAGE_SIZE);
+	if (ctx_init(&c, 0) || ctx_map(&c, VA_JOB, pa) || ctx_map(&c, VA_OUT, pa + PAGE_SIZE)) {
+		mali_log("heap test: pool empty");
+		return -1;
+	}
+	j[4] = (2U << 1) | 1U;
+	j[8] = (uint32_t)VA_OUT;
+	j[9] = (uint32_t)(VA_OUT >> 32);
+	j[10] = 6U;
+	j[12] = 0xC0FFEE02U;
+	o[0] = 0xDEADBEEFU;
+	flush_dcache64((addr64_t)pa, 2 * PAGE_SIZE, TRUE);   /* clean+invalidate: the GPU is not coherent */
+	ctx_activate(&c);
+	uint32_t r = mali_submit_wait(&c, 1, VA_JOB, 100);
+	flush_dcache64((addr64_t)pa, 2 * PAGE_SIZE, TRUE);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	mali_log("heap test: pa=%llx status=%x out=%08x exc=%x%s", pa, r, o[0], j[0],
+	    o[0] == 0xC0FFEE02U ? " OK THE GPU WROTE KERNEL RAM" : " FAIL");
+	ctx_deactivate(&c);
+	return o[0] == 0xC0FFEE02U ? 0 : -1;
+}
+
 void sweet_mali_boot(void);
 
 void
@@ -377,6 +423,7 @@ sweet_mali_boot(void)
 	}
 	mali_log("powered: shader=%x tiler=%x l2=%x", rd(R_SHADER_READY), rd(R_TILER_READY), rd(R_L2_READY));
 	mali_selftest();
+	mali_selftest_heap();
 	mali_log("ready, left powered (pool used %u of %u pages)", mali.pool_next, mali.pool_pages);
 }
 #endif /* ARM64_BOARD_CONFIG_SWEET */
