@@ -44,6 +44,7 @@ void sweet_mali_ctx_destroy(int id);
 int sweet_mali_ctx_map(int id, uint64_t va, uint64_t pa);
 void sweet_mali_ctx_unmap(int id, uint64_t va);
 uint32_t sweet_mali_submit(int id, uint32_t slot, uint64_t jc_va, uint32_t timeout_ms);
+void sweet_mali_set_asflush(int on);
 void sweet_mali_log_str(const char *s);
 }
 
@@ -99,9 +100,10 @@ OSDefineMetaClassAndStructors(SweetMali, IOService);
 
 /* bring-up check through the same paths the user client uses: BO -> physical pages -> GPU map -> job */
 static void
-sweet_mali_service_selftest(void)
+sweet_mali_service_selftest_one(int flushvariant)
 {
 	const uint64_t VA_JOB = 0x30000000ULL, VA_OUT = 0x30001000ULL;
+	const uint32_t MAGIC = 0xC0FFEE03U + (uint32_t)flushvariant;
 	int ctx = sweet_mali_ctx_create();
 	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
 	    kIODirectionInOut, 2 * page_size, page_size);
@@ -129,18 +131,29 @@ sweet_mali_service_selftest(void)
 	j[8] = (uint32_t)VA_OUT;
 	j[9] = (uint32_t)(VA_OUT >> 32);
 	j[10] = 6U;
-	j[12] = 0xC0FFEE03U;
+	j[12] = MAGIC;
 	o[0] = 0xDEADBEEFU;
-	sm_log("service selftest: bo ready pa0=%llx pa1=%llx ctx=%llx", pa0, pa1, (uint64_t)ctx);
+	o[1] = 0x11111111U;
+	sm_log("service selftest v%llx: pa0=%llx pa1=%llx", (uint64_t)flushvariant, pa0, pa1);
 	sm_flush_md(md, 2);
+	sweet_mali_set_asflush(flushvariant);
 	uint32_t r = sweet_mali_submit(ctx, 1, VA_JOB, 100);
 	sm_flush_md(md, 2);
-	sm_log("service selftest: status=%llx out=%llx exc=%llx", r, o[0], j[0]);
-	if (o[0] == 0xC0FFEE03U) {
-		sweet_mali_log_str("service selftest: OK THE GPU WROTE A USER-CLIENT STYLE BO");
+	sm_log("service selftest v%llx: status=%llx out=%llx", (uint64_t)flushvariant, r, o[0]);
+	sm_log("service selftest v%llx: exc=%llx out1=%llx j12=%llx", (uint64_t)flushvariant, ((uint64_t)j[0] << 32) | o[1], j[12]);
+	if (o[0] == MAGIC) {
+		sm_log("service selftest v%llx: OK THE GPU WROTE A USER-CLIENT STYLE BO", (uint64_t)flushvariant, 0, 0);
 	}
 	md->release();
 	sweet_mali_ctx_destroy(ctx);
+}
+
+static void
+sweet_mali_service_selftest(void)
+{
+	sweet_mali_service_selftest_one(0);
+	sweet_mali_service_selftest_one(1);
+	sweet_mali_set_asflush(1);
 }
 
 bool

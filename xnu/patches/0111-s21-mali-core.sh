@@ -457,7 +457,16 @@ void sweet_mali_ctx_destroy(int id);
 int sweet_mali_ctx_map(int id, uint64_t va, uint64_t pa);
 void sweet_mali_ctx_unmap(int id, uint64_t va);
 uint32_t sweet_mali_submit(int id, uint32_t slot, uint64_t jc_va, uint32_t timeout_ms);
+void sweet_mali_set_asflush(int on);
 void sweet_mali_log_str(const char *s);
+
+static int use_asflush = 1;
+
+void
+sweet_mali_set_asflush(int on)
+{
+	use_asflush = on;
+}
 
 int
 sweet_mali_up(void)
@@ -548,7 +557,9 @@ sweet_mali_submit(int id, uint32_t slot, uint64_t jc_va, uint32_t timeout_ms)
 		return 0xFFFDU;
 	}
 	ctx_activate(&ctxs[id]);
-	as_flush((uint32_t)id);
+	if (use_asflush) {
+		as_flush((uint32_t)id);
+	}
 	uint32_t r = mali_submit_wait(&ctxs[id], slot, jc_va, timeout_ms);
 	return r;
 }
