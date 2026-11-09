@@ -70,6 +70,22 @@ sm_log(const char *fmt, uint64_t a, uint64_t b, uint64_t c)
 	sweet_mali_log_str(line);
 }
 
+extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
+
+/* The GPU is not cache coherent: clean+invalidate a buffer's pages by physical address. */
+static void
+sm_flush_md(IOBufferMemoryDescriptor *md, uint32_t pages)
+{
+	for (uint32_t k = 0; k < pages; k++) {
+		IOByteCount len = 0;
+		addr64_t pa = md->getPhysicalSegment((IOByteCount)k << 12, &len, kIOMemoryMapperNone);
+		if (pa != 0) {
+			flush_dcache64(pa, page_size, TRUE);
+		}
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
 /* ---------------------------------------------------------------- service */
 
 class SweetMali : public IOService {
@@ -88,7 +104,7 @@ sweet_mali_service_selftest(void)
 	const uint64_t VA_JOB = 0x30000000ULL, VA_OUT = 0x30001000ULL;
 	int ctx = sweet_mali_ctx_create();
 	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-	    kIODirectionInOut | kIOMapWriteCombineCache, 2 * page_size, page_size);
+	    kIODirectionInOut, 2 * page_size, page_size);
 	if (ctx < 0 || md == NULL) {
 		sm_log("service selftest: no ctx/bo (ctx=%llx md=%llx)", (uint64_t)(int64_t)ctx, (uint64_t)(uintptr_t)md, 0);
 		OSSafeReleaseNULL(md);
@@ -115,9 +131,10 @@ sweet_mali_service_selftest(void)
 	j[10] = 6U;
 	j[12] = 0xC0FFEE03U;
 	o[0] = 0xDEADBEEFU;
-	__asm__ volatile ("dsb sy" ::: "memory");
+	sm_log("service selftest: bo ready pa0=%llx pa1=%llx ctx=%llx", pa0, pa1, (uint64_t)ctx);
+	sm_flush_md(md, 2);
 	uint32_t r = sweet_mali_submit(ctx, 1, VA_JOB, 100);
-	__asm__ volatile ("dsb sy" ::: "memory");
+	sm_flush_md(md, 2);
 	sm_log("service selftest: status=%llx out=%llx exc=%llx", r, o[0], j[0]);
 	if (o[0] == 0xC0FFEE03U) {
 		sweet_mali_log_str("service selftest: OK THE GPU WROTE A USER-CLIENT STYLE BO");
@@ -285,7 +302,7 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			break;
 		}
 		IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-		    kIODirectionInOut | kIOMapWriteCombineCache, (vm_size_t)size, page_size);
+		    kIODirectionInOut, (vm_size_t)size, page_size);
 		if (md == NULL) {
 			ret = kIOReturnNoMemory;
 			break;
@@ -346,7 +363,17 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		if (tmo > 5000) {
 			tmo = 5000;
 		}
+		for (uint32_t i = 0; i < SM_MAX_BO; i++) {
+			if (fBo[i].md != NULL && fBo[i].mapped) {
+				sm_flush_md(fBo[i].md, fBo[i].pages);
+			}
+		}
 		args->scalarOutput[0] = sweet_mali_submit(fCtx, (uint32_t)args->scalarInput[0], args->scalarInput[1], tmo);
+		for (uint32_t i = 0; i < SM_MAX_BO; i++) {
+			if (fBo[i].md != NULL && fBo[i].mapped) {
+				sm_flush_md(fBo[i].md, fBo[i].pages);
+			}
+		}
 		args->scalarOutputCount = 1;
 		ret = kIOReturnSuccess;
 		break;
