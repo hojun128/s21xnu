@@ -1,0 +1,22 @@
+name: userland
+on:
+  workflow_dispatch:
+  push:
+    paths: ["userland/**", ".github/workflows/userland.yml"]
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build iOS arm64 tools
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p out
+          for f in userland/*.c; do
+            n=$(basename $f .c)
+            xcrun clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -framework IOKit "$f" -o out/$n
+            codesign -f -s - out/$n
+          done
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with: { name: ios-tools, path: out/ }
