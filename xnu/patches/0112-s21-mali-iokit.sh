@@ -58,6 +58,7 @@ enum {
 	kSMMapBO = 2,
 	kSMSubmit = 3,
 	kSMDestroyBO = 4,
+	kSMLog = 5,
 };
 
 static IOLock *sm_lock;                 /* serializes all hardware / context calls */
@@ -398,6 +399,20 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			break;
 		}
 		freeBo((uint32_t)(h - 1));
+		ret = kIOReturnSuccess;
+		break;
+	}
+	case kSMLog: {
+		char buf[160];
+		if (args->structureInput == NULL || args->structureInputSize == 0) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		size_t n = args->structureInputSize < sizeof(buf) - 8 ? args->structureInputSize : sizeof(buf) - 8;
+		memcpy(buf, "user: ", 6);
+		memcpy(buf + 6, args->structureInput, n);
+		buf[6 + n] = 0;
+		sweet_mali_log_str(buf);
 		ret = kIOReturnSuccess;
 		break;
 	}
