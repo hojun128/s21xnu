@@ -241,13 +241,28 @@ static int run(void)
 
 	uint64_t st;
 	{
-		const unsigned char *vb[2] = { POSA_BIN, POSB_BIN };
-		size_t vl[2] = { sizeof POSA_BIN, sizeof POSB_BIN };
-		for (int k = 0; k < 2; k++) {
+		const unsigned char *vb[5] = { POSA_BIN, POSB_BIN, POSD_BIN, POSE_BIN, POSF_BIN };
+		size_t vl[5] = { sizeof POSA_BIN, sizeof POSB_BIN, sizeof POSD_BIN, sizeof POSE_BIN, sizeof POSF_BIN };
+		for (int k = 0; k < 5; k++) {
 			memset(cpu + OFF_BPOS, 0, 0x100);
 			memcpy(cpu + OFF_BPOS, vb[k], vl[k]);
 			for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
 			kr = submit(c, 1, VA_BASE + OFF_VJOB, &st);
+			char nm[4] = { 'a' + k, 0 }, e1[40], e2[40];
+			enc(e1, kr); enc(e2, *(volatile uint32_t *)(cpu + OFF_VJOB));
+			ulog("EV%s %s %s", nm, e1, e2);
+			if (k == 1) {
+				for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_FJOB))[q] = 0;
+				kr = submit(c, 0, VA_BASE + OFF_FJOB, &st);
+				enc(e1, kr); enc(e2, *(volatile uint32_t *)(cpu + OFF_FJOB));
+				ulog("EFB %s %s", e1, e2);
+			}
+		}
+		memset(cpu + OFF_BPOS, 0, 0x100);
+		memcpy(cpu + OFF_BPOS, POS_BIN, sizeof POS_BIN);
+		for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
+	}
+	kr = submit(c, 1, VA_BASE + OFF_VJOB, &st);
 			char nm[4] = { 'a' + k, 0 };
 			edump(nm, kr, (uint32_t)st, (volatile uint32_t *)(cpu + OFF_VJOB));
 		}
