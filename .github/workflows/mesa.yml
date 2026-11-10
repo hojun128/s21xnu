@@ -20,14 +20,22 @@ jobs:
       - name: Fetch mesa
         run: |
           git clone -q --depth 1 -b "${{ inputs.mesa_ref || 'mesa-24.1.7' }}" https://gitlab.freedesktop.org/mesa/mesa.git mesa
+      - name: libdrm headers (compile-time only; runtime goes through SweetMali)
+        run: |
+          git clone -q --depth 1 -b libdrm-2.4.123 https://gitlab.freedesktop.org/mesa/drm.git drm
+          mkdir -p drminc/libdrm
+          cp drm/xf86drm.h drminc/
+          cp drm/include/drm/*.h drminc/
+          cp drm/include/drm/*.h drminc/libdrm/
+          ls drminc | head -40
       - name: Cross file
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           CC=$(xcrun --sdk iphoneos -f clang); CXX=$(xcrun --sdk iphoneos -f clang++); AR=$(xcrun --sdk iphoneos -f ar)
           cat > ios.ini <<EOF2
           [binaries]
-          c = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0']
-          cpp = ['$CXX', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0']
+          c = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0', '-I$GITHUB_WORKSPACE/drminc']
+          cpp = ['$CXX', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0', '-I$GITHUB_WORKSPACE/drminc']
           objc = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0']
           ar = '$AR'
           strip = 'strip'
