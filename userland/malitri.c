@@ -98,7 +98,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: build4 bo ok heap=%d", have_heap);
+	ulog("tri: build5 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	volatile uint32_t *px = (volatile uint32_t *)(cpu + OFF_FB);
@@ -282,6 +282,6 @@ int main(void)
 	int r = run();
 	ulog("malitri done rc=%d", r);
 	sleep(3);
-	kill(1, SIGKILL);
+	for (;;) sleep(60);
 	return r;
 }
