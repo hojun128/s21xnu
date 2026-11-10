@@ -51,8 +51,8 @@ static void ulog(const char *fmt, ...)
 #define OFF_SAMP 0xC00
 #define OFF_FB   0x1000
 #ifndef VAR_FIRST
-#define VAR_FIRST 1
-#define VAR_LAST 2
+#define VAR_FIRST 3
+#define VAR_LAST 4
 #endif
 #define W 64
 #define H 64
@@ -152,7 +152,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: build8 bo ok heap=%d", have_heap);
+	ulog("tri: build9 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	volatile uint32_t *px = (volatile uint32_t *)(cpu + OFF_FB);
