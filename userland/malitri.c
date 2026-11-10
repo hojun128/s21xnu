@@ -240,6 +240,21 @@ static int run(void)
 	}
 
 	uint64_t st;
+	{
+		const unsigned char *vb[2] = { POSA_BIN, POSB_BIN };
+		size_t vl[2] = { sizeof POSA_BIN, sizeof POSB_BIN };
+		for (int k = 0; k < 2; k++) {
+			memset(cpu + OFF_BPOS, 0, 0x100);
+			memcpy(cpu + OFF_BPOS, vb[k], vl[k]);
+			for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
+			kr = submit(c, 1, VA_BASE + OFF_VJOB, &st);
+			char nm[4] = { 'a' + k, 0 };
+			edump(nm, kr, (uint32_t)st, (volatile uint32_t *)(cpu + OFF_VJOB));
+		}
+		memset(cpu + OFF_BPOS, 0, 0x100);
+		memcpy(cpu + OFF_BPOS, POS_BIN, sizeof POS_BIN);
+		for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
+	}
 	kr = submit(c, 1, VA_BASE + OFF_VJOB, &st);
 	uint32_t vexc = *(volatile uint32_t *)(cpu + OFF_VJOB);
 	edump("V", kr, (uint32_t)st, (volatile uint32_t *)(cpu + OFF_VJOB));
