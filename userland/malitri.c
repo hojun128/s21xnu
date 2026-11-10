@@ -52,6 +52,14 @@ static void ulog(const char *fmt, ...)
 #define W 64
 #define H 64
 
+
+static void enc(char *o, uint32_t v) { for (int i = 7; i >= 0; i--) *o++ = 'B' + 2 * ((v >> (4 * i)) & 15); *o = 0; }
+static void edump(const char *tag, uint32_t a, uint32_t b, const volatile uint32_t *w)
+{
+	char x[9], y[9], z[9], q[9], r[9], t[9];
+	enc(x, a); enc(y, b); enc(z, w[0]); enc(q, w[1]); enc(r, w[2]); enc(t, w[3]);
+	ulog("E%s %s %s %s %s %s %s", tag, x, y, z, q, r, t);
+}
 static kern_return_t submit(io_connect_t c, uint64_t slot, uint64_t jc, uint64_t *st)
 {
 	uint64_t in[3] = { slot, jc, 1500 }, out[2]; uint32_t oc = 1;
@@ -232,9 +240,11 @@ static int run(void)
 	uint64_t st;
 	kr = submit(c, 1, VA_BASE + OFF_VJOB, &st);
 	uint32_t vexc = *(volatile uint32_t *)(cpu + OFF_VJOB);
+	edump("V", kr, (uint32_t)st, (volatile uint32_t *)(cpu + OFF_VJOB));
 	ulog("tri: vertex kr=%x status=%llx exc=%08x", kr, st, vexc);
 	kr = submit(c, 0, VA_BASE + OFF_FJOB, &st);
 	uint32_t fexc = *(volatile uint32_t *)(cpu + OFF_FJOB);
+	edump("F", kr, (uint32_t)st, (volatile uint32_t *)(cpu + OFF_FJOB));
 	int tri = 0, bg = 0;
 	for (int i = 0; i < W * H; i++) { if (px[i] == 0xFF00FF00u) tri++; else if (px[i] == 0xFF0000FFu) bg++; }
 	ulog("tri: frag kr=%x status=%llx exc=%08x tri=%d bg=%d p(10,10)=%08x p(50,50)=%08x %s", kr, st, fexc, tri, bg,
