@@ -6,13 +6,22 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Mesa headers (panfrost genxml packers)
+        run: |
+          git clone -q --depth 1 -b mesa-24.1.7 https://gitlab.freedesktop.org/mesa/mesa.git mesa
+          mkdir -p gx/genxml
+          for p in common v9; do python3 mesa/src/panfrost/lib/genxml/gen_pack.py mesa/src/panfrost/lib/genxml/$p.xml > gx/genxml/${p}_pack.h; done
+          ls -la gx/genxml
       - name: Build iOS arm64 tools
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          M=$PWD/mesa; G=$PWD/gx
           mkdir -p out
           for f in userland/*.c; do
             n=$(basename "$f" .c)
-            xcrun clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -framework IOKit "$f" -o "out/$n"
+            xcrun clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -framework IOKit \
+              -I$G -I$M/src/panfrost/lib -I$M/src/panfrost -I$M/include -I$M/src -I$M/src/panfrost/include -I$M/src/compiler \
+              "$f" -o "out/$n"
             codesign -f -s - "out/$n"
           done
           ls -la out
