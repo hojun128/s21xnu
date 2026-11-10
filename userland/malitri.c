@@ -98,7 +98,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: bo ok heap=%d", have_heap);
+	ulog("tri: build3 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	volatile uint32_t *px = (volatile uint32_t *)(cpu + OFF_FB);
@@ -258,12 +258,6 @@ static int run(void)
 			char nm[4] = { 'a' + k, 0 }, e1[40], e2[40];
 			enc(e1, kr); enc(e2, *(volatile uint32_t *)(cpu + OFF_VJOB));
 			ulog("EV%s %s %s", nm, e1, e2);
-			if (k == 1) {
-				for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_FJOB))[q] = 0;
-				kr = submit(c, 0, VA_BASE + OFF_FJOB, &st);
-				enc(e1, kr); enc(e2, *(volatile uint32_t *)(cpu + OFF_FJOB));
-				ulog("EFB %s %s", e1, e2);
-			}
 		}
 		memset(cpu + OFF_BPOS, 0, 0x100);
 		memcpy(cpu + OFF_BPOS, POS_BIN, sizeof POS_BIN);
