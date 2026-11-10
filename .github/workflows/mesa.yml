@@ -1,0 +1,66 @@
+name: mesa-panfrost-ios
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: mesa tag
+        default: mesa-24.1.7
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deps
+        run: |
+          brew install meson ninja bison flex pkg-config
+          pip3 install --break-system-packages mako pyyaml packaging
+          echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
+          echo "$(brew --prefix flex)/bin" >> $GITHUB_PATH
+      - name: Fetch mesa
+        run: |
+          git clone -q --depth 1 -b "${{ inputs.mesa_ref || 'mesa-24.1.7' }}" https://gitlab.freedesktop.org/mesa/mesa.git mesa
+      - name: Cross file
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC=$(xcrun --sdk iphoneos -f clang); CXX=$(xcrun --sdk iphoneos -f clang++); AR=$(xcrun --sdk iphoneos -f ar)
+          cat > ios.ini <<EOF2
+          [binaries]
+          c = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0']
+          cpp = ['$CXX', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0']
+          objc = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0']
+          ar = '$AR'
+          strip = 'strip'
+          pkg-config = 'false'
+          [host_machine]
+          system = 'darwin'
+          subsystem = 'ios'
+          cpu_family = 'aarch64'
+          cpu = 'arm64'
+          endian = 'little'
+          EOF2
+          sed -i '' 's/^          //' ios.ini; cat ios.ini
+      - name: Configure (panfrost, no drm/llvm/platforms)
+        working-directory: mesa
+        run: |
+          meson setup ../b --cross-file ../ios.ini -Dbuildtype=release \
+            -Dgallium-drivers=panfrost -Dvulkan-drivers= -Dplatforms= -Dglx=disabled -Degl=disabled \
+            -Dgbm=disabled -Dllvm=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
+            -Dshared-glapi=disabled -Dzstd=disabled -Dexpat=disabled -Dvalgrind=disabled \
+            -Dlibunwind=disabled -Dbuild-tests=false -Dtools= 2>&1 | tee ../configure.log
+      - name: Build panfrost compiler + lib only
+        run: |
+          ninja -C b -k 0 src/panfrost/compiler/libpanfrost_bifrost.a src/panfrost/lib/libpanfrost_lib.a 2>&1 | tee build.log | tail -60
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out; cp configure.log build.log out/ 2>/dev/null || true
+          find b -name '*.a' -path '*panfrost*' -exec cp {} out/ \; 2>/dev/null || true
+          find b/src/util -name 'libmesa_util*.a' -exec cp {} out/ \; 2>/dev/null || true
+          find b/src/compiler -maxdepth 2 -name '*.a' -exec cp {} out/ \; 2>/dev/null || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mesa-panfrost-ios
+          path: out/
