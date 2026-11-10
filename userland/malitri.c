@@ -148,7 +148,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: build6 bo ok heap=%d", have_heap);
+	ulog("tri: build7 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	volatile uint32_t *px = (volatile uint32_t *)(cpu + OFF_FB);
@@ -270,8 +270,9 @@ static int run(void)
 	}
 	int tri = 0, bg = 0;
 	{
-		static const struct { uint32_t mask; int usetiler; int usesamp; } V[4] = { {0xFF,1,1}, {0x28,1,1}, {0x28,0,1}, {0x28,1,0} };
+		static const struct { uint32_t mask; int usetiler; int usesamp; } V[4] = { {0x28,0,1}, {0x28,1,0}, {0x28,1,1}, {0xFF,1,1} };
 		for (int v = 0; v < 4; v++) {
+			ulog("tri: about var%d", v);
 			repack(cpu, V[v].mask, V[v].usetiler ? VA_BASE + OFF_TCTX : 0, V[v].usesamp ? VA_BASE + OFF_SAMP : 0);
 			for (int i = 0; i < W * H; i++) px[i] = 0xDEADBEEF;
 			for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
