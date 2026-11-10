@@ -87,6 +87,56 @@ static io_connect_t mkbo(io_connect_t c, uint64_t size, uint64_t va, uint8_t **c
 	return 1;
 }
 
+static void repack(uint8_t *cpu, uint32_t mask, uint64_t tiler, uint64_t samp)
+{
+	pan_pack(cpu + OFF_THEAP, TILER_HEAP, heap_d) {
+		heap_d.size = HEAP_BYTES;
+		heap_d.base = HEAP_VA;
+		heap_d.bottom = HEAP_VA;
+		heap_d.top = HEAP_VA + HEAP_BYTES;
+	}
+	pan_pack(cpu + OFF_TCTX, TILER_CONTEXT, t) {
+		t.hierarchy_mask = mask;
+		t.fb_width = W;
+		t.fb_height = H;
+		t.heap = VA_BASE + OFF_THEAP;
+		t.sample_pattern = MALI_SAMPLE_PATTERN_SINGLE_SAMPLED;
+		t.first_provoking_vertex = true;
+	}
+	void *fbd = cpu + OFF_FBD;
+	pan_section_pack(fbd, FRAMEBUFFER, PARAMETERS, cfg) {
+		cfg.pre_frame_0 = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
+		cfg.pre_frame_1 = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
+		cfg.post_frame = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
+		cfg.width = W; cfg.height = H;
+		cfg.bound_max_x = W - 1; cfg.bound_max_y = H - 1;
+		cfg.effective_tile_size = 256;
+		cfg.tie_break_rule = MALI_TIE_BREAK_RULE_MINUS_180_IN_0_OUT;
+		cfg.render_target_count = 1;
+		cfg.z_internal_format = MALI_Z_INTERNAL_FORMAT_D24;
+		cfg.color_buffer_allocation = 1024;
+		cfg.sample_count = 1;
+		cfg.sample_pattern = MALI_SAMPLE_PATTERN_SINGLE_SAMPLED;
+		cfg.tiler = tiler;
+		cfg.sample_locations = samp;
+		cfg.first_provoking_vertex = true;
+	}
+	pan_section_pack(fbd, FRAMEBUFFER, PADDING, padding) {}
+	pan_pack((uint8_t *)fbd + pan_size(FRAMEBUFFER), RENDER_TARGET, rt) {
+		rt.clean_pixel_write_enable = true;
+		rt.clear.color_0 = rt.clear.color_1 = rt.clear.color_2 = rt.clear.color_3 = 0xFF0000FFu;
+		rt.write_enable = true;
+		rt.dithering_enable = true;
+		rt.internal_format = MALI_COLOR_BUFFER_INTERNAL_FORMAT_R8G8B8A8;
+		rt.writeback_format = MALI_COLOR_FORMAT_R8G8B8A8;
+		rt.writeback_block_format = MALI_BLOCK_FORMAT_LINEAR;
+		rt.writeback_msaa = MALI_MSAA_SINGLE;
+		rt.swizzle = 0 | (1 << 3) | (2 << 6) | (3 << 9);
+		rt.rgb.base = VA_BASE + OFF_FB;
+		rt.rgb.row_stride = W * 4;
+	}
+}
+
 static int run(void)
 {
 	io_service_t s = 0;
@@ -98,7 +148,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: build5 bo ok heap=%d", have_heap);
+	ulog("tri: build6 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	volatile uint32_t *px = (volatile uint32_t *)(cpu + OFF_FB);
@@ -110,20 +160,7 @@ static int run(void)
 	memcpy(v, tv, sizeof tv);
 	((uint64_t *)(cpu + OFF_FAU))[0] = VA_BASE + OFF_VERT;
 
-	pan_pack(cpu + OFF_THEAP, TILER_HEAP, heap_d) {
-		heap_d.size = HEAP_BYTES;
-		heap_d.base = HEAP_VA;
-		heap_d.bottom = HEAP_VA;
-		heap_d.top = HEAP_VA + HEAP_BYTES;
-	}
-	pan_pack(cpu + OFF_TCTX, TILER_CONTEXT, t) {
-		t.hierarchy_mask = 0x28;
-		t.fb_width = W;
-		t.fb_height = H;
-		t.heap = VA_BASE + OFF_THEAP;
-		t.sample_pattern = MALI_SAMPLE_PATTERN_SINGLE_SAMPLED;
-		t.first_provoking_vertex = true;
-	}
+	repack(cpu, 0x28, VA_BASE + OFF_TCTX, VA_BASE + OFF_SAMP);
 	pan_pack(cpu + OFF_TLS, LOCAL_STORAGE, tl) {
 		tl.wls_instances = MALI_LOCAL_STORAGE_NO_WORKGROUP_MEM;
 	}
@@ -152,38 +189,6 @@ static int run(void)
 	{
 		uint16_t *sp = (uint16_t *)(cpu + OFF_SAMP);
 		for (int i = 0; i < 128; i++) sp[i] = 128;
-	}
-	void *fbd = cpu + OFF_FBD;
-	pan_section_pack(fbd, FRAMEBUFFER, PARAMETERS, cfg) {
-		cfg.pre_frame_0 = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
-		cfg.pre_frame_1 = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
-		cfg.post_frame = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
-		cfg.width = W; cfg.height = H;
-		cfg.bound_max_x = W - 1; cfg.bound_max_y = H - 1;
-		cfg.effective_tile_size = 256;
-		cfg.tie_break_rule = MALI_TIE_BREAK_RULE_MINUS_180_IN_0_OUT;
-		cfg.render_target_count = 1;
-		cfg.z_internal_format = MALI_Z_INTERNAL_FORMAT_D24;
-		cfg.color_buffer_allocation = 1024;
-		cfg.sample_count = 1;
-		cfg.sample_pattern = MALI_SAMPLE_PATTERN_SINGLE_SAMPLED;
-		cfg.tiler = VA_BASE + OFF_TCTX;
-		cfg.sample_locations = VA_BASE + OFF_SAMP;
-		cfg.first_provoking_vertex = true;
-	}
-	pan_section_pack(fbd, FRAMEBUFFER, PADDING, padding) {}
-	pan_pack((uint8_t *)fbd + pan_size(FRAMEBUFFER), RENDER_TARGET, rt) {
-		rt.clean_pixel_write_enable = true;
-		rt.clear.color_0 = rt.clear.color_1 = rt.clear.color_2 = rt.clear.color_3 = 0xFF0000FFu;
-		rt.write_enable = true;
-		rt.dithering_enable = true;
-		rt.internal_format = MALI_COLOR_BUFFER_INTERNAL_FORMAT_R8G8B8A8;
-		rt.writeback_format = MALI_COLOR_FORMAT_R8G8B8A8;
-		rt.writeback_block_format = MALI_BLOCK_FORMAT_LINEAR;
-		rt.writeback_msaa = MALI_MSAA_SINGLE;
-		rt.swizzle = 0 | (1 << 3) | (2 << 6) | (3 << 9);
-		rt.rgb.base = VA_BASE + OFF_FB;
-		rt.rgb.row_stride = W * 4;
 	}
 
 	void *vj = cpu + OFF_VJOB;
@@ -263,17 +268,27 @@ static int run(void)
 		memcpy(cpu + OFF_BPOS, POS_BIN, sizeof POS_BIN);
 		for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
 	}
-	kr = submit(c, 1, VA_BASE + OFF_VJOB, &st);
-	uint32_t vexc = *(volatile uint32_t *)(cpu + OFF_VJOB);
-	edump("V", kr, (uint32_t)st, (volatile uint32_t *)(cpu + OFF_VJOB));
-	ulog("tri: vertex kr=%x status=%llx exc=%08x", kr, st, vexc);
-	kr = submit(c, 0, VA_BASE + OFF_FJOB, &st);
-	uint32_t fexc = *(volatile uint32_t *)(cpu + OFF_FJOB);
-	edump("F", kr, (uint32_t)st, (volatile uint32_t *)(cpu + OFF_FJOB));
 	int tri = 0, bg = 0;
-	for (int i = 0; i < W * H; i++) { if (px[i] == 0xFF00FF00u) tri++; else if (px[i] == 0xFF0000FFu) bg++; }
-	ulog("tri: frag kr=%x status=%llx exc=%08x tri=%d bg=%d p(10,10)=%08x p(50,50)=%08x %s", kr, st, fexc, tri, bg,
-	    px[10 * W + 10], px[50 * W + 50], tri > 1000 ? "GPU-DREW-TRIANGLE" : "TRI-FAIL");
+	{
+		static const struct { uint32_t mask; int usetiler; int usesamp; } V[4] = { {0xFF,1,1}, {0x28,1,1}, {0x28,0,1}, {0x28,1,0} };
+		for (int v = 0; v < 4; v++) {
+			repack(cpu, V[v].mask, V[v].usetiler ? VA_BASE + OFF_TCTX : 0, V[v].usesamp ? VA_BASE + OFF_SAMP : 0);
+			for (int i = 0; i < W * H; i++) px[i] = 0xDEADBEEF;
+			for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
+			for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_FJOB))[q] = 0;
+			kr = submit(c, 1, VA_BASE + OFF_VJOB, &st);
+			uint32_t vexc = *(volatile uint32_t *)(cpu + OFF_VJOB);
+			kr = submit(c, 0, VA_BASE + OFF_FJOB, &st);
+			uint32_t fexc = *(volatile uint32_t *)(cpu + OFF_FJOB);
+			tri = bg = 0;
+			for (int i = 0; i < W * H; i++) { if (px[i] == 0xFF00FF00u) tri++; else if (px[i] == 0xFF0000FFu) bg++; }
+			char e1[40], e2[40]; enc(e1, vexc); enc(e2, fexc);
+			ulog("EW%d %s %s", v, e1, e2);
+			ulog("tri: var%d vexc=%08x fexc=%08x tri=%d bg=%d p(10,10)=%08x p(50,50)=%08x %s", v, vexc, fexc, tri, bg,
+			    px[10 * W + 10], px[50 * W + 50], tri > 1000 ? "GPU-DREW-TRIANGLE" : "TRI-FAIL");
+			if (tri > 1000) break;
+		}
+	}
 	return tri > 1000 ? 0 : 5;
 }
 
