@@ -48,6 +48,7 @@ static void ulog(const char *fmt, ...)
 #define OFF_BPOS 0x800
 #define OFF_BFRAG 0x900
 #define OFF_VERT 0xA00
+#define OFF_SAMP 0xC00
 #define OFF_FB   0x1000
 #define W 64
 #define H 64
@@ -148,6 +149,10 @@ static int run(void)
 		sp.preload.r60 = true;
 	}
 
+	{
+		uint16_t *sp = (uint16_t *)(cpu + OFF_SAMP);
+		for (int i = 0; i < 128; i++) sp[i] = 128;
+	}
 	void *fbd = cpu + OFF_FBD;
 	pan_section_pack(fbd, FRAMEBUFFER, PARAMETERS, cfg) {
 		cfg.pre_frame_0 = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
@@ -163,6 +168,8 @@ static int run(void)
 		cfg.sample_count = 1;
 		cfg.sample_pattern = MALI_SAMPLE_PATTERN_SINGLE_SAMPLED;
 		cfg.tiler = VA_BASE + OFF_TCTX;
+		cfg.sample_locations = VA_BASE + OFF_SAMP;
+		cfg.first_provoking_vertex = true;
 	}
 	pan_section_pack(fbd, FRAMEBUFFER, PADDING, padding) {}
 	pan_pack((uint8_t *)fbd + pan_size(FRAMEBUFFER), RENDER_TARGET, rt) {
