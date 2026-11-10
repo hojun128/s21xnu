@@ -28,7 +28,7 @@ static void ulog(const char *fmt, ...)
 static int run(void)
 {
 	io_service_t s = 0;
-	for (int i = 0; i < 600 && !s; i++) { s = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("SweetMali")); if (!s) sleep(2); }
+	for (int i = 0; i < 30 && !s; i++) { s = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("SweetMali")); if (!s) sleep(2); }
 	printf("service=%u\n", s);
 	if (!s) return 1;
 	io_connect_t c = 0;
