@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <signal.h>
 #include <mach/mach.h>
 
 typedef mach_port_t io_object_t, io_service_t, io_connect_t;
@@ -24,7 +25,7 @@ static void ulog(const char *fmt, ...)
 	printf("%s\n", b); fflush(stdout);
 	if (gc) IOConnectCallMethod(gc, 5, NULL, 0, b, strlen(b), NULL, NULL, NULL, NULL);
 }
-int main(void)
+static int run(void)
 {
 	io_service_t s = 0;
 	for (int i = 0; i < 600 && !s; i++) { s = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("SweetMali")); if (!s) sleep(2); }
@@ -62,4 +63,13 @@ int main(void)
 	ulog("submit kr=%x status=%llx out=%08x exc=%x %s", kr, out[0], o[0], j[0],
 	    o[0] == 0xA11CE5E1U ? "GPU-FROM-USERLAND-OK" : "FAIL");
 	return o[0] == 0xA11CE5E1U ? 0 : 5;
+}
+
+int main(void)
+{
+	int r = run();
+	ulog("malitest done rc=%d; killing launchd so the panic keeps the log", r);
+	sleep(3);
+	kill(1, SIGKILL);
+	return r;
 }
