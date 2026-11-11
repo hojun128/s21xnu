@@ -35,7 +35,7 @@ char g_hist[16][150]; int g_nh;
 #include "malitri_gen.h"
 
 #define BO_BYTES 32768
-#define HEAP_BYTES (4u << 20)
+#define HEAP_BYTES (16u << 20)
 #define HEAP_VA  0x40000000ULL
 #define OFF_FJOB 0x000
 #define OFF_FBD  0x040
@@ -162,7 +162,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: disp1 bo ok heap=%d", have_heap);
+	ulog("tri: disp2 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	float *v = (float *)(cpu + OFF_VERT);
@@ -295,19 +295,22 @@ static int run(void)
 	memset(cpu + OFF_BPOS, 0, 0x100); memcpy(cpu + OFF_BPOS, VS_BIG, sizeof VS_BIG);
 	memset(cpu + OFF_BFRAG, 0, 0x100); memcpy(cpu + OFF_BFRAG, FS_GREEN, sizeof FS_GREEN);
 	static const uint32_t clears[4] = { 0xFF300000u, 0xFF003000u, 0xFF000030u, 0xFF303000u };
+	static const uint32_t masks[3] = { 0xFF, 0x28, 0x08 };
 	for (int f = 0; f < 4000; f++) {
 		g_clear = clears[f & 3];
+		uint32_t mk = masks[f % 3];
 		memset(heap, 0, HEAP_BYTES);
-		repack(cpu, 0xFF, VA_BASE + OFF_TCTX, VA_BASE + OFF_SAMP);
+		repack(cpu, mk, VA_BASE + OFF_TCTX, VA_BASE + OFF_SAMP);
 		for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
 		for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_FJOB))[q] = 0;
 		uint64_t st;
 		kr = submit(c, 1, VA_BASE + OFF_VJOB, &st);
 		uint32_t vexc = *(volatile uint32_t *)(cpu + OFF_VJOB);
+		uint64_t vst = st;
 		kr = submit(c, 0, VA_BASE + OFF_FJOB, &st);
 		uint32_t fexc = *(volatile uint32_t *)(cpu + OFF_FJOB);
-		if (f < 6 || (f % 20) == 0) ulog("disp: frame %d vexc=%08x fexc=%08x", f, vexc, fexc);
-		usleep(500000);
+		ulog("disp: f%d mask=%02x vexc=%08x vst=%llx fexc=%08x fst=%llx", f, mk, vexc, vst, fexc, st);
+		sleep(2);
 	}
 	return 0;
 }
