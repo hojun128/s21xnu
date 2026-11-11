@@ -28,8 +28,9 @@ jobs:
             -Dlibunwind=disabled -Dbuild-tests=false -Dtools= 2>&1 | tail -5
       - name: Build libs
         run: |
-          ninja -C b src/panfrost/compiler/libpanfrost_bifrost.a src/compiler/nir/libnir.a src/compiler/libcompiler.a src/util/libmesa_util.a 2>&1 | tail -15 || true
-          ninja -C b -k 0 2>&1 | tail -3 || true
+          T=$(ninja -C b -t targets all | grep -E '^src/(panfrost|c11|compiler|util)[^:]*\.a:' | cut -d: -f1 | tr '\n' ' ')
+          echo "$T"
+          ninja -C b -k 0 $T 2>&1 | tail -15 || true
       - name: Build tool
         run: |
           set -x
@@ -45,7 +46,7 @@ jobs:
           FLAGS=$(echo "$CMD" | tr ' ' '\n' | grep -E '^-(I|D|std|isystem)' | tr '\n' ' ')
           cd b
           clang -O1 -w $FLAGS -I$PWD ../tools/shadergen/shadergen.c -o shadergen \
-            $(find src -name '*.a' | grep -v -E 'gallium|drivers/' ) $(find src -name '*.a' | grep -v -E 'gallium|drivers/') -lm -lz 2>&1 | tail -40
+            $(find src -name '*.a' | grep -v -E 'gallium|drivers/|libpanfrost_lib') $(find src -name '*.a' | grep -v -E 'gallium|drivers/') -lm -lz 2>&1 | tail -40
           ls -la shadergen
       - name: Run
         run: |
