@@ -35,7 +35,7 @@ char g_hist[16][150]; int g_nh;
 #include "malitri_gen.h"
 
 #define BO_BYTES 32768
-#define HEAP_BYTES (16u << 20)
+#define HEAP_BYTES (4u << 20)
 #define HEAP_VA  0x40000000ULL
 #define OFF_FJOB 0x000
 #define OFF_FBD  0x040
@@ -162,7 +162,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: disp2 bo ok heap=%d", have_heap);
+	ulog("tri: disp3 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	float *v = (float *)(cpu + OFF_VERT);
