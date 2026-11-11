@@ -3,6 +3,8 @@
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
 #include <mach/mach.h>
+#include <signal.h>
+#include <unistd.h>
 #include <stdarg.h>
 
 typedef mach_port_t io_object_t, io_service_t, io_connect_t;
@@ -23,15 +25,19 @@ static void ulog(const char *fmt, ...)
 	if (nh < 12) snprintf(hist[nh++], 150, "%s", b);
 }
 
+static void onsig(int sg) { char b[40]; snprintf(b, sizeof b, "mtltest: CRASH signal %d", sg); if (gc) IOConnectCallMethod(gc, 5, NULL, 0, b, strlen(b), NULL, NULL, NULL, NULL); _exit(1); }
 int main(void)
 {
+	signal(SIGSEGV, onsig); signal(SIGBUS, onsig); signal(SIGABRT, onsig); signal(SIGILL, onsig); signal(SIGTRAP, onsig);
 	@autoreleasepool {
 		io_service_t s = 0;
 		for (int i = 0; i < 30 && !s; i++) { s = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("SweetMali")); if (!s) sleep(2); }
 		if (s) IOServiceOpen(s, mach_task_self(), 0, &gc);
 		io_service_t acc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOAcceleratorES"));
 		ulog("mtltest: SweetMali=%u IOAcceleratorES=%u", s, acc);
-		id<MTLDevice> d = MTLCreateSystemDefaultDevice();
+		ulog("mtltest: calling MTLCreateSystemDefaultDevice");
+		id<MTLDevice> d = nil;
+		@try { d = MTLCreateSystemDefaultDevice(); } @catch (NSException *e) { ulog("mtltest: exception %s", [[e description] UTF8String]); }
 		ulog("mtltest: MTLCreateSystemDefaultDevice -> %p %s", d, d ? object_getClassName(d) : "nil");
 		if (d) ulog("mtltest: name=%s", [[d name] UTF8String]);
 		NSArray *all = MTLCopyAllDevices();

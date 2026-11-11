@@ -12,6 +12,5 @@
 	<key>CFBundleVersion</key><string>1</string>
 	<key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
 	<key>MinimumOSVersion</key><string>16.0</string>
-	<key>NSPrincipalClass</key><string>SweetMTLDevice</string>
 </dict>
 </plist>
