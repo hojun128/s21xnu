@@ -48,14 +48,16 @@ char g_hist[16][150]; int g_nh;
 #define OFF_SFRAG 0x5C0
 #define OFF_TLS  0x600
 #define OFF_FAU  0x700
+#define OFF_FAU2 0x780
+#define OFF_MARK 0xB00
 #define OFF_BPOS 0x800
 #define OFF_BFRAG 0x900
 #define OFF_VERT 0xA00
 #define OFF_SAMP 0xC00
 #define OFF_FB   0x1000
 #ifndef VAR_FIRST
-#define VAR_FIRST 0
-#define VAR_LAST 1
+#define VAR_FIRST 3
+#define VAR_LAST 4
 #endif
 #define W 64
 #define H 64
@@ -159,7 +161,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: build15 bo ok heap=%d", have_heap);
+	ulog("tri: build16 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	volatile uint32_t *px = (volatile uint32_t *)(cpu + OFF_FB);
@@ -170,6 +172,7 @@ static int run(void)
 	float tv[12] = { 4, 4, 0.5f, 1, 60, 4, 0.5f, 1, 4, 60, 0.5f, 1 };
 	memcpy(v, tv, sizeof tv);
 	((uint64_t *)(cpu + OFF_FAU))[0] = VA_BASE + OFF_VERT;
+	((uint64_t *)(cpu + OFF_FAU2))[0] = VA_BASE + OFF_MARK;
 
 	repack(cpu, 0x28, VA_BASE + OFF_TCTX, VA_BASE + OFF_SAMP);
 	pan_pack(cpu + OFF_TLS, LOCAL_STORAGE, tl) {
@@ -245,6 +248,8 @@ static int run(void)
 		cfg.overdraw_alpha1 = true;
 		cfg.shader.thread_storage = VA_BASE + OFF_TLS;
 		cfg.shader.shader = VA_BASE + OFF_SFRAG;
+		cfg.shader.fau = VA_BASE + OFF_FAU2;
+		cfg.shader.fau_count = 1;
 	}
 	pan_section_pack(vj, MALLOC_VERTEX_JOB, POSITION, cfg) {
 		cfg.thread_storage = VA_BASE + OFF_TLS;
@@ -275,6 +280,7 @@ static int run(void)
 		for (int k = 0; k < 5; k++) {
 			memset(cpu + OFF_BPOS, 0, 0x100);
 			memcpy(cpu + OFF_BPOS, vb[k], vl[k]);
+			*(volatile uint32_t *)(cpu + OFF_MARK) = 0x11111111;
 			for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
 			kr = submit(c, 1, VA_BASE + OFF_VJOB, &st);
 			char nm[4] = { 'a' + k, 0 }, e1[40], e2[40];
@@ -287,12 +293,13 @@ static int run(void)
 	}
 	int tri = 0, bg = 0;
 	{
-		static const struct { uint32_t mask; int usetiler; int usesamp; int fs; } V[3] = { {0x28,1,1,0}, {0x28,1,1,2}, {0x28,1,1,1} };
+		static const struct { uint32_t mask; int usetiler; int usesamp; int fs; } V[4] = { {0x28,1,1,0}, {0x28,1,1,2}, {0x28,1,1,1}, {0x28,1,1,3} };
 		for (int v = VAR_FIRST; v < VAR_LAST; v++) {
 			ulog("tri: about var%d", v);
 			memset(cpu + OFF_BFRAG, 0, 0x100);
 			if (V[v].fs == 1) memcpy(cpu + OFF_BFRAG, FRAGN_BIN, sizeof FRAGN_BIN);
 			else if (V[v].fs == 2) memcpy(cpu + OFF_BFRAG, FRAGA_BIN, sizeof FRAGA_BIN);
+			else if (V[v].fs == 3) memcpy(cpu + OFF_BFRAG, FRAGM_BIN, sizeof FRAGM_BIN);
 			else memcpy(cpu + OFF_BFRAG, FRAG_BIN, sizeof FRAG_BIN);
 			repack(cpu, V[v].mask, V[v].usetiler ? VA_BASE + OFF_TCTX : 0, V[v].usesamp ? VA_BASE + OFF_SAMP : 0);
 			for (int i = 0; i < W * H; i++) px[i] = 0xDEADBEEF;
@@ -309,7 +316,7 @@ static int run(void)
 			
 			char e1[40], e2[40]; enc(e1, vexc); enc(e2, fexc);
 			ulog("EW%d %s %s", v, e1, e2);
-			ulog("tri: var%d vexc=%08x fexc=%08x tri=%d bg=%d p(10,10)=%08x p(50,50)=%08x %s", v, vexc, fexc, tri, bg,
+			ulog("tri: var%d mark=%08x vexc=%08x fexc=%08x tri=%d bg=%d p(10,10)=%08x p(50,50)=%08x %s", v, *(volatile uint32_t *)(cpu + OFF_MARK), vexc, fexc, tri, bg,
 			    px[10 * W + 10], px[50 * W + 50], tri > 1000 ? "GPU-DREW-TRIANGLE" : "TRI-FAIL");
 			if (tri > 1000) break;
 		}
