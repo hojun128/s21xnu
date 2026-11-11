@@ -59,6 +59,7 @@ enum {
 	kSMSubmit = 3,
 	kSMDestroyBO = 4,
 	kSMLog = 5,
+	kSMMapFB = 6,
 };
 
 static IOLock *sm_lock;                 /* serializes all hardware / context calls */
@@ -76,7 +77,7 @@ extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 
 /* The GPU is not cache coherent: clean+invalidate a buffer's pages by physical address. */
 static void
-sm_flush_md(IOBufferMemoryDescriptor *md, uint32_t pages)
+sm_flush_md(IOMemoryDescriptor *md, uint32_t pages)
 {
 	for (uint32_t k = 0; k < pages; k++) {
 		IOByteCount len = 0;
@@ -186,7 +187,7 @@ SweetMali::start(IOService *provider)
 /* ------------------------------------------------------------ user client */
 
 struct SMBo {
-	IOBufferMemoryDescriptor *md;
+	IOMemoryDescriptor *md;
 	uint64_t va;
 	uint32_t pages;
 	bool     mapped;
@@ -399,6 +400,49 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			break;
 		}
 		freeBo((uint32_t)(h - 1));
+		ret = kIOReturnSuccess;
+		break;
+	}
+	case kSMMapFB: {
+		/* wrap the boot/display framebuffer (physical RAM scanned out by the panel) as a BO */
+		if (outs < 4) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		PE_Video video;
+		PE_current_console(&video);
+		uint64_t fpa = video.v_baseAddr, rb = video.v_rowBytes, fh = video.v_height, fw = video.v_width;
+		uint64_t fsize = (rb * fh + page_size - 1) & ~((uint64_t)page_size - 1);
+		if (fpa == 0 || fsize == 0 || fsize > SM_MAX_BO_BYTES) {
+			ret = kIOReturnNoDevice;
+			break;
+		}
+		uint32_t slot = SM_MAX_BO;
+		for (uint32_t i = 0; i < SM_MAX_BO; i++) {
+			if (fBo[i].md == NULL) {
+				slot = i;
+				break;
+			}
+		}
+		if (slot == SM_MAX_BO) {
+			ret = kIOReturnNoResources;
+			break;
+		}
+		IOMemoryDescriptor *fmd = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)fpa,
+		    (IOByteCount)fsize, kIODirectionInOut);
+		if (fmd == NULL) {
+			ret = kIOReturnNoMemory;
+			break;
+		}
+		fBo[slot].md = fmd;
+		fBo[slot].pages = (uint32_t)(fsize >> 12);
+		fBo[slot].mapped = false;
+		sm_total += fsize;
+		args->scalarOutput[0] = slot + 1;
+		args->scalarOutput[1] = fpa;
+		args->scalarOutput[2] = rb;
+		args->scalarOutput[3] = (fw << 16) | fh;
+		args->scalarOutputCount = 4;
 		ret = kIOReturnSuccess;
 		break;
 	}
