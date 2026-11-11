@@ -11,7 +11,7 @@
 
 static void emit(const char *name, nir_shader *nir, bool fs)
 {
-	struct panfrost_compile_inputs in = { .gpu_id = GPU_ID };
+	struct panfrost_compile_inputs in = { .gpu_id = GPU_ID, .no_ubo_to_push = true };
 	struct util_dynarray bin; util_dynarray_init(&bin, NULL);
 	struct pan_shader_info info; memset(&info, 0, sizeof info);
 	if (fs) {
@@ -25,6 +25,7 @@ static void emit(const char *name, nir_shader *nir, bool fs)
 	for (unsigned i = 0; i < bin.size; i++) printf("%s0x%02x,", (i % 16) ? "" : "\n", ((uint8_t *)bin.data)[i]);
 	printf("\n};\n");
 	printf("#define %s_PRELOAD 0x%llxull\n", name, (unsigned long long)info.preload);
+	printf("#define %s_PUSH_WORDS %u\n", name, (unsigned)info.push.count);
 	if (!fs) printf("#define %s_IDVS %d\n#define %s_SECOND_OFF %u\n", name, info.vs.idvs, name, (unsigned)info.vs.secondary_offset);
 }
 
@@ -65,6 +66,34 @@ int main(void)
 		    .src_type = nir_type_float32, .io_semantics.location = VARYING_SLOT_POS, .io_semantics.num_slots = 1);
 		b.shader->info.outputs_written = BITFIELD64_BIT(VARYING_SLOT_POS);
 		emit("VS_BIG", b.shader, false);
+	}
+	/* compute: copy one 32-bit pixel per invocation.
+	 * push: [0]=src u64, [8]=dst u64, [16]=src stride, [20]=dst stride, [24]=width */
+	{
+		nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &bifrost_nir_options_v9, "cs_copy");
+		b.shader->info.workgroup_size[0] = 64;
+		b.shader->info.workgroup_size[1] = 1;
+		b.shader->info.workgroup_size[2] = 1;
+		nir_def *id = nir_load_global_invocation_id(&b, 32);
+		nir_def *x = nir_channel(&b, id, 0), *y = nir_channel(&b, id, 1);
+		nir_def *w = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 24, .range = 4);
+		nir_push_if(&b, nir_ult(&b, x, w));
+		{
+			nir_def *src = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0), .base = 0, .range = 8);
+			nir_def *dst = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0), .base = 8, .range = 8);
+			nir_def *ss = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 16, .range = 4);
+			nir_def *ds = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 20, .range = 4);
+			nir_def *xo = nir_ishl_imm(&b, x, 2);
+			nir_def *so = nir_iadd(&b, nir_imul(&b, y, ss), xo);
+			nir_def *dof = nir_iadd(&b, nir_imul(&b, y, ds), xo);
+			nir_def *sa = nir_iadd(&b, src, nir_u2u64(&b, so));
+			nir_def *da = nir_iadd(&b, dst, nir_u2u64(&b, dof));
+			nir_def *v = nir_load_global(&b, sa, 4, 1, 32);
+			nir_store_global(&b, da, 4, v, 0x1);
+		}
+		nir_pop_if(&b, NULL);
+		b.shader->info.num_ubos = 0;
+		emit("CS_COPY", b.shader, false);
 	}
 	return 0;
 }
