@@ -24,7 +24,18 @@ jobs:
               "$f" -o "out/$n"
             codesign -f -s - "out/$n"
           done
-          ls -la out
+          for f in userland/*.m; do
+            n=$(basename "$f" .m)
+            xcrun clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -fobjc-arc \
+              -framework Foundation -framework Metal -framework IOKit "$f" -o "out/$n"
+            codesign -f -s - "out/$n"
+          done
+          mkdir -p out/SweetMetal.bundle
+          xcrun clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -fobjc-arc -bundle \
+            -framework Foundation -framework IOKit metal/SweetMetal.m -o out/SweetMetal.bundle/SweetMetal
+          cp metal/Info.plist out/SweetMetal.bundle/Info.plist
+          codesign -f -s - out/SweetMetal.bundle/SweetMetal
+          ls -la out out/SweetMetal.bundle
       - uses: actions/upload-artifact@v4
         with:
           name: ios-tools

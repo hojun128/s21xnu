@@ -100,6 +100,17 @@ public:
 
 OSDefineMetaClassAndStructors(SweetMali, IOService);
 
+/*
+ * Metal (Metal.framework) enumerates IOServiceMatching("IOAcceleratorES") and loads
+ * /System/Library/Extensions/<MetalPluginName>.bundle, class <MetalPluginClassName>,
+ * -initWithAcceleratorPort:. boot-arg sweetmetal=1 publishes one for the SweetMetal plugin.
+ */
+class IOAcceleratorES : public IOService {
+	OSDeclareDefaultStructors(IOAcceleratorES);
+};
+OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+
+
 /* bring-up check through the same paths the user client uses: BO -> physical pages -> GPU map -> job */
 static void
 sweet_mali_service_selftest_one(int flushvariant)
@@ -180,6 +191,22 @@ SweetMali::start(IOService *provider)
 	sweet_mali_service_selftest();
 	IOLockUnlock(sm_lock);
 	registerService();
+	{
+		int metal = 0;
+		if (PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal)) && metal != 0) {
+			IOAcceleratorES *acc = OSTypeAlloc(IOAcceleratorES);
+			if (acc != NULL && acc->init()) {
+				acc->setProperty("MetalPluginName", "SweetMetal");
+				acc->setProperty("MetalPluginClassName", "SweetMTLDevice");
+				acc->setProperty(kIOUserClientClassKey, "SweetMaliUserClient");
+				if (acc->attach(this)) {
+					acc->registerService();
+					sweet_mali_log_str("service: IOAcceleratorES (SweetMetal) published");
+				}
+			}
+			OSSafeReleaseNULL(acc);
+		}
+	}
 	sweet_mali_log_str("service: SweetMali registered");
 	return true;
 }
