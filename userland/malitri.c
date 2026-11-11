@@ -69,11 +69,7 @@ static void edump(const char *tag, uint32_t a, uint32_t b, const volatile uint32
 }
 static void dumpw(const char *tag, const volatile uint32_t *p, int n)
 {
-	for (int i = 0; i < n; i += 4) {
-		char a[40], b[40], c[40], d[40];
-		enc(a, p[i]); enc(b, p[i + 1]); enc(c, p[i + 2]); enc(d, p[i + 3]);
-		ulog("D%s%d %s %s %s %s", tag, i, a, b, c, d);
-	}
+	for (int i = 0; i < n; i++) ulog("W%s%d=%08x/%08x/%08x", tag, i, p[i], p[i], p[i]);
 }
 static kern_return_t submit(io_connect_t c, uint64_t slot, uint64_t jc, uint64_t *st)
 {
@@ -160,7 +156,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: build10 bo ok heap=%d", have_heap);
+	ulog("tri: build11 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	volatile uint32_t *px = (volatile uint32_t *)(cpu + OFF_FB);
@@ -296,8 +292,8 @@ static int run(void)
 			tri = bg = 0;
 			for (int i = 0; i < W * H; i++) { if (px[i] == 0xFF00FF00u) tri++; else if (px[i] == 0xFF0000FFu) bg++; }
 			dumpw("H", (volatile uint32_t *)(cpu + OFF_THEAP), 8);
-			dumpw("T", (volatile uint32_t *)(cpu + OFF_TCTX), 8);
-			dumpw("P", (volatile uint32_t *)heap, 8);
+			dumpw("T", (volatile uint32_t *)(cpu + OFF_TCTX), 4);
+			dumpw("P", (volatile uint32_t *)heap, 6);
 			char e1[40], e2[40]; enc(e1, vexc); enc(e2, fexc);
 			ulog("EW%d %s %s", v, e1, e2);
 			ulog("tri: var%d vexc=%08x fexc=%08x tri=%d bg=%d p(10,10)=%08x p(50,50)=%08x %s", v, vexc, fexc, tri, bg,
