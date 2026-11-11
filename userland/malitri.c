@@ -56,8 +56,8 @@ char g_hist[16][150]; int g_nh;
 #define OFF_SAMP 0xC00
 #define OFF_FB   0x1000
 #ifndef VAR_FIRST
-#define VAR_FIRST 0
-#define VAR_LAST 1
+#define VAR_FIRST 4
+#define VAR_LAST 7
 #endif
 #define W 64
 #define H 64
@@ -161,7 +161,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: build17 bo ok heap=%d", have_heap);
+	ulog("tri: build18 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	volatile uint32_t *px = (volatile uint32_t *)(cpu + OFF_FB);
@@ -287,6 +287,7 @@ static int run(void)
 		for (int k = 0; k < 5; k++) {
 			memset(cpu + OFF_BPOS, 0, 0x100);
 			memcpy(cpu + OFF_BPOS, vb[k], vl[k]);
+			memset(heap, 0, HEAP_BYTES);
 			*(volatile uint32_t *)(cpu + OFF_MARK) = 0x11111111;
 			for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
 			kr = submit(c, 1, VA_BASE + OFF_VJOB, &st);
@@ -300,12 +301,15 @@ static int run(void)
 	}
 	int tri = 0, bg = 0;
 	{
-		static const struct { uint32_t mask; int usetiler; int usesamp; int fs; } V[4] = { {0x28,1,1,0}, {0x28,1,1,2}, {0x28,1,1,1}, {0x28,1,1,3} };
+		static const struct { uint32_t mask; int usetiler; int usesamp; int fs; } V[7] = { {0x28,1,1,0}, {0x28,1,1,2}, {0x28,1,1,1}, {0x28,1,1,3}, {0x28,1,1,4}, {0x28,1,1,5}, {0x28,1,1,6} };
 		for (int v = VAR_FIRST; v < VAR_LAST; v++) {
 			ulog("tri: about var%d", v);
 			memset(cpu + OFF_BFRAG, 0, 0x100);
 			if (V[v].fs == 1) memcpy(cpu + OFF_BFRAG, FRAGN_BIN, sizeof FRAGN_BIN);
 			else if (V[v].fs == 2) memcpy(cpu + OFF_BFRAG, FRAGA_BIN, sizeof FRAGA_BIN);
+			else if (V[v].fs == 4) memcpy(cpu + OFF_BFRAG, FRAGB_BIN, sizeof FRAGB_BIN);
+			else if (V[v].fs == 5) memcpy(cpu + OFF_BFRAG, FRAGW_BIN, sizeof FRAGW_BIN);
+			else if (V[v].fs == 6) memcpy(cpu + OFF_BFRAG, FRAGX_BIN, sizeof FRAGX_BIN);
 			else if (V[v].fs == 3) memcpy(cpu + OFF_BFRAG, FRAGM_BIN, sizeof FRAGM_BIN);
 			else memcpy(cpu + OFF_BFRAG, FRAG_BIN, sizeof FRAG_BIN);
 			repack(cpu, V[v].mask, V[v].usetiler ? VA_BASE + OFF_TCTX : 0, V[v].usesamp ? VA_BASE + OFF_SAMP : 0);
