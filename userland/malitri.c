@@ -54,8 +54,8 @@ char g_hist[16][150]; int g_nh;
 #define OFF_SAMP 0xC00
 #define OFF_FB   0x1000
 #ifndef VAR_FIRST
-#define VAR_FIRST 3
-#define VAR_LAST 4
+#define VAR_FIRST 0
+#define VAR_LAST 3
 #endif
 #define W 64
 #define H 64
@@ -159,7 +159,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: build12 bo ok heap=%d", have_heap);
+	ulog("tri: build13 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	volatile uint32_t *px = (volatile uint32_t *)(cpu + OFF_FB);
@@ -281,9 +281,13 @@ static int run(void)
 	}
 	int tri = 0, bg = 0;
 	{
-		static const struct { uint32_t mask; int usetiler; int usesamp; } V[4] = { {0x28,0,1}, {0x28,1,0}, {0x28,1,1}, {0xFF,1,1} };
+		static const struct { uint32_t mask; int usetiler; int usesamp; int fs; } V[3] = { {0x28,1,1,1}, {0x28,1,1,2}, {0x28,1,1,0} };
 		for (int v = VAR_FIRST; v < VAR_LAST; v++) {
 			ulog("tri: about var%d", v);
+			memset(cpu + OFF_BFRAG, 0, 0x100);
+			if (V[v].fs == 1) memcpy(cpu + OFF_BFRAG, FRAGN_BIN, sizeof FRAGN_BIN);
+			else if (V[v].fs == 2) memcpy(cpu + OFF_BFRAG, FRAGA_BIN, sizeof FRAGA_BIN);
+			else memcpy(cpu + OFF_BFRAG, FRAG_BIN, sizeof FRAG_BIN);
 			repack(cpu, V[v].mask, V[v].usetiler ? VA_BASE + OFF_TCTX : 0, V[v].usesamp ? VA_BASE + OFF_SAMP : 0);
 			for (int i = 0; i < W * H; i++) px[i] = 0xDEADBEEF;
 			for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
@@ -294,9 +298,9 @@ static int run(void)
 			uint32_t fexc = *(volatile uint32_t *)(cpu + OFF_FJOB);
 			tri = bg = 0;
 			for (int i = 0; i < W * H; i++) { if (px[i] == 0xFF00FF00u) tri++; else if (px[i] == 0xFF0000FFu) bg++; }
-			dumpw("H", (volatile uint32_t *)(cpu + OFF_THEAP), 8);
-			dumpw("T", (volatile uint32_t *)(cpu + OFF_TCTX), 4);
-			dumpw("P", (volatile uint32_t *)heap, 6);
+			
+			
+			
 			char e1[40], e2[40]; enc(e1, vexc); enc(e2, fexc);
 			ulog("EW%d %s %s", v, e1, e2);
 			ulog("tri: var%d vexc=%08x fexc=%08x tri=%d bg=%d p(10,10)=%08x p(50,50)=%08x %s", v, vexc, fexc, tri, bg,
