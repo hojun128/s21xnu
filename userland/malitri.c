@@ -159,7 +159,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: build13 bo ok heap=%d", have_heap);
+	ulog("tri: build14 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	volatile uint32_t *px = (volatile uint32_t *)(cpu + OFF_FB);
@@ -253,7 +253,7 @@ static int run(void)
 	void *job = cpu + OFF_FJOB;
 	pan_section_pack(job, FRAGMENT_JOB, PAYLOAD, cfg) {
 		cfg.bound_min_x = 0; cfg.bound_min_y = 0;
-		cfg.bound_max_x = W - 1; cfg.bound_max_y = H - 1;
+		cfg.bound_max_x = (W - 1) >> 4; cfg.bound_max_y = (H - 1) >> 4;
 		cfg.tile_render_order = MALI_TILE_RENDER_ORDER_Z_ORDER;
 		cfg.framebuffer = VA_BASE + OFF_FBD;
 	}
@@ -281,7 +281,7 @@ static int run(void)
 	}
 	int tri = 0, bg = 0;
 	{
-		static const struct { uint32_t mask; int usetiler; int usesamp; int fs; } V[3] = { {0x28,1,1,1}, {0x28,1,1,2}, {0x28,1,1,0} };
+		static const struct { uint32_t mask; int usetiler; int usesamp; int fs; } V[3] = { {0x28,1,1,0}, {0x28,1,1,2}, {0x28,1,1,1} };
 		for (int v = VAR_FIRST; v < VAR_LAST; v++) {
 			ulog("tri: about var%d", v);
 			memset(cpu + OFF_BFRAG, 0, 0x100);
