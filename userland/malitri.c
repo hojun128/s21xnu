@@ -24,7 +24,10 @@ static void ulog(const char *fmt, ...)
 	char b[150]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
 	printf("%s\n", b); fflush(stdout);
 	if (gc) IOConnectCallMethod(gc, 5, NULL, 0, b, strlen(b), NULL, NULL, NULL, NULL);
+	extern char g_hist[16][150]; extern int g_nh;
+	if (strncmp(b, "tri:", 4) == 0 || b[0] == 'W') { snprintf(g_hist[g_nh % 16], 150, "%s", b); g_nh++; }
 }
+char g_hist[16][150]; int g_nh;
 #define PAN_ARCH 9
 #include "genxml/gen_macros.h"
 
@@ -156,7 +159,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: build11 bo ok heap=%d", have_heap);
+	ulog("tri: build12 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	volatile uint32_t *px = (volatile uint32_t *)(cpu + OFF_FB);
@@ -309,6 +312,14 @@ int main(void)
 	int r = run();
 	ulog("malitri done rc=%d", r);
 	sleep(3);
-	for (;;) sleep(60);
+	for (int n = 0;; n++) {
+		int st = g_nh > 16 ? g_nh - 16 : 0;
+		ulog("==== MALITRI RESULT (repeat %d) ====", n);
+		for (int i = st; i < g_nh; i++) {
+			char t[150]; snprintf(t, sizeof t, "R%d %s", i, g_hist[i % 16]);
+			if (gc) IOConnectCallMethod(gc, 5, NULL, 0, t, strlen(t), NULL, NULL, NULL, NULL);
+		}
+		sleep(5);
+	}
 	return r;
 }
