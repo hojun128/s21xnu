@@ -35,9 +35,8 @@ char g_hist[16][150]; int g_nh;
 #include "malitri_gen.h"
 
 #define BO_BYTES 32768
-#define HEAP_BYTES g_heapbytes
-#define HEAP_VA  g_heapva
-static uint64_t g_heapva = 0x40000000ULL; static uint32_t g_heapbytes = 4u << 20;
+#define HEAP_BYTES (4u << 20)
+#define HEAP_VA  0x40000000ULL
 #define OFF_FJOB 0x000
 #define OFF_FBD  0x040
 #define OFF_VJOB 0x100
@@ -162,12 +161,8 @@ static int run(void)
 	if (kr) { ulog("tri: open kr=%x", kr); return 2; }
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
-	uint8_t *hp[3] = {0}; static const uint64_t hva[3] = { 0x40000000ULL, 0x41000000ULL, 0x44000000ULL };
-	static const uint32_t hsz[3] = { 4u << 20, 16u << 20, 64u << 20 };
-	int have_heap = 1;
-	for (int i = 0; i < 3; i++) { if (!mkbo(c, hsz[i], hva[i], &hp[i])) { ulog("disp: heap%d create failed", i); have_heap = (i > 0) ? 1 : 0; break; } }
-	heap = hp[0];
-	ulog("tri: disp4 bo ok heap=%d", have_heap);
+	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
+	ulog("tri: disp5 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	float *v = (float *)(cpu + OFF_VERT);
@@ -300,28 +295,22 @@ static int run(void)
 	memset(cpu + OFF_BPOS, 0, 0x100); memcpy(cpu + OFF_BPOS, VS_BIG, sizeof VS_BIG);
 	memset(cpu + OFF_BFRAG, 0, 0x100); memcpy(cpu + OFF_BFRAG, FS_GREEN, sizeof FS_GREEN);
 	static const uint32_t clears[4] = { 0xFF300000u, 0xFF003000u, 0xFF000030u, 0xFF303000u };
-	static const struct { uint32_t mask; int h; } T[5] = { {0x28,0}, {0xFF,0}, {0xFF,1}, {0xFF,2}, {0x28,2} };
 	for (int f = 0; f < 4000; f++) {
 		g_clear = clears[f & 3];
-		uint32_t vx[5], vs[5], fx[5];
-		for (int k = 0; k < 5; k++) {
-			int hi = T[k].h;
-			if (!hp[hi]) { vx[k] = vs[k] = fx[k] = 0xdead; continue; }
-			g_heapva = hva[hi]; g_heapbytes = hsz[hi];
-			uint32_t z = hsz[hi] < (8u << 20) ? hsz[hi] : (4u << 20);
-			memset(hp[hi], 0, z); memset(hp[hi] + hsz[hi] - z, 0, z);
-			repack(cpu, T[k].mask, VA_BASE + OFF_TCTX, VA_BASE + OFF_SAMP);
-			for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
-			for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_FJOB))[q] = 0;
-			uint64_t st;
-			submit(c, 1, VA_BASE + OFF_VJOB, &st);
-			vx[k] = *(volatile uint32_t *)(cpu + OFF_VJOB); vs[k] = (uint32_t)st;
-			submit(c, 0, VA_BASE + OFF_FJOB, &st);
-			fx[k] = *(volatile uint32_t *)(cpu + OFF_FJOB);
-		}
-		for (int k = 0; k < 5; k++)
-			ulog("disp: k%d m=%02x h=%dM v=%08x/%x f=%08x", k, T[k].mask, (int)(hsz[T[k].h] >> 20), vx[k], vs[k], fx[k]);
-		sleep(3);
+		memset(heap, 0, HEAP_BYTES);
+		repack(cpu, 0x28, VA_BASE + OFF_TCTX, VA_BASE + OFF_SAMP);
+		/* DRAW.vertex_array is written by the hardware in packet mode: reset it every frame */
+		volatile uint32_t *dw = (volatile uint32_t *)(cpu + OFF_VJOB + 128);
+		dw[2] = 1; dw[3] = 0; dw[4] = 0;
+		for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
+		for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_FJOB))[q] = 0;
+		uint64_t st;
+		submit(c, 1, VA_BASE + OFF_VJOB, &st);
+		uint32_t vx = *(volatile uint32_t *)(cpu + OFF_VJOB), vs = (uint32_t)st;
+		submit(c, 0, VA_BASE + OFF_FJOB, &st);
+		uint32_t fx = *(volatile uint32_t *)(cpu + OFF_FJOB);
+		ulog("disp5: f%d v=%08x/%x f=%08x/%x", f, vx, vs, fx, (uint32_t)st);
+		sleep(2);
 	}
 	return 0;
 }
