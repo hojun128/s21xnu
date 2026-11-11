@@ -191,6 +191,7 @@ struct SMBo {
 	uint64_t va;
 	uint32_t pages;
 	bool     mapped;
+	bool     ext;   /* external physical range (display fb): outside the physmap, never flush by phystokv */
 };
 
 class SweetMaliUserClient : public IOUserClient {
@@ -379,13 +380,13 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			tmo = 5000;
 		}
 		for (uint32_t i = 0; i < SM_MAX_BO; i++) {
-			if (fBo[i].md != NULL && fBo[i].mapped) {
+			if (fBo[i].md != NULL && fBo[i].mapped && !fBo[i].ext) {
 				sm_flush_md(fBo[i].md, fBo[i].pages);
 			}
 		}
 		args->scalarOutput[0] = sweet_mali_submit(fCtx, (uint32_t)args->scalarInput[0], args->scalarInput[1], tmo);
 		for (uint32_t i = 0; i < SM_MAX_BO; i++) {
-			if (fBo[i].md != NULL && fBo[i].mapped) {
+			if (fBo[i].md != NULL && fBo[i].mapped && !fBo[i].ext) {
 				sm_flush_md(fBo[i].md, fBo[i].pages);
 			}
 		}
@@ -437,6 +438,7 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		fBo[slot].md = fmd;
 		fBo[slot].pages = (uint32_t)(fsize >> 12);
 		fBo[slot].mapped = false;
+		fBo[slot].ext = true;
 		sm_total += fsize;
 		args->scalarOutput[0] = slot + 1;
 		args->scalarOutput[1] = fpa;
