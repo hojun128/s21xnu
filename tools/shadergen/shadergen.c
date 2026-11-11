@@ -53,5 +53,18 @@ int main(void)
 		b.shader->info.outputs_written = BITFIELD64_BIT(VARYING_SLOT_POS);
 		emit("VS_TRI", b.shader, false);
 	}
+	/* vertex: big screen-space triangle (1080x2400 display) */
+	{
+		nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, &bifrost_nir_options_v9, "vs2");
+		nir_def *vid = nir_load_vertex_id(&b);
+		nir_def *x = nir_bcsel(&b, nir_ieq_imm(&b, vid, 0), nir_imm_float(&b, 100.0f),
+		    nir_bcsel(&b, nir_ieq_imm(&b, vid, 1), nir_imm_float(&b, 980.0f), nir_imm_float(&b, 540.0f)));
+		nir_def *y = nir_bcsel(&b, nir_ieq_imm(&b, vid, 2), nir_imm_float(&b, 2000.0f), nir_imm_float(&b, 300.0f));
+		nir_def *pos = nir_vec4(&b, x, y, nir_imm_float(&b, 0.5f), nir_imm_float(&b, 1.0f));
+		nir_store_output(&b, pos, nir_imm_int(&b, 0), .base = 0, .write_mask = 0xf,
+		    .src_type = nir_type_float32, .io_semantics.location = VARYING_SLOT_POS, .io_semantics.num_slots = 1);
+		b.shader->info.outputs_written = BITFIELD64_BIT(VARYING_SLOT_POS);
+		emit("VS_BIG", b.shader, false);
+	}
 	return 0;
 }
