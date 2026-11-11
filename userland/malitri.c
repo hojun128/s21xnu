@@ -33,6 +33,7 @@ char g_hist[16][150]; int g_nh;
 
 #define BO_BYTES 32768
 #include "malitri_shaders.h"
+#include "malitri_gen.h"
 
 #define BO_BYTES 32768
 #define HEAP_BYTES (4u << 20)
@@ -56,8 +57,8 @@ char g_hist[16][150]; int g_nh;
 #define OFF_SAMP 0xC00
 #define OFF_FB   0x1000
 #ifndef VAR_FIRST
-#define VAR_FIRST 4
-#define VAR_LAST 7
+#define VAR_FIRST 7
+#define VAR_LAST 8
 #endif
 #define W 64
 #define H 64
@@ -161,7 +162,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: build18 bo ok heap=%d", have_heap);
+	ulog("tri: build19 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	volatile uint32_t *px = (volatile uint32_t *)(cpu + OFF_FB);
@@ -211,6 +212,7 @@ static int run(void)
 		sp.register_allocation = MALI_SHADER_REGISTER_ALLOCATION_32_PER_THREAD;
 		sp.binary = VA_BASE + OFF_BFRAG;
 		sp.preload.r60 = true;
+		sp.preload.r61 = true;
 	}
 
 	{
@@ -281,37 +283,24 @@ static int run(void)
 	}
 
 	uint64_t st;
-	{
-		const unsigned char *vb[5] = { POSA_BIN, POSB_BIN, POSD_BIN, POSE_BIN, POSF_BIN };
-		size_t vl[5] = { sizeof POSA_BIN, sizeof POSB_BIN, sizeof POSD_BIN, sizeof POSE_BIN, sizeof POSF_BIN };
-		for (int k = 0; k < 5; k++) {
-			memset(cpu + OFF_BPOS, 0, 0x100);
-			memcpy(cpu + OFF_BPOS, vb[k], vl[k]);
-			memset(heap, 0, HEAP_BYTES);
-			*(volatile uint32_t *)(cpu + OFF_MARK) = 0x11111111;
-			for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
-			kr = submit(c, 1, VA_BASE + OFF_VJOB, &st);
-			char nm[4] = { 'a' + k, 0 }, e1[40], e2[40];
-			enc(e1, kr); enc(e2, *(volatile uint32_t *)(cpu + OFF_VJOB));
-			ulog("EV%s %s %s", nm, e1, e2);
-		}
-		memset(cpu + OFF_BPOS, 0, 0x100);
-		memcpy(cpu + OFF_BPOS, POS_BIN, sizeof POS_BIN);
-		for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
-	}
+	memset(cpu + OFF_BPOS, 0, 0x100);
+	memcpy(cpu + OFF_BPOS, POS_BIN, sizeof POS_BIN);
 	int tri = 0, bg = 0;
 	{
-		static const struct { uint32_t mask; int usetiler; int usesamp; int fs; } V[7] = { {0x28,1,1,0}, {0x28,1,1,2}, {0x28,1,1,1}, {0x28,1,1,3}, {0x28,1,1,4}, {0x28,1,1,5}, {0x28,1,1,6} };
+		static const struct { uint32_t mask; int usetiler; int usesamp; int fs; } V[9] = { {0x28,1,1,0}, {0x28,1,1,2}, {0x28,1,1,1}, {0x28,1,1,3}, {0x28,1,1,4}, {0x28,1,1,5}, {0x28,1,1,6}, {0x28,1,1,7}, {0x28,1,1,0} };
 		for (int v = VAR_FIRST; v < VAR_LAST; v++) {
 			ulog("tri: about var%d", v);
 			memset(cpu + OFF_BFRAG, 0, 0x100);
 			if (V[v].fs == 1) memcpy(cpu + OFF_BFRAG, FRAGN_BIN, sizeof FRAGN_BIN);
 			else if (V[v].fs == 2) memcpy(cpu + OFF_BFRAG, FRAGA_BIN, sizeof FRAGA_BIN);
+			else if (V[v].fs == 7) memcpy(cpu + OFF_BFRAG, FS_GREEN, sizeof FS_GREEN);
 			else if (V[v].fs == 4) memcpy(cpu + OFF_BFRAG, FRAGB_BIN, sizeof FRAGB_BIN);
 			else if (V[v].fs == 5) memcpy(cpu + OFF_BFRAG, FRAGW_BIN, sizeof FRAGW_BIN);
 			else if (V[v].fs == 6) memcpy(cpu + OFF_BFRAG, FRAGX_BIN, sizeof FRAGX_BIN);
 			else if (V[v].fs == 3) memcpy(cpu + OFF_BFRAG, FRAGM_BIN, sizeof FRAGM_BIN);
 			else memcpy(cpu + OFF_BFRAG, FRAG_BIN, sizeof FRAG_BIN);
+			memset(cpu + OFF_BPOS, 0, 0x100);
+			if (V[v].fs == 7) memcpy(cpu + OFF_BPOS, VS_TRI, sizeof VS_TRI); else memcpy(cpu + OFF_BPOS, POS_BIN, sizeof POS_BIN);
 			repack(cpu, V[v].mask, V[v].usetiler ? VA_BASE + OFF_TCTX : 0, V[v].usesamp ? VA_BASE + OFF_SAMP : 0);
 			for (int i = 0; i < W * H; i++) px[i] = 0xDEADBEEF;
 			for (int q = 0; q < 4; q++) ((volatile uint32_t *)(cpu + OFF_VJOB))[q] = 0;
