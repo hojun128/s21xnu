@@ -1,0 +1,61 @@
+name: shadergen
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: mesa tag
+        default: mesa-24.1.7
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deps
+        run: |
+          brew install meson ninja bison flex pkg-config
+          pip3 install --break-system-packages mako pyyaml packaging
+          echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
+          echo "$(brew --prefix flex)/bin" >> $GITHUB_PATH
+      - name: Fetch mesa
+        run: git clone -q --depth 1 -b "${{ inputs.mesa_ref || 'mesa-24.1.7' }}" https://gitlab.freedesktop.org/mesa/mesa.git mesa
+      - name: Configure (host)
+        working-directory: mesa
+        run: |
+          meson setup ../b -Dbuildtype=release -Dgallium-drivers=panfrost -Dvulkan-drivers= -Dplatforms= \
+            -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dllvm=disabled -Dopengl=false -Dgles1=disabled \
+            -Dgles2=disabled -Dshared-glapi=disabled -Dzstd=disabled -Dexpat=disabled -Dvalgrind=disabled \
+            -Dlibunwind=disabled -Dbuild-tests=false -Dtools= 2>&1 | tail -5
+      - name: Build libs
+        run: |
+          ninja -C b src/panfrost/compiler/libpanfrost_bifrost.a src/compiler/nir/libnir.a src/compiler/libcompiler.a src/util/libmesa_util.a 2>&1 | tail -15 || true
+          ninja -C b -k 0 2>&1 | tail -3 || true
+      - name: Build tool
+        run: |
+          set -x
+          CMD=$(python3 - <<'PY'
+          import json
+          for e in json.load(open('b/compile_commands.json')):
+              if e['file'].endswith('panfrost/compiler/bifrost_compile.c'):
+                  print(e['command']); break
+          PY
+          )
+          echo "$CMD" > cc_cmd.txt
+          # reuse include flags only
+          FLAGS=$(echo "$CMD" | tr ' ' '\n' | grep -E '^-(I|D|std|isystem)' | tr '\n' ' ')
+          cd b
+          clang -O1 -w $FLAGS -I$PWD ../tools/shadergen/shadergen.c -o shadergen \
+            $(find src -name '*.a' | grep -v -E 'gallium|drivers/' ) $(find src -name '*.a' | grep -v -E 'gallium|drivers/') -lm -lz 2>&1 | tail -40
+          ls -la shadergen
+      - name: Run
+        run: |
+          ./b/shadergen > shaders_gen.h 2> shadergen.log || true
+          cat shadergen.log; head -c 1500 shaders_gen.h
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shadergen
+          path: |
+            shaders_gen.h
+            shadergen.log
+            cc_cmd.txt
