@@ -469,5 +469,217 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	return ret;
 }
 
+
+/* ------------------------------------------------------------ GPU compositor
+ * sweet_mali_blit(): the panel copy of one CoreAnimation layer, done by a Mali compute job
+ * (one 32-bit pixel per invocation, shader CS_COPY compiled by Mesa's Valhall compiler,
+ * tools/shadergen). Called from AppleCLCD::present (SweetFramebuffer.cpp) when sweetgpucomp=1.
+ * Returns 0 when the GPU copied the layer; anything else makes the caller do the CPU copy.
+ */
+static const uint8_t smb_cs_copy[] = {
+0x3c,0x86,0xc0,0x80,0x04,0xc0,0xf0,0x00,0x40,0x12,0x00,0x00,0x30,0xc0,0x1f,0x50,
+0x7c,0xc8,0xc0,0x19,0x01,0xc0,0xb4,0x00,0x3d,0x84,0x0a,0x00,0x00,0xc1,0xa0,0x00,
+0x7d,0x85,0x0a,0x00,0x00,0xc2,0xa0,0x00,0x41,0x00,0x00,0x00,0x00,0xc1,0xa8,0x00,
+0x42,0x40,0x00,0x00,0x00,0xc0,0xa8,0x00,0x80,0x41,0x00,0x00,0x00,0xc1,0xa8,0x00,
+0x01,0x80,0xc0,0x00,0x04,0xc2,0xf0,0x00,0x42,0x81,0x00,0x00,0x00,0xc2,0xa8,0x00,
+0x41,0x00,0x00,0x00,0x00,0xc4,0x91,0x00,0x42,0x00,0x00,0x00,0x00,0xc5,0x91,0x00,
+0x44,0x00,0x00,0x18,0x82,0x81,0x60,0x00,0x82,0x40,0x00,0x00,0x00,0xc0,0xa8,0x00,
+0x00,0x82,0xc0,0x00,0x04,0xc2,0xf0,0x00,0x42,0x83,0x00,0x00,0x00,0xc2,0xa8,0x00,
+0x40,0x00,0x00,0x00,0x00,0xc4,0x91,0x00,0x42,0x00,0x00,0x00,0x00,0xc5,0x91,0x08,
+0x44,0x00,0x00,0x58,0x02,0x41,0x61,0x00,0xc0,0x01,0x00,0x00,0x10,0xc0,0x1f,0x50,
+0x00,0x00,0x00,0x00,0x00,0xc0,0x00,0x78,0x00,0x00,0x00,0x00,0x00,0xc0,0x00,0x78,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+};
+#define SMB_CS_PRELOAD  0x3000u                 /* r60,r61 (preload >> 48) */
+#define SMB_VA_DESC     0x10000000ULL
+#define SMB_VA_FB       0x50000000ULL
+#define SMB_VA_SRC      0x60000000ULL
+#define SMB_SRC_SPAN    0x4000000ULL            /* 64 MiB per cached source */
+#define SMB_SLOTS       4
+
+struct SMBSrc {
+	IOMemoryDescriptor *md;
+	uint64_t len, pa0, palast, lru;
+	uint32_t pages;
+};
+
+static int smb_ctx = -1;
+static bool smb_dead;
+static IOBufferMemoryDescriptor *smb_desc;
+static uint64_t smb_fbpa, smb_fbsize, smb_tick, smb_ok, smb_fail;
+static uint32_t smb_failrun;
+static SMBSrc smb_src[SMB_SLOTS];
+
+/* lock held */
+static bool
+smb_init(uint64_t fbpa, uint64_t fbsize)
+{
+	if (smb_ctx >= 0) {
+		return smb_fbpa == fbpa && smb_fbsize == fbsize;
+	}
+	if (!sweet_mali_up()) {
+		return false;
+	}
+	smb_desc = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, 4096, 4096);
+	if (smb_desc == NULL) {
+		return false;
+	}
+	int ctx = sweet_mali_ctx_create();
+	if (ctx < 0) {
+		smb_desc->release();
+		smb_desc = NULL;
+		return false;
+	}
+	IOByteCount l = 0;
+	addr64_t dpa = smb_desc->getPhysicalSegment(0, &l, kIOMemoryMapperNone);
+	if (dpa == 0 || sweet_mali_ctx_map(ctx, SMB_VA_DESC, dpa)) {
+		sweet_mali_ctx_destroy(ctx);
+		smb_desc->release();
+		smb_desc = NULL;
+		return false;
+	}
+	for (uint64_t o = 0; o < fbsize; o += 4096) {
+		if (sweet_mali_ctx_map(ctx, SMB_VA_FB + o, fbpa + o)) {
+			sweet_mali_ctx_destroy(ctx);
+			smb_desc->release();
+			smb_desc = NULL;
+			return false;
+		}
+	}
+	uint8_t *d = (uint8_t *)smb_desc->getBytesNoCopy();
+	bzero(d, 4096);
+	uint32_t *j = (uint32_t *)d;
+	j[4] = (4u << 1) | (1u << 16);                  /* COMPUTE, index 1 */
+	j[8] = (64u - 1) | (1u << 31);                  /* workgroup 64x1x1, allow merging */
+	j[9] = 1u | (2u << 14);                         /* task increment 1, axis Z */
+	j[10] = 1; j[11] = 1; j[12] = 1;
+	j[17] = 4;                                      /* FAU count (64-bit entries) */
+	uint64_t sp = SMB_VA_DESC + 0x100, tls = SMB_VA_DESC + 0x140, fau = SMB_VA_DESC + 0x200;
+	j[26] = (uint32_t)sp;  j[27] = (uint32_t)(sp >> 32);
+	j[28] = (uint32_t)tls; j[29] = (uint32_t)(tls >> 32);
+	j[30] = (uint32_t)fau; j[31] = (uint32_t)(fau >> 32);
+	uint32_t *spd = (uint32_t *)(d + 0x100);
+	uint64_t bin = SMB_VA_DESC + 0x400;
+	spd[0] = 8u | (1u << 4) | (2u << 30);           /* shader, compute, 32 regs/thread */
+	spd[1] = SMB_CS_PRELOAD;
+	spd[2] = (uint32_t)bin; spd[3] = (uint32_t)(bin >> 32);
+	uint32_t *ls = (uint32_t *)(d + 0x140);
+	ls[1] = 31;                                     /* no workgroup memory */
+	memcpy(d + 0x400, smb_cs_copy, sizeof(smb_cs_copy));
+	smb_fbpa = fbpa;
+	smb_fbsize = fbsize;
+	smb_ctx = ctx;
+	sm_log("gpucomp: ready fb=%llx size=%llx ctx=%llu", fbpa, fbsize, (uint64_t)ctx);
+	return true;
+}
+
+/* lock held: GPU VA of the cached mapping of srcmd, or 0 */
+static uint64_t
+smb_src_va(IOMemoryDescriptor *md)
+{
+	IOByteCount l = 0;
+	uint64_t len = md->getLength();
+	if (len == 0 || len > SMB_SRC_SPAN) {
+		return 0;
+	}
+	uint64_t pa0 = md->getPhysicalSegment(0, &l, kIOMemoryMapperNone);
+	uint64_t pal = md->getPhysicalSegment((len - 1) & ~0xFFFULL, &l, kIOMemoryMapperNone);
+	if (pa0 == 0 || pal == 0) {
+		return 0;
+	}
+	smb_tick++;
+	uint32_t victim = 0;
+	for (uint32_t i = 0; i < SMB_SLOTS; i++) {
+		SMBSrc *e = &smb_src[i];
+		if (e->md == md && e->len == len && e->pa0 == pa0 && e->palast == pal) {
+			e->lru = smb_tick;
+			return SMB_VA_SRC + i * SMB_SRC_SPAN;
+		}
+		if (e->lru < smb_src[victim].lru) {
+			victim = i;
+		}
+	}
+	SMBSrc *e = &smb_src[victim];
+	uint64_t base = SMB_VA_SRC + victim * SMB_SRC_SPAN;
+	for (uint32_t k = 0; k < e->pages; k++) {
+		sweet_mali_ctx_unmap(smb_ctx, base + ((uint64_t)k << 12));
+	}
+	bzero(e, sizeof(*e));
+	uint32_t pages = (uint32_t)((len + 4095) >> 12);
+	for (uint32_t k = 0; k < pages; k++) {
+		uint64_t pa = md->getPhysicalSegment((IOByteCount)k << 12, &l, kIOMemoryMapperNone);
+		if (pa == 0 || sweet_mali_ctx_map(smb_ctx, base + ((uint64_t)k << 12), pa & ~0xFFFULL)) {
+			for (uint32_t u = 0; u < k; u++) {
+				sweet_mali_ctx_unmap(smb_ctx, base + ((uint64_t)u << 12));
+			}
+			return 0;
+		}
+	}
+	e->md = md; e->len = len; e->pa0 = pa0; e->palast = pal; e->pages = pages; e->lru = smb_tick;
+	return base;
+}
+
+int sweet_mali_blit(IOMemoryDescriptor *srcmd, uint64_t srcoff, uint32_t srcbpr, uint64_t fbpa, uint32_t fbbpr,
+    uint64_t fbsize, uint64_t dstoff, uint32_t w, uint32_t h);
+
+int
+sweet_mali_blit(IOMemoryDescriptor *srcmd, uint64_t srcoff, uint32_t srcbpr, uint64_t fbpa, uint32_t fbbpr,
+    uint64_t fbsize, uint64_t dstoff, uint32_t w, uint32_t h)
+{
+	if (sm_lock == NULL || smb_dead || srcmd == NULL || w == 0 || h == 0) {
+		return -1;
+	}
+	IOLockLock(sm_lock);
+	int ret = -1;
+	uint64_t sva = 0, last = srcoff + (uint64_t)(h - 1) * srcbpr + (uint64_t)w * 4;
+	if (!smb_init(fbpa, fbsize) || dstoff + (uint64_t)(h - 1) * fbbpr + (uint64_t)w * 4 > fbsize ||
+	    last > srcmd->getLength() || (sva = smb_src_va(srcmd)) == 0) {
+		goto out;
+	}
+	/* CoreAnimation wrote the source through the CPU caches */
+	for (uint64_t o = srcoff & ~0xFFFULL; o < last; o += 4096) {
+		IOByteCount l = 0;
+		uint64_t pa = srcmd->getPhysicalSegment((IOByteCount)o, &l, kIOMemoryMapperNone);
+		if (pa != 0) {
+			flush_dcache64(pa & ~0xFFFULL, 4096, TRUE);
+		}
+	}
+	{
+		uint8_t *d = (uint8_t *)smb_desc->getBytesNoCopy();
+		uint32_t *j = (uint32_t *)d;
+		uint64_t *fau = (uint64_t *)(d + 0x200);
+		fau[0] = sva + srcoff;
+		fau[1] = SMB_VA_FB + dstoff;
+		fau[2] = (uint64_t)srcbpr | ((uint64_t)fbbpr << 32);
+		fau[3] = w;
+		j[0] = j[1] = j[2] = j[3] = 0;
+		j[10] = (w + 63) / 64;
+		j[11] = h;
+		sm_flush_md(smb_desc, 1);
+		uint32_t r = sweet_mali_submit(smb_ctx, 1, SMB_VA_DESC, 200);
+		if (r == 0) {
+			ret = 0;
+			smb_ok++;
+			smb_failrun = 0;
+		} else {
+			smb_fail++;
+			if (++smb_failrun >= 3) {
+				smb_dead = true;
+			}
+			sm_log("gpucomp: job status %llx fails %llu (dead=%llu)", r, smb_fail, smb_dead);
+		}
+		if (smb_ok == 1 || (smb_ok % 600) == 0) {
+			sm_log("gpucomp: ok=%llu fail=%llu last %llux...", smb_ok, smb_fail, ((uint64_t)w << 32) | h);
+		}
+	}
+out:
+	IOLockUnlock(sm_lock);
+	return ret;
+}
+
 #endif /* ARM64_BOARD_CONFIG_SWEET */
 EOF_SWEET_SRC

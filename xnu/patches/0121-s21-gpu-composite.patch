@@ -1,0 +1,33 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,12 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++
++/* S21: GPU (Mali) copy of a layer into the panel memory, SweetMali.cpp. 0 = done, else fall back to the CPU. */
++class IOMemoryDescriptor;
++int sweet_mali_blit(IOMemoryDescriptor *srcmd, uint64_t srcoff, uint32_t srcbpr, uint64_t fbpa, uint32_t fbbpr,
++    uint64_t fbsize, uint64_t dstoff, uint32_t w, uint32_t h);
++static int sweet_fb_gpu = -1;           /* boot-arg sweetgpucomp=1 */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -388,7 +394,17 @@
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
++		}
++		if (sweet_fb_gpu < 0) {
++			int v = 0;
++			sweet_fb_gpu = (PE_parse_boot_argn("sweetgpucomp", &v, sizeof(v)) && v != 0) ? 1 : 0;
+ 		}
++		if (src != 0 && bpe == 4 && sweet_fb_gpu == 1 &&
++		    sweet_mali_blit(s->memory, (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4,
++		    s->bytesPerRow, fPhys, fRowBytes, (uint64_t)fRowBytes * fHeight,
++		    (uint64_t)dy * fRowBytes + (uint64_t)dx * 4, (uint32_t)w, (uint32_t)h) == 0) {
++			src = 0;        /* the GPU did it */
++		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
