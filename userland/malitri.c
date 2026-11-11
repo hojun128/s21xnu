@@ -55,7 +55,7 @@ char g_hist[16][150]; int g_nh;
 #define OFF_FB   0x1000
 #ifndef VAR_FIRST
 #define VAR_FIRST 0
-#define VAR_LAST 3
+#define VAR_LAST 1
 #endif
 #define W 64
 #define H 64
@@ -159,7 +159,7 @@ static int run(void)
 	uint8_t *cpu = 0, *heap = 0;
 	if (!mkbo(c, BO_BYTES, VA_BASE, &cpu)) return 3;
 	int have_heap = mkbo(c, HEAP_BYTES, HEAP_VA, &heap) ? 1 : 0;
-	ulog("tri: build14 bo ok heap=%d", have_heap);
+	ulog("tri: build15 bo ok heap=%d", have_heap);
 	if (!have_heap) return 4;
 	memset(cpu, 0, 0x1000);
 	volatile uint32_t *px = (volatile uint32_t *)(cpu + OFF_FB);
@@ -175,7 +175,13 @@ static int run(void)
 	pan_pack(cpu + OFF_TLS, LOCAL_STORAGE, tl) {
 		tl.wls_instances = MALI_LOCAL_STORAGE_NO_WORKGROUP_MEM;
 	}
-	pan_pack(cpu + OFF_DS, DEPTH_STENCIL, d) {}
+	pan_pack(cpu + OFF_DS, DEPTH_STENCIL, d) {
+		d.depth_function = MALI_FUNC_ALWAYS;
+		d.front_compare_function = MALI_FUNC_ALWAYS;
+		d.back_compare_function = MALI_FUNC_ALWAYS;
+		d.front_write_mask = 0xFF; d.back_write_mask = 0xFF;
+		d.front_value_mask = 0xFF; d.back_value_mask = 0xFF;
+	}
 	pan_pack(cpu + OFF_BLEND, BLEND, b) {
 		b.round_to_fb_precision = true;
 		b.internal.mode = MALI_BLEND_MODE_OPAQUE;
