@@ -1,0 +1,6 @@
+air_gen.inc
+*.smsp
+*.metallib
+*.bc
+*.ll
+varying_slots.json
