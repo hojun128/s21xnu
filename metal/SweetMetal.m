@@ -13,6 +13,7 @@
 #include <mach/mach.h>
 #include <stdarg.h>
 #include <string.h>
+#include <sys/sysctl.h>
 
 typedef mach_port_t io_object_t, io_service_t, io_connect_t;
 extern const mach_port_t kIOMasterPortDefault;
@@ -612,6 +613,39 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	slog("SweetMTL: function %s -> %s", name.UTF8String, sm_find(name) ? "translated" : "NOT in pack");
 	return f;
 }
+- (id)newFunctionWithName:(NSString *)name constantValues:(id)cv functionCache:(id)fc specializedName:(NSString *)sp error:(NSError **)err
+{
+	if (err) *err = nil;
+	NSString *use = (sp && sm_find(sp)) ? sp : name;
+	SweetMTLFunction *f = [SweetMTLFunction new]; f.name = use;
+	f.constants = cv ? [sm_fc_dict(cv) copy] : @{};
+	slog("SweetMTL: function %s (specialized %s) -> %s", name.UTF8String, sp ? sp.UTF8String : "-", sm_find(use) ? "translated" : "NOT in pack");
+	return f;
+}
+- (void)newFunctionWithName:(NSString *)name constantValues:(id)cv functionCache:(id)fc specializedName:(NSString *)sp completionHandler:(void (^)(id, NSError *))h
+{
+	id f = [self newFunctionWithName:name constantValues:cv functionCache:fc specializedName:sp error:NULL];
+	if (h) h(f, nil);
+}
+- (id)newFunctionWithName:(NSString *)name constantValues:(id)cv pipelineLibrary:(id)pl error:(NSError **)err
+{
+	return [self newFunctionWithName:name constantValues:cv error:err];
+}
+- (void)newFunctionWithName:(NSString *)name constantValues:(id)cv completionHandler:(void (^)(id, NSError *))h
+{
+	id f = [self newFunctionWithName:name constantValues:cv error:NULL];
+	if (h) h(f, nil);
+}
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
+{
+	NSMethodSignature *m = [super methodSignatureForSelector:sel];
+	return m ? m : [NSMethodSignature signatureWithObjCTypes:"@@:@@@@"];
+}
+- (void)forwardInvocation:(NSInvocation *)inv
+{
+	slog("SweetMTL: library unimplemented -%s", sel_getName(inv.selector));
+	void *z = NULL; [inv setReturnValue:&z];
+}
 - (id)newFunctionWithName:(NSString *)name constantValues:(id)cv error:(NSError **)err
 {
 	if (err) *err = nil;
@@ -909,7 +943,12 @@ static void sm_fc_hook(void)
 {
 	const char *pn = getprogname();
 	slog("SweetMTL: initWithAcceleratorPort:%u in %s", port, pn ? pn : "?");
-	if (pn == NULL || strcmp(pn, "malitest") != 0) {
+	static int all = -1;
+	if (all < 0) {
+		char ba[1024] = {0}; size_t bl = sizeof(ba) - 1;
+		all = (sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetmetal=2")) ? 1 : 0;
+	}
+	if (!all && (pn == NULL || strcmp(pn, "malitest") != 0)) {
 		return nil;
 	}
 	self = [super init];
