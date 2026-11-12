@@ -7,6 +7,7 @@
  * implemented yet is logged ("SweetMTL: unimplemented ...") and answered with 0/nil.
  */
 #import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <mach/mach.h>
@@ -44,7 +45,12 @@ static void slog(const char *fmt, ...)
 @interface _MTLDevice : NSObject
 @end
 
-@interface SweetMTLDevice : _MTLDevice
+/* MTLAddDevice asserts conformance to MTLDevice and to the private MTLDeviceSPI
+ * (protocols are matched by name by the runtime, so an empty redeclaration is enough). */
+@protocol MTLDeviceSPI <MTLDevice>
+@end
+
+@interface SweetMTLDevice : _MTLDevice <MTLDevice, MTLDeviceSPI>
 @end
 
 @implementation SweetMTLDevice {

@@ -31,7 +31,7 @@ jobs:
             codesign -f -s - "out/$n"
           done
           mkdir -p out/SweetMetal.bundle
-          xcrun clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -fobjc-arc -bundle \
+          xcrun clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -fobjc-arc -bundle -Wno-protocol -Wno-incomplete-implementation -Wno-objc-protocol-property-synthesis -Wno-objc-property-implementation \
             -framework Foundation -framework IOKit -framework Metal -Wl,-U,'_OBJC_CLASS_$__MTLDevice' -Wl,-U,'_OBJC_METACLASS_$__MTLDevice' metal/SweetMetal.m -o out/SweetMetal.bundle/SweetMetal
           cp metal/Info.plist out/SweetMetal.bundle/Info.plist
           codesign -f -s - out/SweetMetal.bundle/SweetMetal
