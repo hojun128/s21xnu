@@ -7,9 +7,13 @@
  *   u32 varying_slots (VAR0..), u32 reserved, bytes (16-aligned).   (112-byte header)
  */
 #include <stdio.h>
+#define rec_write fwrite
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_builtin_builder.h"
 #include "compiler/glsl_types.h"
 #include "panfrost/compiler/bifrost_compile.h"
 #include "panfrost/util/pan_ir.h"
@@ -100,6 +104,13 @@ int main(int argc, char **argv)
 	long count_at = ftell(f);
 	fwrite(&ok, 4, 1, f);
 	for (unsigned i = 0; i < n; i++) {
+		int pfd[2];
+		if (pipe(pfd)) return 1;
+		pid_t pid = fork();
+		if (pid == 0) {
+			close(pfd[0]);
+			FILE *rf = fdopen(pfd[1], "wb");
+
 		nir_builder b = nir_builder_init_simple_shader(all[i].stage, &bifrost_nir_options_v9, "%s", all[i].name);
 		if (all[i].stage == MESA_SHADER_COMPUTE) {
 			b.shader->info.workgroup_size[0] = 64;
@@ -121,23 +132,34 @@ int main(int argc, char **argv)
 		uint32_t sec = all[i].stage == MESA_SHADER_VERTEX ? info.vs.secondary_offset : 0;
 		uint32_t flags = (all[i].stage == MESA_SHADER_VERTEX && info.vs.secondary_enable) ? 1 : 0;
 		uint64_t preload = info.preload;
-		fwrite(name, 1, 64, f); fwrite(&stage, 4, 1, f); fwrite(&size, 4, 1, f); fwrite(&preload, 8, 1, f);
-		fwrite(&pw, 4, 1, f); fwrite(&wr, 4, 1, f); fwrite(&sec, 4, 1, f); fwrite(&flags, 4, 1, f);
+		rec_write(name, 1, 64, rf); rec_write(&stage, 4, 1, rf); rec_write(&size, 4, 1, rf); rec_write(&preload, 8, 1, rf);
+		rec_write(&pw, 4, 1, rf); rec_write(&wr, 4, 1, rf); rec_write(&sec, 4, 1, rf); rec_write(&flags, 4, 1, rf);
 		uint64_t spre = all[i].stage == MESA_SHADER_VERTEX ? info.vs.secondary_preload : 0;
 		uint32_t nvar = 0, rsv = 0;
 		uint64_t ow = all[i].stage == MESA_SHADER_VERTEX ? b.shader->info.outputs_written : b.shader->info.inputs_read;
 		for (unsigned k = 0; k < 32; k++)
 			if (ow & BITFIELD64_BIT(VARYING_SLOT_VAR0 + k)) nvar = k + 1;
-		fwrite(&spre, 8, 1, f); fwrite(&nvar, 4, 1, f); fwrite(&rsv, 4, 1, f);
-		fwrite(bin.data, 1, bin.size, f);
+		rec_write(&spre, 8, 1, rf); rec_write(&nvar, 4, 1, rf); rec_write(&rsv, 4, 1, rf);
+		rec_write(bin.data, 1, bin.size, rf);
 		static const uint8_t z[16];
-		fwrite(z, 1, (16 - (bin.size & 15)) & 15, f);
+		rec_write(z, 1, (16 - (bin.size & 15)) & 15, rf);
 		fprintf(stderr, "%-36s %s %5u bytes preload=%llx push=%u sec=%u nvar=%u%s\n", name,
 		    stage == MESA_SHADER_VERTEX ? "VS" : stage == MESA_SHADER_FRAGMENT ? "FS" : "CS", size,
 		    (unsigned long long)preload, pw, sec, nvar, flags ? " varying-shader" : "");
 		util_dynarray_fini(&bin);
 		ralloc_free(b.shader);
-		ok++;
+	
+			fclose(rf);
+			_exit(0);
+		}
+		close(pfd[1]);
+		static uint8_t buf[1 << 20];
+		size_t got = 0; ssize_t r;
+		while ((r = read(pfd[0], buf + got, sizeof(buf) - got)) > 0) got += r;
+		close(pfd[0]);
+		int st = 0; waitpid(pid, &st, 0);
+		if (WIFEXITED(st) && WEXITSTATUS(st) == 0 && got >= 112) { fwrite(buf, 1, got, f); ok++; }
+		else fprintf(stderr, "%-36s COMPILER CRASH (status %x), skipped\n", all[i].name, st);
 	}
 	fseek(f, count_at, SEEK_SET);
 	fwrite(&ok, 4, 1, f);

@@ -1,12 +1,15 @@
 """AIR (Metal LLVM IR) -> Mesa nir_builder C code. v0: straight-line functions.
 Push-constant ABI (bytes):  0..63  buffer[i] GPU VA (u64)       64..191 attr[L] {u64 va, u32 stride, u32 pad}
                            192..215 viewport scale.xyz, offset.xyz (f32)
-Texture i -> pan_res_handle(4, i), sampler i -> pan_res_handle(3, i).  Varyings: global name -> VAR0+slot."""
+                           216..223 function-constant "defined" mask (bit k)   256..511 function constant k at 256+4k
+Texture i -> pan_res_handle(4, i), sampler i -> pan_res_handle(3, i), constexpr samplers -> sampler 15.
+Varyings: global name -> VAR0+slot."""
 import re, sys, json
 import llvmlite.binding as llb
 llb.initialize(); llb.initialize_native_target(); llb.initialize_native_asmprinter()
 
-PUSH_BUF, PUSH_ATTR, PUSH_VP = 0, 64, 192
+PUSH_BUF, PUSH_ATTR, PUSH_VP, PUSH_FCDEF, PUSH_FC = 0, 64, 192, 216, 256
+INLINE_SAMPLER = 15
 
 class Unsupported(Exception): pass
 
@@ -19,6 +22,26 @@ def split_top(s, sep=','):
         else: cur += ch
     if cur.strip(): out.append(cur.strip())
     return out
+
+
+def split_tv(x):
+    """'<2 x float> <float 1.0, float 2.0>' -> ('<2 x float>', '<float 1.0, float 2.0>')"""
+    x = x.strip()
+    if x[0] in '<{[':
+        depth = 0
+        for i, ch in enumerate(x):
+            if ch in '<{[(': depth += 1
+            elif ch in '>}])':
+                depth -= 1
+                if depth == 0:
+                    j = i + 1
+                    while x[j:j+1] == '>': j += 1
+                    return x[:j].strip(), x[j:].strip()
+    t, v = x.split(None, 1)
+    while v.startswith('addrspace') or v == '*':
+        a, v = v.split(None, 1) if ' ' in v else (v, '')
+        t += ' ' + a
+    return t, v.strip()
 
 class Types:
     def __init__(self, modtext):
@@ -103,7 +126,10 @@ class Fn:
         v = v.strip()
         if v in ('undef', 'poison', 'zeroinitializer'): v = '0'
         if s in ('float', 'half', 'double'):
-            if v.startswith('0x'):
+            if v.startswith('0xH'):
+                import struct
+                fv = struct.unpack('<e', struct.pack('<H', int(v[3:], 16)))[0]
+            elif v.startswith('0x'):
                 import struct
                 fv = struct.unpack('<d', struct.pack('<Q', int(v, 16)))[0]
             else: fv = float(v)
@@ -113,6 +139,9 @@ class Fn:
         return 'nir_imm_intN_t(b, %s, %d)' % (int(v), max(BITS[s], 1) if s != 'i1' else 1)
     def val(self, ty, txt):
         txt = txt.strip()
+        m = re.search(r'MTL_FC_INIT_(\d+)_', txt)
+        if txt.startswith('@') and m:
+            return ('fc', int(m.group(1)))
         if txt.startswith('%'):
             if txt not in self.vals: raise Unsupported('value ' + txt)
             return self.vals[txt]
@@ -123,9 +152,13 @@ class Fn:
         out = []
         for o in split_top(s):
             o = re.sub(r'\b(nocapture|readonly|readnone|noalias|nonnull|noundef|inreg|zeroext|signext)\b', '', o).strip()
-            m = re.match(r'^(.*?)\s+(%[\w.]+|-?[\d.e+\-]+|0x[0-9A-Fa-f]+|true|false|undef|poison|zeroinitializer|null|<.*>)$', o)
-            if not m: raise Unsupported('operand ' + o)
-            out.append((m.group(1).strip(), m.group(2).strip()))
+            o = re.sub(r'\s+', ' ', o)
+            t, v = split_tv(o)
+            if t.endswith('*') or 'addrspace' in t:
+                m = re.match(r'^(.*\*)\s*(.*)$', o)
+                if m: t, v = m.group(1).strip(), m.group(2).strip()
+            if not v: raise Unsupported('operand ' + o)
+            out.append((t, v))
         return out
 
     # ---------------- entry
@@ -154,18 +187,127 @@ class Fn:
             elif a['kind'] in ('fragment_input',):
                 n, s = scal(ty)
                 self.vals[name] = self.tmp('nir_load_interpolated_input(b, %d, %d, nir_load_barycentric_pixel(b, 32, .interp_mode = INTERP_MODE_SMOOTH), nir_imm_int(b, 0), .base = %d, .io_semantics.location = VARYING_SLOT_VAR0 + %d, .io_semantics.num_slots = 1)'
-                                           % (n, BITS[s], a['slot'], a['slot']))
+                                           % (n, BITS[s], a['slot'] + 1, a['slot']))
             elif a['kind'] in ('vertex_id',):
-                self.vals[name] = self.tmp('nir_load_vertex_id(b)')
+                n, sc = scal(ty)
+                v = self.tmp('nir_load_vertex_id(b)')
+                self.vals[name] = self.tmp('nir_u2uN(b, %s, %d)' % (v, BITS[sc])) if BITS[sc] != 32 else v
+            elif a['kind'] in ('instance_id',):
+                n, sc = scal(ty)
+                v = self.tmp('nir_load_instance_id(b)')
+                self.vals[name] = self.tmp('nir_u2uN(b, %s, %d)' % (v, BITS[sc])) if BITS[sc] != 32 else v
             elif a['kind'] == 'unused':
                 pass
             else:
                 raise Unsupported('arg kind ' + a['kind'])
         blocks = list(self.f.blocks)
-        if len(blocks) != 1: raise Unsupported('%d blocks (control flow)' % len(blocks))
-        for ins in blocks[0].instructions:
-            self.ins(ins)
+        if len(blocks) == 1:
+            for ins in blocks[0].instructions:
+                self.ins(ins)
+        else:
+            self.if_convert(blocks)
         return '\n'.join(self.lines)
+
+    # ---------------- acyclic control flow -> predicated straight-line code
+    def if_convert(self, blocks):
+        nargs = len(list(self.f.arguments))
+        labels = []
+        for k, bb in enumerate(blocks):
+            first = str(bb).lstrip('\n').split('\n', 1)[0]
+            m = re.match(r'^([\w.\-]+):', first)
+            labels.append('%' + m.group(1) if m else ('%' + str(nargs) if k == 0 else None))
+        idx = {l: k for k, l in enumerate(labels)}
+        def term(bb):
+            ins = list(bb.instructions)[-1]
+            return re.sub(r',\s*!\w+ !\d+', '', str(ins).strip())
+        succ = []
+        for bb in blocks:
+            t = term(bb)
+            succ.append([idx[x] for x in re.findall(r'label (%[\w.\-]+)', t)])
+        # topological order (and loop detection)
+        order, state = [], [0] * len(blocks)
+        def dfs(k):
+            if state[k] == 1: raise Unsupported('loop (back edge)')
+            if state[k] == 2: return
+            state[k] = 1
+            for s2 in succ[k]: dfs(s2)
+            state[k] = 2; order.append(k)
+        dfs(0)
+        order.reverse()
+        pred = {0: self.tmp('nir_imm_true(b)')}
+        edge = {}           # (from, to) -> predicate value
+        self.rets = []
+        for k in order:
+            bb = blocks[k]
+            if k not in pred:
+                ins_edges = [edge[e] for e in edge if e[1] == k]
+                if not ins_edges: continue           # unreachable
+                p = ins_edges[0]
+                for e2 in ins_edges[1:]: p = self.tmp('nir_ior(b, %s, %s)' % (p, e2))
+                pred[k] = p
+            self.cur_block, self.cur_pred, self.edge, self.labels = k, pred[k], edge, labels
+            insl = list(bb.instructions)
+            for ins in insl[:-1]:
+                self.ins(ins)
+            t = term(bb)
+            P = pred[k]
+            m = re.match(r'^br label (%[\w.\-]+)$', t)
+            m2 = re.match(r'^br i1 (\S+), label (%[\w.\-]+), label (%[\w.\-]+)$', t)
+            m3 = re.match(r'^switch (\w+) (\S+), label (%[\w.\-]+) \[(.*)\]$', t, re.S)
+            if m:
+                edge[(k, idx[m.group(1)])] = P
+            elif m2:
+                c = self.val('i1', m2.group(1))
+                edge[(k, idx[m2.group(2)])] = self.tmp('nir_iand(b, %s, %s)' % (P, c))
+                edge[(k, idx[m2.group(3)])] = self.tmp('nir_iand(b, %s, nir_inot(b, %s))' % (P, c))
+            elif m3:
+                ty, v, dflt, cases = m3.groups()
+                V = self.val(ty, v)
+                any_case = None
+                for cv, cl in re.findall(r'\w+ (-?\d+), label (%[\w.\-]+)', cases):
+                    eq = self.tmp('nir_ieq_imm(b, %s, %s)' % (V, cv))
+                    any_case = eq if any_case is None else self.tmp('nir_ior(b, %s, %s)' % (any_case, eq))
+                    e = (k, idx[cl])
+                    pe = self.tmp('nir_iand(b, %s, %s)' % (P, eq))
+                    edge[e] = self.tmp('nir_ior(b, %s, %s)' % (edge[e], pe)) if e in edge else pe
+                e = (k, idx[dflt])
+                pd = self.tmp('nir_iand(b, %s, nir_inot(b, %s))' % (P, any_case)) if any_case else P
+                edge[e] = self.tmp('nir_ior(b, %s, %s)' % (edge[e], pd)) if e in edge else pd
+            elif t.startswith('ret'):
+                self.ret_pending = None
+                self.collect_ret = True
+                self.ins_text_ret(t, P)
+            elif t.startswith('unreachable'):
+                pass
+            else:
+                raise Unsupported('terminator ' + t.split()[0])
+        # merge returns
+        if not self.rets: return
+        kind, outs, args = self.md
+        final = dict(self.rets[-1][1])
+        for p2, mem in reversed(self.rets[:-1]):
+            for i2 in final:
+                if i2 in mem: final[i2] = self.tmp('nir_bcsel(b, %s, %s, %s)' % (p2, mem[i2], final[i2]))
+        self.emit_outputs(final)
+
+    def ins_text_ret(self, t, P):
+        m = re.match(r'^ret (.+) (\S+)$', t)
+        if t == 'ret void' or not m: self.rets.append((P, {})); return
+        ty, v = m.groups()
+        self.rets.append((P, self.ret_members(ty, v)))
+
+    def phi(self, rhs):
+        m = re.match(r'^phi (.+?) (\[.*\])$', rhs)
+        ty, rest = m.groups()
+        inc = re.findall(r'\[\s*([^,\]]+?)\s*,\s*(%[\w.\-]+)\s*\]', rest)
+        idx = {l: k for k, l in enumerate(self.labels)}
+        res = None
+        for v, lab in reversed(inc):
+            e = (idx[lab], self.cur_block)
+            val = self.val(ty, v)
+            if res is None: res = val
+            else: res = self.tmp('nir_bcsel(b, %s, %s, %s)' % (self.edge.get(e, 'nir_imm_false(b)'), val, res))
+        return res
 
     def ins(self, ins):
         t = str(ins).strip()
@@ -176,17 +318,19 @@ class Fn:
         op = rhs.split()[0]
         R = None
         if op in ('fadd', 'fsub', 'fmul', 'fdiv', 'add', 'sub', 'mul', 'and', 'or', 'xor', 'shl', 'lshr', 'ashr', 'udiv', 'sdiv', 'urem', 'srem', 'frem'):
-            m = re.match(r'^\w+ (.+?) (\S+), (\S+)$', rhs)
-            ty, a, bb = m.groups()
+            parts = split_top(rhs.split(None, 1)[1])
+            ty, a = split_tv(parts[0]); bb = parts[1]
             fn = {'fadd': 'fadd', 'fsub': 'fsub', 'fmul': 'fmul', 'fdiv': 'fdiv', 'add': 'iadd', 'sub': 'isub', 'mul': 'imul',
                   'and': 'iand', 'or': 'ior', 'xor': 'ixor', 'shl': 'ishl', 'lshr': 'ushr', 'ashr': 'ishr',
                   'udiv': 'udiv', 'sdiv': 'idiv', 'urem': 'umod', 'srem': 'irem', 'frem': 'fmod'}[op]
             R = self.tmp('nir_%s(b, %s, %s)' % (fn, self.val(ty, a), self.val(ty, bb)))
         elif op == 'fneg':
-            m = re.match(r'^fneg (.+?) (\S+)$', rhs); R = self.tmp('nir_fneg(b, %s)' % self.val(*m.groups()))
+            ty, a = split_tv(rhs.split(None, 1)[1]); R = self.tmp('nir_fneg(b, %s)' % self.val(ty, a))
         elif op in ('fcmp', 'icmp'):
-            m = re.match(r'^\w+ (\w+) (.+?) (\S+), (\S+)$', rhs)
-            pred, ty, a, bb = m.groups(); A, B = self.val(ty, a), self.val(ty, bb)
+            _, pred, rest = rhs.split(None, 2)
+            parts = split_top(rest)
+            ty, a = split_tv(parts[0]); bb = parts[1]
+            A, B = self.val(ty, a), self.val(ty, bb)
             tab = {'oeq': ('feq', 0), 'ueq': ('feq', 0), 'one': ('fneu', 0), 'une': ('fneu', 0), 'olt': ('flt', 0), 'ult': ('flt', 0),
                    'ogt': ('flt', 1), 'ugt': ('flt', 1), 'oge': ('fge', 0), 'uge': ('fge', 0), 'ole': ('fge', 1), 'ule': ('fge', 1),
                    'eq': ('ieq', 0), 'ne': ('ine', 0), 'ult_i': ('ult', 0), 'slt': ('ilt', 0), 'sgt': ('ilt', 1), 'sge': ('ige', 0), 'sle': ('ige', 1),
@@ -200,8 +344,8 @@ class Fn:
             ops = self.operands(rhs[len('select '):])
             R = self.tmp('nir_bcsel(b, %s, %s, %s)' % tuple(self.val(*o) for o in ops))
         elif op in ('zext', 'sext', 'trunc', 'fpext', 'fptrunc', 'bitcast', 'sitofp', 'uitofp', 'fptosi', 'fptoui'):
-            m = re.match(r'^\w+ (.+?) (\S+) to (.+)$', rhs)
-            sty, v, dty = m.groups()
+            body, dty = rhs.split(None, 1)[1].rsplit(' to ', 1)
+            sty, v = split_tv(body)
             if sty.endswith('*'):
                 p = self.vals[v]; self.vals[dst] = (p[0], p[1], re.sub(r'\s*addrspace\(\d+\)\*$', '', dty)); return
             A = self.val(sty, v); _, ds = scal(dty); _, ss = scal(sty); db = BITS[ds]
@@ -217,17 +361,25 @@ class Fn:
                 dn, _ = scal(dty)
                 R = self.tmp('nir_bitcast_vector(b, %s, %d)' % (A, db)) if BITS[ds] != BITS[ss] else A
         elif op == 'extractelement':
-            m = re.match(r'^extractelement (.+?) (\S+), \w+ (\d+)$', rhs)
-            if not m: raise Unsupported('dynamic extractelement')
-            R = self.tmp('nir_channel(b, %s, %s)' % (self.val(m.group(1), m.group(2)), m.group(3)))
+            parts = split_top(rhs[len('extractelement '):])
+            vt, v = split_tv(parts[0]); it, iv = split_tv(parts[1])
+            if not iv.isdigit():
+                n_, _ = scal(vt)
+                V = self.val(vt, v); I = self.val(it, iv)
+                acc = 'nir_channel(b, %s, 0)' % V
+                for c in range(1, n_):
+                    acc = 'nir_bcsel(b, nir_ieq_imm(b, %s, %d), nir_channel(b, %s, %d), %s)' % (I, c, V, c, acc)
+                R = self.tmp(acc)
+            else:
+                R = self.tmp('nir_channel(b, %s, %s)' % (self.val(vt, v), iv))
         elif op == 'insertelement':
-            m = re.match(r'^insertelement (.+?) (\S+), (.+?) (\S+), \w+ (\d+)$', rhs)
-            if not m: raise Unsupported('dynamic insertelement')
-            vt, v, et, e, idx = m.groups()
+            parts = split_top(rhs[len('insertelement '):])
+            vt, v = split_tv(parts[0]); et, e = split_tv(parts[1]); _, idx = split_tv(parts[2])
+            if not idx.isdigit(): raise Unsupported('dynamic insertelement')
             R = self.tmp('nir_vector_insert_imm(b, %s, %s, %s)' % (self.val(vt, v), self.val(et, e), idx))
         elif op == 'shufflevector':
-            m = re.match(r'^shufflevector (<\d+ x \w+>) (\S+), (<\d+ x \w+>) (\S+), (<\d+ x i32>) (.+)$', rhs)
-            t1, a, t2, bb, mt, mask = m.groups()
+            parts = split_top(rhs[len('shufflevector '):])
+            t1, a = split_tv(parts[0]); t2, bb = split_tv(parts[1]); mt, mask = split_tv(parts[2])
             n1, s = scal(t1); nm, _ = scal(mt)
             A = self.val(t1, a); B = self.val(t2, bb) if bb not in ('undef', 'poison') else None
             if mask.strip() == 'zeroinitializer': idx = [0] * nm
@@ -278,9 +430,23 @@ class Fn:
             if off_c: addr = self.tmp('nir_iadd_imm(b, %s, %d)' % (addr, off_c))
             self.vals[dst] = ('ptr', addr, cur); return
         elif op == 'load':
-            m = re.match(r'^load (.+?), (.+?) (%[\w.]+)(, align (\d+))?$', rhs)
-            ty, _, ptr, _, al = m.groups()
-            p = self.vals[ptr]; n, s = scal(ty)
+            parts = split_top(rhs[len('load '):])
+            ty = parts[0].strip()
+            pty, ptr = parts[1].rsplit(' ', 1)
+            al = parts[2].split()[-1] if len(parts) > 2 and parts[2].startswith('align') else '4'
+            n, s = scal(ty)
+            fc = re.search(r'MTL_FC_INIT_(\d+)_', ptr)
+            if ptr.startswith('@') and fc:
+                k = int(fc.group(1))
+                if n != 1: raise Unsupported('vector function constant')
+                w = self.tmp('nir_load_push_constant(b, 1, 32, nir_imm_int(b, 0), .base = %d, .range = 4)' % (PUSH_FC + 4 * k))
+                if s in ('float',): R = w
+                elif s == 'half': R = self.tmp('nir_f2f16(b, nir_bitcast_vector(b, %s, 32))' % w)
+                elif s == 'i1': R = self.tmp('nir_ine_imm(b, %s, 0)' % w)
+                else: R = self.tmp('nir_u2uN(b, %s, %d)' % (w, BITS[s])) if BITS[s] != 32 else w
+                self.vals[dst] = R; return
+            if not ptr.startswith('%'): raise Unsupported('load from global ' + ptr[:40])
+            p = self.vals[ptr]
             if ty.startswith('%') or ty.startswith('{') or ty.startswith('['): raise Unsupported('aggregate load')
             R = self.tmp('nir_load_global(b, %s, %s, %d, %d)' % (p[1], al or 4, n, BITS[s]))
         elif op == 'store':
@@ -290,6 +456,8 @@ class Fn:
         elif op == 'call':
             R = self.call(rhs)
             if R is None: return
+        elif op == 'phi':
+            R = self.phi(rhs)
         elif op == 'ret':
             self.ret(rhs); return
         else:
@@ -322,13 +490,20 @@ class Fn:
         if base in ('air.clamp', 'air.fast_clamp'): return self.tmp('nir_fclamp(b, %s, %s, %s)' % (V(0), V(1), V(2)))
         if base == 'air.dot': return self.tmp('nir_fdot(b, %s, %s)' % (V(0), V(1)))
         if base == 'air.fwidth': return self.tmp('nir_fadd(b, nir_fabs(b, nir_fddx(b, %s)), nir_fabs(b, nir_fddy(b, %s)))' % (V(0), V(0)))
-        if base == 'air.fast_atan2': return self.tmp('nir_fatan2(b, %s, %s)' % (V(0), V(1)))
+        if base == 'air.fast_atan2': return self.tmp('nir_atan2(b, %s, %s)' % (V(0), V(1)))
         if base.startswith('air.convert'):
             dk = fn.split('.')[2]; sk = fn.split('.')[-2]
             A = V(0); db = BITS[s]
             if dk == 'f': return self.tmp(('nir_f2fN' if sk == 'f' else 'nir_i2fN' if sk == 's' else 'nir_u2fN') + '(b, %s, %d)' % (A, db))
             if dk == 's': return self.tmp(('nir_f2iN' if sk == 'f' else 'nir_i2iN') + '(b, %s, %d)' % (A, db))
             if dk == 'u': return self.tmp(('nir_f2uN' if sk == 'f' else 'nir_u2uN') + '(b, %s, %d)' % (A, db))
+        if base == 'air.is_function_constant_defined':
+            k = int(re.search(r'MTL_FC_INIT_(\d+)_', args).group(1))
+            mask = self.tmp('nir_load_push_constant(b, 1, 64, nir_imm_int(b, 0), .base = %d, .range = 8)' % PUSH_FCDEF)
+            return self.tmp('nir_ine_imm(b, nir_iand_imm(b, %s, %du), 0)' % (mask, 1 << k) if k < 32 else
+                            'nir_ine_imm(b, nir_iand(b, %s, nir_imm_int64(b, 1ull << %d)), 0)' % (mask, k))
+        if base == 'air.normalize_function_constant_predicate':
+            return V(0)
         if base == 'air.read_texture_2d':
             tex = self.vals[ops[0][1]][1]
             m2 = re.match(r'\{ <(\d+) x (\w+)>', rty); nn, ss = int(m2.group(1)), m2.group(2)
@@ -337,7 +512,8 @@ class Fn:
                          'sm_txf(b, %s, %s, %d, %d)' % (V(1), V(2), tex, BITS[ss]))
             return {0: r}
         if base == 'air.sample_texture_2d':
-            tex = self.vals[ops[0][1]][1]; smp = self.vals[ops[1][1]][1]
+            tex = self.vals[ops[0][1]][1]
+            smp = INLINE_SAMPLER if '__air_sampler_state' in ops[1][1] or '__air_sampler_state' in ops[1][0] else self.vals[ops[1][1]][1]
             m2 = re.match(r'\{ <(\d+) x (\w+)>', rty); ss = m2.group(2)
             r = self.tmp('sm_tex(b, %s, %d, %d, %d)' % (V(2), tex, smp, BITS[ss]))
             return {0: r}
@@ -348,8 +524,20 @@ class Fn:
         m = re.match(r'^ret (.+) (\S+)$', rhs)
         if rhs == 'ret void': return
         ty, v = m.groups()
-        agg = self.vals[v] if v.startswith('%') else None
-        members = agg if isinstance(agg, dict) else {0: self.val(ty, v)}
+        members = self.ret_members(ty, v)
+        self.emit_outputs(members)
+
+    def ret_members(self, ty, v):
+        if v.startswith('%'):
+            agg = self.vals[v]
+            return dict(agg) if isinstance(agg, dict) else {0: agg}
+        mm = re.match(r'^<?\{(.*)\}>?$', ty.strip())
+        if mm:      # constant aggregate (zeroinitializer / undef)
+            return {i: self.tmp(self.const(et, 'zeroinitializer')) for i, et in enumerate(split_top(mm.group(1)))}
+        return {0: self.val(ty, v)}
+
+    def emit_outputs(self, members):
+        kind, outs, args = self.md
         for i, o in enumerate(outs):
             if i not in members: continue
             val = members[i]
@@ -357,7 +545,7 @@ class Fn:
                 self.lines.append('\tsm_store_position(b, %s);' % val)
             elif o['kind'] == 'vertex_output':
                 self.lines.append('\tnir_store_output(b, %s, nir_imm_int(b, 0), .base = %d, .write_mask = BITFIELD_MASK(%s->num_components), .src_type = nir_type_float | %s->bit_size, .io_semantics.location = VARYING_SLOT_VAR0 + %d, .io_semantics.num_slots = 1);'
-                                  % (val, o['slot'], val, val, o['slot']))
+                                  % (val, o['slot'] + 1, val, val, o['slot']))
             elif o['kind'] == 'render_target':
                 self.lines.append('\tnir_store_output(b, %s, nir_imm_int(b, 0), .base = %d, .write_mask = BITFIELD_MASK(%s->num_components), .src_type = nir_type_float | %s->bit_size, .io_semantics.location = FRAG_RESULT_DATA0 + %d, .io_semantics.num_slots = 1);'
                                   % (val, o['idx'], val, val, o['idx']))
@@ -401,6 +589,7 @@ def entry_md(modtext, fname, slots):
         elif '"air.fragment_input"' in t:
             nm = re.search(r'"air.fragment_input", !"([^"]+)"', t).group(1); args.append({'kind': 'fragment_input', 'slot': slot_of(nm)})
         elif '"air.vertex_id"' in t: args.append({'kind': 'vertex_id'})
+        elif '"air.instance_id"' in t: args.append({'kind': 'instance_id'})
         else: args.append({'kind': 'other:' + t[:60]})
     return kind, outs, args
 
