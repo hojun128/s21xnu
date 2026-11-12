@@ -213,6 +213,36 @@ int main(int argc, char **argv)
 				for (int i = 0; i < 64 * 64; i++) { if (px[i] == 0xFF00FF00u) tri++; else if (px[i] == 0xFFFF0000u) bg++; }
 				ulog("mtltest: AIR vs status=%lu tri=%d bg=%d p(10,10)=%08x p(50,50)=%08x %s", (unsigned long)cb.status, tri, bg,
 				    px[10 * 64 + 10], px[50 * 64 + 50], tri > 1000 ? "APPLE-VS-ON-MALI-OK" : "APPLE-VS-FAIL");
+
+				/* phase 2d: CoreAnimation's read_surf_frag (texture fetch at the pixel) + std_vert0_lpf full-screen quad */
+				id<MTLFunction> ff2 = [lib newFunctionWithName:@"read_surf_frag"];
+				MTLRenderPipelineDescriptor *pd3 = [MTLRenderPipelineDescriptor new];
+				pd3.vertexFunction = vf; pd3.fragmentFunction = ff2; pd3.vertexDescriptor = vd;
+				pd3.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+				id<MTLRenderPipelineState> ps3 = [d newRenderPipelineStateWithDescriptor:pd3 error:&perr];
+				id<MTLTexture> src = [d newTextureWithDescriptor:td];
+				static uint32_t pat[64 * 64];
+				for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) pat[y * 64 + x] = 0xFF000000u | (x * 4) | ((y * 4) << 8) | (((x ^ y) & 1) ? 0xC00000u : 0x300000u);
+				[src replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 withBytes:pat bytesPerRow:256];
+				static const float quad[6 * 8] = {
+					-1, 1, 0.5f, 1,  1,1,1,1,   1, 1, 0.5f, 1,  1,1,1,1,   -1,-1, 0.5f, 1,  1,1,1,1,
+					 1, 1, 0.5f, 1,  1,1,1,1,   1,-1, 0.5f, 1,  1,1,1,1,   -1,-1, 0.5f, 1,  1,1,1,1 };
+				id<MTLBuffer> qb = [d newBufferWithBytes:quad length:sizeof quad options:0];
+				cb = [q commandBuffer];
+				enc = [cb renderCommandEncoderWithDescriptor:rp];
+				[enc setRenderPipelineState:ps3];
+				[enc setVertexBuffer:qb offset:0 atIndex:0];
+				[enc setVertexBytes:mvp length:sizeof mvp atIndex:2];
+				[enc setFragmentTexture:src atIndex:0];
+				[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+				[enc endEncoding];
+				[cb commit];
+				[cb waitUntilCompleted];
+				[tex getBytes:px bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+				int same = 0, firstbad = -1;
+				for (int i = 0; i < 64 * 64; i++) { if (px[i] == pat[i]) same++; else if (firstbad < 0) firstbad = i; }
+				ulog("mtltest: AIR fs status=%lu same=%d/4096 px0=%08x want=%08x px(33,17)=%08x want=%08x bad@%d %s", (unsigned long)cb.status,
+				    same, px[0], pat[0], px[17 * 64 + 33], pat[17 * 64 + 33], firstbad, same == 4096 ? "APPLE-FS-TEXTURE-OK" : "APPLE-FS-TEXTURE-FAIL");
 			}
 		}
 		for (int n = 0;; n++) {

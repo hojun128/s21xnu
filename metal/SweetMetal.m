@@ -355,6 +355,9 @@ typedef struct {
 	uint64_t buf[31];                /* GPU VA bound at each Metal buffer index */
 	struct { uint32_t fmt, off, bidx; } attr[16];
 	uint32_t stride[31];
+	struct { uint64_t va; uint32_t w, h, stride, fmt; } tex[8];
+	struct { uint32_t nearest, wrap; } smp[8];
+	uint32_t ntex, nsmp;
 } sm_drawrec;
 
 #define SMP_BUF 0
@@ -454,6 +457,42 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		}
 		float vp[6] = { w * 0.5f, -(float)h * 0.5f, 1.0f, w * 0.5f, h * 0.5f, 0.0f };
 		memcpy(push + SMP_VP, vp, sizeof vp);
+		/* fragment resources: SAMPLER table (3) and TEXTURE table (4), descriptors at 0x1C00.. */
+		uint64_t res_va = 0;
+		if (r->ntex || r->nsmp) {
+			uint32_t ns = r->nsmp ? r->nsmp : 1;
+			for (uint32_t k = 0; k < ns; k++) {
+				pan_pack(P + 0x1C00 + 32 * k, SAMPLER, sc) {
+					sc.minify_nearest = r->smp[k].nearest; sc.magnify_nearest = r->smp[k].nearest;
+					sc.normalized_coordinates = true;
+					sc.wrap_mode_s = sc.wrap_mode_t = sc.wrap_mode_r = MALI_WRAP_MODE_CLAMP_TO_EDGE;
+				}
+			}
+			for (uint32_t k = 0; k < r->ntex; k++) {
+				pan_pack(P + 0x1E00 + 32 * k, PLANE, pl) {
+					pl.plane_type = MALI_PLANE_TYPE_GENERIC;
+					pl.clump_format = MALI_CLUMP_FORMAT_RAW32;
+					pl.clump_ordering = MALI_CLUMP_ORDERING_LINEAR;
+					pl.pointer = r->tex[k].va;
+					pl.row_stride = r->tex[k].stride;
+					pl.size = r->tex[k].stride * r->tex[k].h;
+					pl.slice_stride = r->tex[k].stride * r->tex[k].h;
+				}
+				pan_pack(P + 0x1D00 + 32 * k, TEXTURE, tx) {
+					tx.dimension = MALI_TEXTURE_DIMENSION_2D;
+					tx.format = r->tex[k].fmt;
+					tx.width = r->tex[k].w; tx.height = r->tex[k].h;
+					tx.swizzle = 0 | (1 << 3) | (2 << 6) | (3 << 9);
+					tx.levels = 1; tx.array_size = 1; tx.sample_count = 1;
+					tx.surfaces = PV + 0x1E00 + 32 * k;
+					tx.minimum_lod = 0; tx.maximum_lod = 0;
+				}
+			}
+			memset(P + 0x280, 0, 6 * 16);
+			pan_pack(P + 0x280 + 3 * 16, RESOURCE, rc) { rc.address = PV + 0x1C00; rc.size = ns * 32; }
+			if (r->ntex) pan_pack(P + 0x280 + 4 * 16, RESOURCE, rc) { rc.address = PV + 0x1D00; rc.size = r->ntex * 32; }
+			res_va = (PV + 0x280) | 6;
+		}
 		uint32_t vs_fau = (vs->push_words + 1) / 2, fs_fau = (fs_push + 1) / 2;
 		if (vs_fau == 0) vs_fau = 1;
 		uint32_t nvar = vs->nvar; if (fs && fs->nvar > nvar) nvar = fs->nvar;
@@ -482,6 +521,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 			cfg.overdraw_alpha0 = true; cfg.overdraw_alpha1 = true;
 			cfg.shader.thread_storage = D + OFF_TLS; cfg.shader.shader = PV + 0x240;
 			cfg.shader.fau = PV + 0x300; cfg.shader.fau_count = fs_fau ? fs_fau : 1;
+			cfg.shader.resources = res_va;
 		}
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, POSITION, cfg) {
 			cfg.thread_storage = D + OFF_TLS; cfg.shader = PV + 0x200; cfg.fau = PV + 0x300; cfg.fau_count = vs_fau;
@@ -570,6 +610,11 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	_bo = &_store;
 	return self;
 }
+- (uint32_t)maliFormat
+{
+	bool bgra = _pixelFormat == MTLPixelFormatBGRA8Unorm;
+	return (MALI_RGBA8_UNORM << 12) | (bgra ? MALI_RGB_COMPONENT_ORDER_BGRA : MALI_RGB_COMPONENT_ORDER_RGBA);
+}
 - (NSUInteger)depth { return 1; }
 - (NSUInteger)mipmapLevelCount { return 1; }
 - (NSUInteger)sampleCount { return 1; }
@@ -599,6 +644,13 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 - (void)setLabel:(NSString *)l {}
 @end
 
+@interface SweetMTLSampler : NSObject
+@property (nonatomic) uint32_t nearest;
+@end
+@implementation SweetMTLSampler
+- (void)setLabel:(NSString *)l {}
+@end
+
 @interface SweetMTLCommandBuffer : NSObject
 @property (nonatomic, strong) NSMutableArray *passes;
 @property (nonatomic) NSUInteger status;
@@ -615,6 +667,8 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 @implementation SweetMTLRenderEncoder {
 @public
 	uint64_t _buf[31];
+	__unsafe_unretained SweetMTLTexture *_tex[8];
+	__unsafe_unretained SweetMTLSampler *_smp[8];
 	sm_drawrec _draws[32];
 	uint32_t _ndraw;
 }
@@ -634,6 +688,14 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	SweetMTLBuffer *b = [[SweetMTLBuffer alloc] initWithLength:len bytes:p];
 	if (b) { [_keep addObject:b]; if (i < 31) _buf[i] = [b gpuAddress]; }
 }
+- (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i
+{
+	if (i < 8) { _tex[i] = t; if (t) [_keep addObject:t]; }
+}
+- (void)setFragmentSamplerState:(id)smp atIndex:(NSUInteger)i
+{
+	if (i < 8) { _smp[i] = smp; if (smp) [_keep addObject:smp]; }
+}
 - (void)setFragmentBuffer:(id)buf offset:(NSUInteger)off atIndex:(NSUInteger)i { [self setVertexBuffer:buf offset:off atIndex:i]; }
 - (void)setFragmentBytes:(const void *)p length:(NSUInteger)len atIndex:(NSUInteger)i { [self setVertexBytes:p length:len atIndex:i]; }
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
@@ -648,6 +710,15 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	if (_pipeline) {
 		for (int k = 0; k < 16; k++) { r->attr[k].fmt = _pipeline->_attr[k].fmt; r->attr[k].off = _pipeline->_attr[k].off; r->attr[k].bidx = _pipeline->_attr[k].bidx; }
 		memcpy(r->stride, _pipeline->_stride, sizeof r->stride);
+	}
+	for (uint32_t k = 0; k < 8; k++) {
+		SweetMTLTexture *t = _tex[k];
+		if (t) {
+			r->tex[k].va = t.bo->gpu; r->tex[k].w = (uint32_t)t.width; r->tex[k].h = (uint32_t)t.height;
+			r->tex[k].stride = (uint32_t)t.bytesPerRow; r->tex[k].fmt = [t maliFormat];
+			r->ntex = k + 1;
+		}
+		if (_smp[k]) { r->smp[k].nearest = _smp[k].nearest; r->nsmp = k + 1; }
 	}
 	_ndraw++;
 }
@@ -794,6 +865,12 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	slog("SweetMTL: pipeline vs=%s(%s) fs=%s(%s)", ps.vsName.UTF8String ?: "-", ps.vs ? "ok" : "missing",
 	    ps.fsName.UTF8String ?: "-", ps.fs ? "ok" : "fallback");
 	return ps;
+}
+- (id)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d
+{
+	SweetMTLSampler *smp = [SweetMTLSampler new];
+	smp.nearest = d.minFilter == MTLSamplerMinMagFilterNearest;
+	return smp;
 }
 - (id)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)o { return [[SweetMTLBuffer alloc] initWithLength:len bytes:NULL]; }
 - (id)newBufferWithBytes:(const void *)p length:(NSUInteger)len options:(MTLResourceOptions)o { return [[SweetMTLBuffer alloc] initWithLength:len bytes:p]; }
