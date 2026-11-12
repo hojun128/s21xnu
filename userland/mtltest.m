@@ -113,8 +113,6 @@ int main(int argc, char **argv)
 		@try { d = MTLCreateSystemDefaultDevice(); } @catch (NSException *e) { ulog("mtltest: exception %s", [[e description] UTF8String]); }
 		ulog("mtltest: MTLCreateSystemDefaultDevice -> %p %s", d, d ? object_getClassName(d) : "nil");
 		if (d) ulog("mtltest: name=%s", [[d name] UTF8String]);
-		NSArray *all = MTLCopyAllDevices();
-		ulog("mtltest: MTLCopyAllDevices count=%lu", (unsigned long)all.count);
 		if (d) {
 			id q = [d newCommandQueue];
 			ulog("mtltest: newCommandQueue -> %p", q);

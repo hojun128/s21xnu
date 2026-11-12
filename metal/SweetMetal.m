@@ -36,60 +36,67 @@ static void slog(const char *fmt, ...)
 }
 
 /*
- * Metal requires the plugin class to be a subclass of _MTLDevice (private). It is created at
- * load time with the runtime API so the bundle links without private headers.
- * Everything Metal asks that is not implemented here is logged and answered with 0/nil.
+ * Metal (getMetalPluginClassForService) takes the class with -[NSBundle classNamed:], which only
+ * returns classes compiled into this bundle, and requires it to be a subclass of the private
+ * _MTLDevice. So _MTLDevice is declared here and its class symbols are resolved at load time
+ * (-Wl,-U in the build). Everything not implemented is logged and answered with 0/nil.
  */
-static NSString *sm_name(id self, SEL _cmd) { return @"Sweet Mali-G78 MP14"; }
-static uint64_t sm_regid(id self, SEL _cmd) { return 0x53574545; }
-static BOOL sm_no(id self, SEL _cmd) { return NO; }
-static BOOL sm_yes(id self, SEL _cmd) { return YES; }
-static uint32_t sm_port(id self, SEL _cmd) { return 0; }
+@interface _MTLDevice : NSObject
+@end
 
-static id sm_init(id self, SEL _cmd, uint32_t port)
+@interface SweetMTLDevice : _MTLDevice
+@end
+
+@implementation SweetMTLDevice {
+	uint32_t _smPort;
+}
+
++ (void)load
+{
+	slog("SweetMTL: +load in %s, super=%s", getprogname() ? getprogname() : "?", class_getName(class_getSuperclass(self)));
+}
+
+- (instancetype)initWithAcceleratorPort:(uint32_t)port
 {
 	const char *pn = getprogname();
 	slog("SweetMTL: initWithAcceleratorPort:%u in %s", port, pn ? pn : "?");
 	if (pn == NULL || strcmp(pn, "malitest") != 0) {
 		return nil;
 	}
+	self = [super init];
+	slog("SweetMTL: super init -> %p", self);
+	if (self) _smPort = port;
 	return self;
 }
-static id sm_init2(id self, SEL _cmd, uint32_t port, id o) { return sm_init(self, _cmd, port); }
-static id sm_init3(id self, SEL _cmd, uint32_t port, BOOL b) { return sm_init(self, _cmd, port); }
 
-static NSMethodSignature *sm_sig(id self, SEL _cmd, SEL sel)
+- (instancetype)initWithAcceleratorPort:(uint32_t)port options:(id)options
 {
-	struct objc_super sup = { self, class_getSuperclass(object_getClass(self)) };
-	NSMethodSignature *m = ((NSMethodSignature *(*)(struct objc_super *, SEL, SEL))objc_msgSendSuper)(&sup, _cmd, sel);
-	slog("SweetMTL: asked -%s (sig %s)", sel_getName(sel), m ? "yes" : "no");
+	return [self initWithAcceleratorPort:port];
+}
+
+- (instancetype)initWithAcceleratorPort:(uint32_t)port simultaneousInstances:(BOOL)simul
+{
+	return [self initWithAcceleratorPort:port];
+}
+
+- (NSString *)name { return @"Sweet Mali-G78 MP14"; }
+- (uint64_t)registryID { return 0x53574545; }
+- (BOOL)isLowPower { return NO; }
+- (BOOL)isHeadless { return NO; }
+- (BOOL)isRemovable { return NO; }
+- (uint32_t)acceleratorPort { return _smPort; }
+
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
+{
+	NSMethodSignature *m = [super methodSignatureForSelector:sel];
 	return m ? m : [NSMethodSignature signatureWithObjCTypes:"@@:@@@@"];
 }
-static void sm_fwd(id self, SEL _cmd, NSInvocation *inv)
+
+- (void)forwardInvocation:(NSInvocation *)inv
 {
 	slog("SweetMTL: unimplemented -%s", sel_getName(inv.selector));
 	void *z = NULL;
 	[inv setReturnValue:&z];
 }
 
-__attribute__((constructor)) static void sm_register(void)
-{
-	Class base = NSClassFromString(@"_MTLDevice");
-	slog("SweetMTL: bundle loaded, _MTLDevice=%p in %s", base, getprogname() ? getprogname() : "?");
-	if (!base) return;
-	Class c = objc_allocateClassPair(base, "SweetMTLDevice", 0);
-	if (!c) { slog("SweetMTL: allocateClassPair failed"); return; }
-	class_addMethod(c, @selector(initWithAcceleratorPort:), (IMP)sm_init, "@@:I");
-	class_addMethod(c, @selector(initWithAcceleratorPort:options:), (IMP)sm_init2, "@@:I@");
-	class_addMethod(c, @selector(initWithAcceleratorPort:simultaneousInstances:), (IMP)sm_init3, "@@:IB");
-	class_addMethod(c, @selector(name), (IMP)sm_name, "@@:");
-	class_addMethod(c, @selector(registryID), (IMP)sm_regid, "Q@:");
-	class_addMethod(c, @selector(isLowPower), (IMP)sm_no, "B@:");
-	class_addMethod(c, @selector(isHeadless), (IMP)sm_no, "B@:");
-	class_addMethod(c, @selector(isRemovable), (IMP)sm_no, "B@:");
-	class_addMethod(c, @selector(acceleratorPort), (IMP)sm_port, "I@:");
-	class_addMethod(c, @selector(methodSignatureForSelector:), (IMP)sm_sig, "@@::");
-	class_addMethod(c, @selector(forwardInvocation:), (IMP)sm_fwd, "v@:@");
-	objc_registerClassPair(c);
-	slog("SweetMTL: registered class SweetMTLDevice (super _MTLDevice) = %p", c);
-}
+@end
