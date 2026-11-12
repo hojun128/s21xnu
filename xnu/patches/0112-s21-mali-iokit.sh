@@ -34,6 +34,8 @@ cat > iokit/Kernel/arm/SweetMali.cpp <<'EOF_SWEET_SRC'
 #include <libkern/c++/OSString.h>
 #include <pexpert/pexpert.h>
 #include <libkern/libkern.h>
+#include <kern/thread_call.h>
+#include <kern/clock.h>
 
 extern "C" {
 void sweet_mali_boot(void);
@@ -60,6 +62,7 @@ enum {
 	kSMDestroyBO = 4,
 	kSMLog = 5,
 	kSMMapFB = 6,
+	kSMRebootRecovery = 7,
 };
 
 static IOLock *sm_lock;                 /* serializes all hardware / context calls */
@@ -87,6 +90,39 @@ sm_flush_md(IOMemoryDescriptor *md, uint32_t pages)
 		}
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/*
+ * Reboot into the recovery (TWRP) the way the SM-G991N kernel does (sec_reboot.ko + exynos-reboot.ko):
+ * PMU_ALIVE 0x15860000: magic-inform 0x808 byte2 = 0x4e (normal reboot), panic-inform 0x80c =
+ * 0x12345604 (reset reason "recovery"), reboot-cmd 0x810 = 0xff, then SWRESET 0x3c00 = 2.
+ * Lets a test run end itself in the recovery without anyone holding keys.
+ */
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
+static void
+sm_reboot_recovery(const char *why)
+{
+	char line[96];
+	snprintf(line, sizeof(line), "reboot to recovery (%s)", why);
+	sweet_mali_log_str(line);
+	IOSleep(400);
+	volatile uint32_t *r = (volatile uint32_t *)ml_io_map(0x15860000U, 0x4000);
+	r[0x808 / 4] = (r[0x808 / 4] & ~0x00FF0000U) | 0x004E0000U;
+	r[0x80c / 4] = 0x12345604U;
+	r[0x810 / 4] = 0xFFU;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	r[0x3c00 / 4] = 0x2U;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (;;) {
+		IOSleep(1000);
+	}
+}
+
+static void
+sm_autorec_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	sm_reboot_recovery("sweetautorec timer");
 }
 
 /* ---------------------------------------------------------------- service */
@@ -191,6 +227,19 @@ SweetMali::start(IOService *provider)
 	sweet_mali_service_selftest();
 	IOLockUnlock(sm_lock);
 	registerService();
+	{
+		/* boot-arg sweetautorec=<seconds>: unconditional reboot into the recovery after that long */
+		uint32_t secs = 0;
+		if (PE_parse_boot_argn("sweetautorec", &secs, sizeof(secs)) && secs != 0) {
+			thread_call_t tc = thread_call_allocate(sm_autorec_fire, NULL);
+			uint64_t deadline = 0;
+			clock_interval_to_deadline(secs, NSEC_PER_SEC, &deadline);
+			if (tc != NULL) {
+				thread_call_enter_delayed(tc, deadline);
+				sm_log("service: sweetautorec armed %llu s", secs, 0, 0);
+			}
+		}
+	}
 	{
 		int metal = 0;
 		if (PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal)) && metal != 0) {
@@ -474,6 +523,11 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		args->scalarOutputCount = 4;
 		ret = kIOReturnSuccess;
 		break;
+	}
+	case kSMRebootRecovery: {
+		IOLockUnlock(sm_lock);
+		sm_reboot_recovery("user client");
+		return kIOReturnSuccess;
 	}
 	case kSMLog: {
 		char buf[160];

@@ -4,6 +4,8 @@
 #import <objc/runtime.h>
 #include <mach/mach.h>
 #include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <mach/thread_act.h>
@@ -67,13 +69,41 @@ static void *watchdog(void *arg)
 	return NULL;
 }
 static void onsig(int sg) { char b[40]; snprintf(b, sizeof b, "mtltest: CRASH signal %d", sg); if (gc) IOConnectCallMethod(gc, 5, NULL, 0, b, strlen(b), NULL, NULL, NULL, NULL); _exit(1); }
-int main(void)
+extern char **environ;
+static void open_gc(void)
 {
+	io_service_t s = 0;
+	for (int i = 0; i < 30 && !s; i++) { s = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("SweetMali")); if (!s) sleep(2); }
+	if (s) IOServiceOpen(s, mach_task_self(), 0, &gc);
+}
+/* Guardian: runs the real test as a child, reports how it ended, then sends the phone to the recovery. */
+static int guardian(char *self)
+{
+	open_gc();
+	char *av[] = { self, "child", NULL };
+	pid_t pid = 0;
+	int rc = posix_spawn(&pid, self, NULL, NULL, av, environ);
+	ulog("guardian: spawn rc=%d pid=%d", rc, pid);
+	int st = 0, done = 0;
+	for (int t = 0; rc == 0 && t < 45; t++) {
+		if (waitpid(pid, &st, WNOHANG) == pid) { done = 1; break; }
+		sleep(1);
+	}
+	if (done) ulog("guardian: child ended raw=%x exited=%d code=%d signaled=%d sig=%d", st, WIFEXITED(st), WEXITSTATUS(st), WIFSIGNALED(st), WTERMSIG(st));
+	else ulog("guardian: child still running after 45s");
+	sleep(2);
+	if (gc) IOConnectCallMethod(gc, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
+	for (;;) pause();
+	return 0;
+}
+
+int main(int argc, char **argv)
+{
+	if (argc < 2) return guardian(argv[0]);
 	signal(SIGSEGV, onsig); signal(SIGBUS, onsig); signal(SIGABRT, onsig); signal(SIGILL, onsig); signal(SIGTRAP, onsig);
 	@autoreleasepool {
-		io_service_t s = 0;
-		for (int i = 0; i < 30 && !s; i++) { s = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("SweetMali")); if (!s) sleep(2); }
-		if (s) IOServiceOpen(s, mach_task_self(), 0, &gc);
+		open_gc();
+		io_service_t s = gc;
 		io_service_t acc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOAcceleratorES"));
 		ulog("mtltest: SweetMali=%u IOAcceleratorES=%u", s, acc);
 		g_main_thr = mach_thread_self();
