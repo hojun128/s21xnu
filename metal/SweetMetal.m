@@ -313,8 +313,8 @@ typedef struct {
 	char name[64];
 	uint32_t stage, size; uint64_t preload;
 	uint32_t push_words, work_regs, sec_off, flags; uint64_t sec_preload;
-	uint32_t nvar, rsv;
-	const uint8_t *bin;
+	uint32_t nvar, cdata_size;
+	const uint8_t *bin, *cdata;
 } sm_shader;
 static sm_shader *sm_pack; static uint32_t sm_pack_n;
 
@@ -334,6 +334,7 @@ static void sm_pack_load(void)
 		sm_shader *e = &sm_pack[i];
 		memcpy(e, d + o, 112); o += 112;
 		e->bin = d + o; o += (e->size + 15) & ~15u;
+		e->cdata = d + o; o += (e->cdata_size + 15) & ~15u;
 	}
 	sm_pack_n = cnt;
 	slog("SweetMTL: shader pack: %u shaders", cnt);
@@ -358,12 +359,20 @@ typedef struct {
 	struct { uint64_t va; uint32_t w, h, stride, fmt; } tex[8];
 	struct { uint32_t nearest, wrap; } smp[8];
 	uint32_t ntex, nsmp;
+	uint32_t fc[64]; uint64_t fc_defined;
 } sm_drawrec;
 
 #define SMP_BUF 0
 #define SMP_ATTR 64
 #define SMP_VP 192
-#define SMP_BYTES 256
+#define SMP_FCDEF 216
+#define SMP_CDATA_VS 224
+#define SMP_CDATA_FS 232
+#define SMP_DUMMY 240
+#define SMP_FC 256
+#define SMP_BYTES 512
+#define SM_DRAW_STRIDE 0x10000      /* per draw: job 0, descs 0x200, resources 0x280, push 0x400, cdata 0x600/0x800,
+                                       samplers 0xA00, textures 0xC00, planes 0xD00, VS bin 0x1000, FS bin 0x6000 */
 
 static void sm_shader_desc(void *dst, const sm_shader *s, uint32_t stage, uint64_t bin_va, uint64_t preload, uint32_t wr)
 {
@@ -428,26 +437,39 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		b.internal.fixed_function.num_comps = 4; b.internal.fixed_function.rt = 0;
 		b.internal.fixed_function.conversion.memory_format = (MALI_RGBA8_TB << 12) | MALI_RGB_COMPONENT_ORDER_RGBA;
 	}
-	/* per draw: 0x2000 bytes at 0x1000 + i*0x2000: job 0x000, shader descs 0x200, push 0x300, VS bin 0x400, FS bin 0x1000 */
+	static sm_bo dummy; static bool havedummy;
+	if (!havedummy) havedummy = sm_bo_alloc(&dummy, 0x10000);
 	uint32_t vs_all = 0;
 	for (uint32_t i = 0; i < ndraw; i++) {
 		const sm_drawrec *r = &dr[i];
-		uint32_t base = 0x1000 + i * 0x2000;
+		uint32_t base = 0x10000 + i * SM_DRAW_STRIDE;
 		uint8_t *P = cpu + base; uint64_t PV = D + base;
-		memset(P, 0, 0x2000);
+		memset(P, 0, 0x1000);
 		const sm_shader *vs = r->vs, *fs = r->fs;
-		uint64_t vs_bin = PV + 0x400, fs_bin = PV + 0x1000;
-		memcpy(P + 0x400, vs->bin, vs->size);
+		if (vs->size > 0x5000 || (fs && fs->size > 0xA000) || vs->cdata_size > 0x200 || (fs && fs->cdata_size > 0x200)) {
+			slog("SweetMTL: shader too large for the draw slot (vs %u fs %u)", vs->size, fs ? fs->size : 0);
+			continue;
+		}
+		uint64_t vs_bin = PV + 0x1000, fs_bin = PV + 0x6000;
+		memcpy(P + 0x1000, vs->bin, vs->size);
+		if (vs->cdata_size) memcpy(P + 0x600, vs->cdata, vs->cdata_size);
+		if (fs && fs->cdata_size) memcpy(P + 0x800, fs->cdata, fs->cdata_size);
 		uint32_t fs_preload_hi, fs_wr, fs_push;
-		if (fs) { memcpy(P + 0x1000, fs->bin, fs->size); fs_preload_hi = 0; fs_wr = fs->work_regs; fs_push = fs->push_words; }
-		else { memcpy(P + 0x1000, FS_GREEN, sizeof FS_GREEN); fs_wr = 32; fs_push = 0; }
+		if (fs) { memcpy(P + 0x6000, fs->bin, fs->size); fs_preload_hi = 0; fs_wr = fs->work_regs; fs_push = fs->push_words; }
+		else { memcpy(P + 0x6000, FS_GREEN, sizeof FS_GREEN); fs_wr = 32; fs_push = 0; }
 		sm_shader_desc(P + 0x200, vs, MALI_SHADER_STAGE_VERTEX, vs_bin, vs->preload, vs->work_regs);
 		bool sec = (vs->flags & 1) != 0;
 		if (sec) sm_shader_desc(P + 0x220, vs, MALI_SHADER_STAGE_VERTEX, vs_bin + vs->sec_off, vs->sec_preload, vs->work_regs);
 		sm_shader_desc(P + 0x240, fs, MALI_SHADER_STAGE_FRAGMENT, fs_bin, fs ? fs->preload : FS_GREEN_PRELOAD, fs_wr);
 		(void)fs_preload_hi;
 		/* push constants (see air2nir.py ABI) */
-		uint8_t *push = P + 0x300;
+		uint8_t *push = P + 0x400;
+		{
+			uint64_t cv = PV + 0x600, cf = PV + 0x800, dv = havedummy ? dummy.gpu : 0;
+			memcpy(push + SMP_FCDEF, &r->fc_defined, 8);
+			memcpy(push + SMP_CDATA_VS, &cv, 8); memcpy(push + SMP_CDATA_FS, &cf, 8); memcpy(push + SMP_DUMMY, &dv, 8);
+			memcpy(push + SMP_FC, r->fc, sizeof r->fc);
+		}
 		for (int k = 0; k < 8; k++) memcpy(push + SMP_BUF + 8 * k, &r->buf[k], 8);
 		for (int L = 0; L < 8; L++) {
 			uint32_t bi = r->attr[L].bidx;
@@ -457,43 +479,47 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		}
 		float vp[6] = { w * 0.5f, -(float)h * 0.5f, 1.0f, w * 0.5f, h * 0.5f, 0.0f };
 		memcpy(push + SMP_VP, vp, sizeof vp);
-		/* fragment resources: SAMPLER table (3) and TEXTURE table (4), descriptors at 0x1C00.. */
+		/* fragment resources: SAMPLER table (3) x16 at 0xA00 (slot 15 = constexpr sampler), TEXTURE table (4) x8 at 0xC00
+		 * (slot 7 = 1x1 null 2D, slot 6 = 1x1x1 null 3D, both pointing at the zeroed dummy page) */
 		uint64_t res_va = 0;
-		if (r->ntex || r->nsmp) {
-			uint32_t ns = r->nsmp ? r->nsmp : 1;
-			for (uint32_t k = 0; k < ns; k++) {
-				pan_pack(P + 0x1C00 + 32 * k, SAMPLER, sc) {
-					sc.minify_nearest = r->smp[k].nearest; sc.magnify_nearest = r->smp[k].nearest;
+		{
+			for (uint32_t k = 0; k < 16; k++) {
+				bool nearest = k < r->nsmp ? r->smp[k].nearest : false;
+				pan_pack(P + 0xA00 + 32 * k, SAMPLER, sc) {
+					sc.minify_nearest = nearest; sc.magnify_nearest = nearest;
 					sc.normalized_coordinates = true;
 					sc.wrap_mode_s = sc.wrap_mode_t = sc.wrap_mode_r = MALI_WRAP_MODE_CLAMP_TO_EDGE;
 				}
 			}
-			for (uint32_t k = 0; k < r->ntex; k++) {
-				pan_pack(P + 0x1E00 + 32 * k, PLANE, pl) {
+			for (uint32_t k = 0; k < 8; k++) {
+				bool real = k < r->ntex && r->tex[k].va;
+				bool is3d = !real && k == 6;
+				uint64_t va = real ? r->tex[k].va : (havedummy ? dummy.gpu : 0);
+				uint32_t tw = real ? r->tex[k].w : 1, th = real ? r->tex[k].h : 1, ts = real ? r->tex[k].stride : 4;
+				uint32_t fmt = real ? r->tex[k].fmt : ((MALI_RGBA8_UNORM << 12) | MALI_RGB_COMPONENT_ORDER_RGBA);
+				pan_pack(P + 0xD00 + 32 * k, PLANE, pl) {
 					pl.plane_type = MALI_PLANE_TYPE_GENERIC;
 					pl.clump_format = MALI_CLUMP_FORMAT_RAW32;
 					pl.clump_ordering = MALI_CLUMP_ORDERING_LINEAR;
-					pl.pointer = r->tex[k].va;
-					pl.row_stride = r->tex[k].stride;
-					pl.size = r->tex[k].stride * r->tex[k].h;
-					pl.slice_stride = r->tex[k].stride * r->tex[k].h;
+					pl.pointer = va; pl.row_stride = ts; pl.size = ts * th; pl.slice_stride = ts * th;
 				}
-				pan_pack(P + 0x1D00 + 32 * k, TEXTURE, tx) {
-					tx.dimension = MALI_TEXTURE_DIMENSION_2D;
-					tx.format = r->tex[k].fmt;
-					tx.width = r->tex[k].w; tx.height = r->tex[k].h;
+				pan_pack(P + 0xC00 + 32 * k, TEXTURE, tx) {
+					tx.dimension = is3d ? MALI_TEXTURE_DIMENSION_3D : MALI_TEXTURE_DIMENSION_2D;
+					tx.format = fmt; tx.width = tw; tx.height = th;
+					if (is3d) tx.depth = 1; else tx.sample_count = 1;
 					tx.swizzle = 0 | (1 << 3) | (2 << 6) | (3 << 9);
-					tx.levels = 1; tx.array_size = 1; tx.sample_count = 1;
-					tx.surfaces = PV + 0x1E00 + 32 * k;
+					tx.levels = 1; tx.array_size = 1;
+					tx.surfaces = PV + 0xD00 + 32 * k;
 					tx.minimum_lod = 0; tx.maximum_lod = 0;
 				}
 			}
 			memset(P + 0x280, 0, 6 * 16);
-			pan_pack(P + 0x280 + 3 * 16, RESOURCE, rc) { rc.address = PV + 0x1C00; rc.size = ns * 32; }
-			if (r->ntex) pan_pack(P + 0x280 + 4 * 16, RESOURCE, rc) { rc.address = PV + 0x1D00; rc.size = r->ntex * 32; }
+			pan_pack(P + 0x280 + 3 * 16, RESOURCE, rc) { rc.address = PV + 0xA00; rc.size = 16 * 32; }
+			pan_pack(P + 0x280 + 4 * 16, RESOURCE, rc) { rc.address = PV + 0xC00; rc.size = 8 * 32; }
 			res_va = (PV + 0x280) | 6;
 		}
 		uint32_t vs_fau = (vs->push_words + 1) / 2, fs_fau = (fs_push + 1) / 2;
+		if (fs_fau < 1) fs_fau = 1;
 		if (vs_fau == 0) vs_fau = 1;
 		uint32_t nvar = vs->nvar; if (fs && fs->nvar > nvar) nvar = fs->nvar;
 		void *vj = P;
@@ -520,14 +546,14 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 			cfg.render_target_mask = 1; cfg.blend = D + OFF_BLEND; cfg.blend_count = 1;
 			cfg.overdraw_alpha0 = true; cfg.overdraw_alpha1 = true;
 			cfg.shader.thread_storage = D + OFF_TLS; cfg.shader.shader = PV + 0x240;
-			cfg.shader.fau = PV + 0x300; cfg.shader.fau_count = fs_fau ? fs_fau : 1;
+			cfg.shader.fau = PV + 0x400; cfg.shader.fau_count = fs_fau ? fs_fau : 1;
 			cfg.shader.resources = res_va;
 		}
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, POSITION, cfg) {
-			cfg.thread_storage = D + OFF_TLS; cfg.shader = PV + 0x200; cfg.fau = PV + 0x300; cfg.fau_count = vs_fau;
+			cfg.thread_storage = D + OFF_TLS; cfg.shader = PV + 0x200; cfg.fau = PV + 0x400; cfg.fau_count = vs_fau;
 		}
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, VARYING, cfg) {
-			if (sec) { cfg.thread_storage = D + OFF_TLS; cfg.shader = PV + 0x220; cfg.fau = PV + 0x300; cfg.fau_count = vs_fau; }
+			if (sec) { cfg.thread_storage = D + OFF_TLS; cfg.shader = PV + 0x220; cfg.fau = PV + 0x400; cfg.fau_count = vs_fau; }
 		}
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, HEADER, header) { header.type = MALI_JOB_TYPE_MALLOC_VERTEX; header.index = 1; }
 		uint32_t vst = sm_submit(1, PV);
@@ -566,6 +592,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 
 @interface SweetMTLFunction : NSObject
 @property (nonatomic, copy) NSString *name;
+@property (nonatomic, strong) NSDictionary *constants;      /* index -> uint32 */
 @end
 @implementation SweetMTLFunction
 - (MTLFunctionType)functionType
@@ -585,6 +612,14 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	slog("SweetMTL: function %s -> %s", name.UTF8String, sm_find(name) ? "translated" : "NOT in pack");
 	return f;
 }
+- (id)newFunctionWithName:(NSString *)name constantValues:(id)cv error:(NSError **)err
+{
+	if (err) *err = nil;
+	SweetMTLFunction *f = [self newFunctionWithName:name];
+	f.constants = cv ? [sm_fc_dict(cv) copy] : @{};
+	slog("SweetMTL: function %s with %lu constants", name.UTF8String, (unsigned long)f.constants.count);
+	return f;
+}
 - (NSArray *)functionNames
 {
 	sm_pack_load();
@@ -595,6 +630,52 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 - (void)setLabel:(NSString *)l {}
 @end
 
+
+/* ------------------------------------------------------------------ function constants
+ * MTLFunctionConstantValues is opaque; record what the app sets by intercepting the internal setters. */
+static char sm_fc_key;
+static NSMutableDictionary *sm_fc_dict(id obj)
+{
+	NSMutableDictionary *d = objc_getAssociatedObject(obj, &sm_fc_key);
+	if (!d) { d = [NSMutableDictionary dictionary]; objc_setAssociatedObject(obj, &sm_fc_key, d, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+	return d;
+}
+static NSUInteger sm_dt_size(NSUInteger t)
+{
+	switch (t) {
+	case MTLDataTypeBool: case MTLDataTypeChar: case MTLDataTypeUChar: return 1;
+	case MTLDataTypeChar2: case MTLDataTypeUChar2: case MTLDataTypeShort: case MTLDataTypeUShort: case MTLDataTypeHalf: return 2;
+	case MTLDataTypeChar3: case MTLDataTypeUChar3: return 3;
+	case MTLDataTypeChar4: case MTLDataTypeUChar4: return 4;
+	default: return 4;
+	}
+}
+static IMP sm_orig_set1, sm_orig_setN;
+static void sm_set1(id self, SEL _cmd, const void *v, NSUInteger type, NSUInteger idx)
+{
+	NSUInteger n = sm_dt_size(type); uint32_t w = 0; memcpy(&w, v, n > 4 ? 4 : n);
+	sm_fc_dict(self)[@(idx)] = @(w);
+	((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))sm_orig_set1)(self, _cmd, v, type, idx);
+}
+static void sm_setN(id self, SEL _cmd, const void *v, NSUInteger type, NSRange r)
+{
+	NSUInteger n = sm_dt_size(type);
+	for (NSUInteger i = 0; i < r.length; i++) {
+		uint32_t w = 0; memcpy(&w, (const uint8_t *)v + i * n, n > 4 ? 4 : n);
+		sm_fc_dict(self)[@(r.location + i)] = @(w);
+	}
+	((void (*)(id, SEL, const void *, NSUInteger, NSRange))sm_orig_setN)(self, _cmd, v, type, r);
+}
+static void sm_fc_hook(void)
+{
+	static bool done; if (done) return; done = true;
+	Class c = NSClassFromString(@"MTLFunctionConstantValuesInternal");
+	if (!c) { slog("SweetMTL: no MTLFunctionConstantValuesInternal"); return; }
+	Method m1 = class_getInstanceMethod(c, @selector(setConstantValue:type:atIndex:));
+	Method m2 = class_getInstanceMethod(c, @selector(setConstantValues:type:withRange:));
+	if (m1) sm_orig_set1 = method_setImplementation(m1, (IMP)sm_set1);
+	if (m2) sm_orig_setN = method_setImplementation(m2, (IMP)sm_setN);
+}
 /* ------------------------------------------------------------------ Metal objects (phase 2a) */
 @interface SweetMTLTexture : NSObject
 @property (nonatomic, readonly) NSUInteger width, height, pixelFormat, bytesPerRow;
@@ -640,6 +721,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 @public
 	struct { uint32_t fmt, off, bidx; } _attr[16];
 	uint32_t _stride[31];
+	uint32_t _fc[64]; uint64_t _fcdef;
 }
 - (void)setLabel:(NSString *)l {}
 @end
@@ -710,6 +792,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	if (_pipeline) {
 		for (int k = 0; k < 16; k++) { r->attr[k].fmt = _pipeline->_attr[k].fmt; r->attr[k].off = _pipeline->_attr[k].off; r->attr[k].bidx = _pipeline->_attr[k].bidx; }
 		memcpy(r->stride, _pipeline->_stride, sizeof r->stride);
+		memcpy(r->fc, _pipeline->_fc, sizeof r->fc); r->fc_defined = _pipeline->_fcdef;
 	}
 	for (uint32_t k = 0; k < 8; k++) {
 		SweetMTLTexture *t = _tex[k];
@@ -751,7 +834,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 - (void)commit
 {
 	static sm_bo desc; static bool have;
-	if (!have) have = sm_bo_alloc(&desc, 0x80000);
+	if (!have) have = sm_bo_alloc(&desc, 0x10000 + 32 * SM_DRAW_STRIDE);
 	_status = 4; /* MTLCommandBufferStatusCompleted */
 	for (SweetMTLRenderEncoder *e in _passes) {
 		if (!have || !e.target) { _status = 5; continue; }
@@ -818,6 +901,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 
 + (void)load
 {
+	sm_fc_hook();
 	slog("SweetMTL: +load in %s, super=%s", getprogname() ? getprogname() : "?", class_getName(class_getSuperclass(self)));
 }
 
@@ -855,6 +939,13 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	SweetMTLRenderPipelineState *ps = [SweetMTLRenderPipelineState new];
 	ps.vsName = d.vertexFunction.name; ps.fsName = d.fragmentFunction.name;
 	ps.vs = sm_find(ps.vsName); ps.fs = sm_find(ps.fsName);
+	for (id fobj in @[ d.vertexFunction ?: (id)[NSNull null], d.fragmentFunction ?: (id)[NSNull null] ]) {
+		if (![fobj isKindOfClass:[SweetMTLFunction class]]) continue;
+		[((SweetMTLFunction *)fobj).constants enumerateKeysAndObjectsUsingBlock:^(NSNumber *k, NSNumber *v, BOOL *stop) {
+			NSUInteger i = k.unsignedIntegerValue;
+			if (i < 64) { ps->_fc[i] = v.unsignedIntValue; ps->_fcdef |= 1ull << i; }
+		}];
+	}
 	MTLVertexDescriptor *vd = d.vertexDescriptor;
 	for (int i = 0; i < 16 && vd; i++) {
 		ps->_attr[i].fmt = (uint32_t)vd.attributes[i].format;
