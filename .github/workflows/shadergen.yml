@@ -52,6 +52,21 @@ jobs:
         run: |
           ./b/shadergen > shaders_gen.h 2> shadergen.log || true
           cat shadergen.log; head -c 1500 shaders_gen.h
+      - name: Package host SDK (libs + generated headers + flags) for local tools
+        run: |
+          echo "$FLAGS_SAVED" > /dev/null
+          python3 - <<'PY'
+          import json
+          for e in json.load(open('b/compile_commands.json')):
+              if e['file'].endswith('panfrost/compiler/bifrost_compile.c'):
+                  open('cc_full.txt','w').write(e['command']); break
+          PY
+          tar czf mesa-host-sdk.tgz cc_full.txt $(find b/src -name '*.a' | grep -v -E 'gallium|drivers/') $(find b/src -name '*.h') $(find b/src -name '*.inc' 2>/dev/null)
+          ls -la mesa-host-sdk.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mesa-host-sdk
+          path: mesa-host-sdk.tgz
       - uses: actions/upload-artifact@v4
         if: always()
         with:
