@@ -243,6 +243,32 @@ int main(int argc, char **argv)
 				for (int i = 0; i < 64 * 64; i++) { if (px[i] == pat[i]) same++; else if (firstbad < 0) firstbad = i; }
 				ulog("mtltest: AIR fs status=%lu same=%d/4096 px0=%08x want=%08x px(33,17)=%08x want=%08x bad@%d %s", (unsigned long)cb.status,
 				    same, px[0], pat[0], px[17 * 64 + 33], pat[17 * 64 + 33], firstbad, same == 4096 ? "APPLE-FS-TEXTURE-OK" : "APPLE-FS-TEXTURE-FAIL");
+				/* debug fragment shaders through the same path */
+				NSArray *dbg = @[ @"dbg_const16", @"dbg_fragxy", @"dbg_txf55", @"dbg_tex", @"read_surf_frag" ];
+				MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+				sd.minFilter = MTLSamplerMinMagFilterNearest; sd.magFilter = MTLSamplerMinMagFilterNearest;
+				id<MTLSamplerState> smp = [d newSamplerStateWithDescriptor:sd];
+				for (NSString *fn in dbg) {
+					MTLRenderPipelineDescriptor *pdx = [MTLRenderPipelineDescriptor new];
+					pdx.vertexFunction = vf; pdx.fragmentFunction = [lib newFunctionWithName:fn]; pdx.vertexDescriptor = vd;
+					pdx.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+					id<MTLRenderPipelineState> psx = [d newRenderPipelineStateWithDescriptor:pdx error:&perr];
+					cb = [q commandBuffer];
+					enc = [cb renderCommandEncoderWithDescriptor:rp];
+					[enc setRenderPipelineState:psx];
+					[enc setVertexBuffer:qb offset:0 atIndex:0];
+					[enc setVertexBytes:mvp length:sizeof mvp atIndex:2];
+					[enc setFragmentTexture:src atIndex:0];
+					[enc setFragmentSamplerState:smp atIndex:0];
+					[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+					[enc endEncoding];
+					[cb commit];
+					[cb waitUntilCompleted];
+					[tex getBytes:px bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+					ulog("mtltest: DBG %s st=%lu p(0,0)=%08x p(5,5)=%08x p(33,17)=%08x p(63,63)=%08x", fn.UTF8String, (unsigned long)cb.status,
+					    px[0], px[5 * 64 + 5], px[17 * 64 + 33], px[63 * 64 + 63]);
+				}
+				ulog("mtltest: DBG src p(5,5)=%08x p(33,17)=%08x", pat[5 * 64 + 5], pat[17 * 64 + 33]);
 			}
 		}
 		for (int n = 0;; n++) {
