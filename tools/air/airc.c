@@ -3,10 +3,12 @@
  * repository because it is derived from Apple's shaders) with Mesa's Valhall compiler and writes
  * a shader pack for SweetMetal.bundle:
  *   "SMSP" u32 count, then per shader: char name[64], u32 stage, u32 size, u64 preload,
- *   u32 push_words, u32 work_regs, u32 secondary_offset, u32 flags, bytes (16-aligned).
+ *   u32 push_words, u32 work_regs, u32 secondary_offset, u32 flags, u64 secondary_preload,
+ *   u32 varying_slots (VAR0..), u32 reserved, bytes (16-aligned).   (112-byte header)
  */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "compiler/nir/nir_builder.h"
 #include "compiler/glsl_types.h"
 #include "panfrost/compiler/bifrost_compile.h"
@@ -38,7 +40,7 @@ static nir_def *sm_txf(nir_builder *b, nir_def *coord, nir_def *lod, unsigned te
 	t->coord_components = 2;
 	t->dest_type = nir_type_float | bits;
 	t->texture_index = pan_res_handle(4, tex);
-	t->sampler_index = 0;
+	t->sampler_index = pan_res_handle(3, 0);   /* Valhall TEX_FETCH still takes a sampler handle */
 	t->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, nir_u2u32(b, coord));
 	t->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_u2u32(b, lod));
 	nir_def_init(&t->instr, &t->def, 4, bits);
@@ -63,42 +65,76 @@ static nir_def *sm_tex(nir_builder *b, nir_def *coord, unsigned tex, unsigned sm
 
 #include "air_gen.inc"
 
+/* debug fragment shaders (not Apple-derived) */
+static void dbg_out(nir_builder *b, nir_def *v)
+{
+	nir_store_output(b, v, nir_imm_int(b, 0), .base = 0, .write_mask = BITFIELD_MASK(v->num_components),
+	    .src_type = nir_type_float | v->bit_size, .io_semantics.location = FRAG_RESULT_DATA0, .io_semantics.num_slots = 1);
+}
+static void dbg_const16(nir_builder *b) { dbg_out(b, nir_f2f16(b, nir_imm_vec4(b, 1.0, 0.0, 0.0, 1.0))); }
+static void dbg_txf55(nir_builder *b) { dbg_out(b, sm_txf(b, nir_imm_ivec2(b, 5, 5), nir_imm_int(b, 0), 0, 32)); }
+static void dbg_fragxy(nir_builder *b)
+{
+	nir_def *fc = nir_load_frag_coord(b);
+	dbg_out(b, nir_vec4(b, nir_fmul_imm(b, nir_channel(b, fc, 0), 1.0 / 64), nir_fmul_imm(b, nir_channel(b, fc, 1), 1.0 / 64),
+	    nir_imm_float(b, 0), nir_imm_float(b, 1)));
+}
+static void dbg_tex(nir_builder *b) { dbg_out(b, sm_tex(b, nir_imm_vec2(b, 0.08, 0.08), 0, 0, 32)); }
+static const struct { const char *name; int stage; void (*build)(nir_builder *); } dbg_shaders[] = {
+	{ "dbg_const16", MESA_SHADER_FRAGMENT, dbg_const16 },
+	{ "dbg_txf55", MESA_SHADER_FRAGMENT, dbg_txf55 },
+	{ "dbg_fragxy", MESA_SHADER_FRAGMENT, dbg_fragxy },
+	{ "dbg_tex", MESA_SHADER_FRAGMENT, dbg_tex },
+};
+
 int main(int argc, char **argv)
 {
 	glsl_type_singleton_init_or_ref();
 	FILE *f = fopen(argc > 1 ? argv[1] : "shaders.smsp", "wb");
-	unsigned n = sizeof(air_shaders) / sizeof(air_shaders[0]), ok = 0;
+	unsigned nair = sizeof(air_shaders) / sizeof(air_shaders[0]), ndbg = sizeof(dbg_shaders) / sizeof(dbg_shaders[0]);
+	unsigned n = nair + ndbg, ok = 0;
+	struct { const char *name; int stage; void (*build)(nir_builder *); } all[256];
+	for (unsigned i = 0; i < nair; i++) { all[i].name = air_shaders[i].name; all[i].stage = air_shaders[i].stage; all[i].build = air_shaders[i].build; }
+	for (unsigned i = 0; i < ndbg; i++) { all[nair + i].name = dbg_shaders[i].name; all[nair + i].stage = dbg_shaders[i].stage; all[nair + i].build = dbg_shaders[i].build; }
 	fwrite("SMSP", 1, 4, f);
 	long count_at = ftell(f);
 	fwrite(&ok, 4, 1, f);
 	for (unsigned i = 0; i < n; i++) {
-		nir_builder b = nir_builder_init_simple_shader(air_shaders[i].stage, &bifrost_nir_options_v9, "%s", air_shaders[i].name);
-		if (air_shaders[i].stage == MESA_SHADER_COMPUTE) {
+		nir_builder b = nir_builder_init_simple_shader(all[i].stage, &bifrost_nir_options_v9, "%s", all[i].name);
+		if (all[i].stage == MESA_SHADER_COMPUTE) {
 			b.shader->info.workgroup_size[0] = 64;
 			b.shader->info.workgroup_size[1] = 1;
 			b.shader->info.workgroup_size[2] = 1;
 		}
-		air_shaders[i].build(&b);
+		all[i].build(&b);
 		nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
 		struct panfrost_compile_inputs in = { .gpu_id = GPU_ID, .no_ubo_to_push = true };
 		struct util_dynarray bin; util_dynarray_init(&bin, NULL);
 		struct pan_shader_info info; memset(&info, 0, sizeof info);
+		if (getenv("AIRC_PRINT")) nir_print_shader(b.shader, stderr);
 		bifrost_preprocess_nir(b.shader, GPU_ID);
+		if (getenv("AIRC_PRINT")) nir_print_shader(b.shader, stderr);
 		bifrost_compile_shader_nir(b.shader, &in, &bin, &info);
 		char name[64] = {0};
-		strncpy(name, air_shaders[i].name, 63);
-		uint32_t stage = air_shaders[i].stage, size = bin.size, pw = info.push.count, wr = info.work_reg_count;
-		uint32_t sec = air_shaders[i].stage == MESA_SHADER_VERTEX ? info.vs.secondary_offset : 0;
-		uint32_t flags = (air_shaders[i].stage == MESA_SHADER_VERTEX && info.vs.secondary_enable) ? 1 : 0;
+		strncpy(name, all[i].name, 63);
+		uint32_t stage = all[i].stage, size = bin.size, pw = info.push.count, wr = info.work_reg_count;
+		uint32_t sec = all[i].stage == MESA_SHADER_VERTEX ? info.vs.secondary_offset : 0;
+		uint32_t flags = (all[i].stage == MESA_SHADER_VERTEX && info.vs.secondary_enable) ? 1 : 0;
 		uint64_t preload = info.preload;
 		fwrite(name, 1, 64, f); fwrite(&stage, 4, 1, f); fwrite(&size, 4, 1, f); fwrite(&preload, 8, 1, f);
 		fwrite(&pw, 4, 1, f); fwrite(&wr, 4, 1, f); fwrite(&sec, 4, 1, f); fwrite(&flags, 4, 1, f);
+		uint64_t spre = all[i].stage == MESA_SHADER_VERTEX ? info.vs.secondary_preload : 0;
+		uint32_t nvar = 0, rsv = 0;
+		uint64_t ow = all[i].stage == MESA_SHADER_VERTEX ? b.shader->info.outputs_written : b.shader->info.inputs_read;
+		for (unsigned k = 0; k < 32; k++)
+			if (ow & BITFIELD64_BIT(VARYING_SLOT_VAR0 + k)) nvar = k + 1;
+		fwrite(&spre, 8, 1, f); fwrite(&nvar, 4, 1, f); fwrite(&rsv, 4, 1, f);
 		fwrite(bin.data, 1, bin.size, f);
 		static const uint8_t z[16];
 		fwrite(z, 1, (16 - (bin.size & 15)) & 15, f);
-		fprintf(stderr, "%-36s %s %5u bytes preload=%llx push=%u sec=%u%s\n", name,
+		fprintf(stderr, "%-36s %s %5u bytes preload=%llx push=%u sec=%u nvar=%u%s\n", name,
 		    stage == MESA_SHADER_VERTEX ? "VS" : stage == MESA_SHADER_FRAGMENT ? "FS" : "CS", size,
-		    (unsigned long long)preload, pw, sec, flags ? " varying-shader" : "");
+		    (unsigned long long)preload, pw, sec, nvar, flags ? " varying-shader" : "");
 		util_dynarray_fini(&bin);
 		ralloc_free(b.shader);
 		ok++;
