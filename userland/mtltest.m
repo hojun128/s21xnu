@@ -158,6 +158,25 @@ int main(int argc, char **argv)
 				for (int i = 0; i < 64 * 64; i++) if (px[i] == 0xFF0080FFu) good++;
 				ulog("mtltest: metal clear status=%lu px0=%08x good=%d/4096 %s", (unsigned long)cb.status, px[0], good,
 				    good == 4096 ? "METAL-CLEAR-ON-MALI-OK" : "METAL-CLEAR-FAIL");
+				/* phase 2b: clear to blue and draw one triangle through the Metal draw API */
+				MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+				pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+				NSError *perr = nil;
+				id<MTLRenderPipelineState> ps = [d newRenderPipelineStateWithDescriptor:pd error:&perr];
+				ulog("mtltest: pipeline -> %p", ps);
+				rp.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 1.0, 1.0);
+				cb = [q commandBuffer];
+				enc = [cb renderCommandEncoderWithDescriptor:rp];
+				[enc setRenderPipelineState:ps];
+				[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+				[enc endEncoding];
+				[cb commit];
+				[cb waitUntilCompleted];
+				[tex getBytes:px bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+				int tri = 0, bg = 0;
+				for (int i = 0; i < 64 * 64; i++) { if (px[i] == 0xFF00FF00u) tri++; else if (px[i] == 0xFFFF0000u) bg++; }
+				ulog("mtltest: metal draw status=%lu tri=%d bg=%d p(10,10)=%08x p(50,50)=%08x %s", (unsigned long)cb.status, tri, bg,
+				    px[10 * 64 + 10], px[50 * 64 + 50], tri > 1000 ? "METAL-TRIANGLE-ON-MALI-OK" : "METAL-TRIANGLE-FAIL");
 			}
 		}
 		for (int n = 0;; n++) {
