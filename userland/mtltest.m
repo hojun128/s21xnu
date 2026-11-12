@@ -7,6 +7,7 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <pthread.h>
 #include <mach/thread_act.h>
 #include <mach/arm/thread_status.h>
@@ -68,7 +69,24 @@ static void *watchdog(void *arg)
 	}
 	return NULL;
 }
-static void onsig(int sg) { char b[40]; snprintf(b, sizeof b, "mtltest: CRASH signal %d", sg); if (gc) IOConnectCallMethod(gc, 5, NULL, 0, b, strlen(b), NULL, NULL, NULL, NULL); _exit(1); }
+static void rawlog(const char *b) { if (gc) IOConnectCallMethod(gc, 5, NULL, 0, b, strlen(b), NULL, NULL, NULL, NULL); }
+static void onsig(int sg)
+{
+	char b[150], t[70];
+	snprintf(b, sizeof b, "mtltest: CRASH signal %d", sg); rawlog(b);
+	void *fr[24]; int n = backtrace(fr, 24);
+	for (int i = 0; i < n; i++) { snprintf(b, sizeof b, "mtltest: bt%d %s", i, symof((uint64_t)fr[i], t, sizeof t)); rawlog(b); }
+	_exit(1);
+}
+static void onexc(NSException *e)
+{
+	char b[150];
+	snprintf(b, sizeof b, "mtltest: EXC %s", [[e name] UTF8String]); rawlog(b);
+	const char *r = [[e reason] UTF8String];
+	for (size_t o = 0; r && o < strlen(r) && o < 420; o += 120) { snprintf(b, sizeof b, "mtltest: EXC: %.120s", r + o); rawlog(b); }
+	NSArray *st = [e callStackSymbols];
+	for (NSUInteger i = 0; i < st.count && i < 14; i++) { snprintf(b, sizeof b, "mtltest: ebt %.130s", [st[i] UTF8String]); rawlog(b); }
+}
 extern char **environ;
 static void open_gc(void)
 {
@@ -100,6 +118,7 @@ static int guardian(char *self)
 int main(int argc, char **argv)
 {
 	if (argc < 2) return guardian(argv[0]);
+	NSSetUncaughtExceptionHandler(onexc);
 	signal(SIGSEGV, onsig); signal(SIGBUS, onsig); signal(SIGABRT, onsig); signal(SIGILL, onsig); signal(SIGTRAP, onsig);
 	@autoreleasepool {
 		open_gc();
