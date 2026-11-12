@@ -133,8 +133,32 @@ int main(int argc, char **argv)
 		ulog("mtltest: MTLCreateSystemDefaultDevice -> %p %s", d, d ? object_getClassName(d) : "nil");
 		if (d) ulog("mtltest: name=%s", [[d name] UTF8String]);
 		if (d) {
-			id q = [d newCommandQueue];
+			id<MTLCommandQueue> q = [d newCommandQueue];
 			ulog("mtltest: newCommandQueue -> %p", q);
+			MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:64 height:64 mipmapped:NO];
+			td.usage = MTLTextureUsageRenderTarget;
+			id<MTLTexture> tex = [d newTextureWithDescriptor:td];
+			ulog("mtltest: newTexture -> %p", tex);
+			if (q && tex) {
+				static uint32_t px[64 * 64];
+				for (int i = 0; i < 64 * 64; i++) px[i] = 0xDEADBEEF;
+				[tex replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 withBytes:px bytesPerRow:256];
+				MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+				rp.colorAttachments[0].texture = tex;
+				rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+				rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+				rp.colorAttachments[0].clearColor = MTLClearColorMake(1.0, 0.5, 0.0, 1.0);
+				id<MTLCommandBuffer> cb = [q commandBuffer];
+				id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+				[enc endEncoding];
+				[cb commit];
+				[cb waitUntilCompleted];
+				[tex getBytes:px bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+				int good = 0;
+				for (int i = 0; i < 64 * 64; i++) if (px[i] == 0xFF0080FFu) good++;
+				ulog("mtltest: metal clear status=%lu px0=%08x good=%d/4096 %s", (unsigned long)cb.status, px[0], good,
+				    good == 4096 ? "METAL-CLEAR-ON-MALI-OK" : "METAL-CLEAR-FAIL");
+			}
 		}
 		for (int n = 0;; n++) {
 			if (gc) { char t[40]; snprintf(t, sizeof t, "== MTLTEST %d ==", n); IOConnectCallMethod(gc, 5, NULL, 0, t, strlen(t), NULL, NULL, NULL, NULL); }
