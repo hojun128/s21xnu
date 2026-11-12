@@ -177,6 +177,42 @@ int main(int argc, char **argv)
 				for (int i = 0; i < 64 * 64; i++) { if (px[i] == 0xFF00FF00u) tri++; else if (px[i] == 0xFFFF0000u) bg++; }
 				ulog("mtltest: metal draw status=%lu tri=%d bg=%d p(10,10)=%08x p(50,50)=%08x %s", (unsigned long)cb.status, tri, bg,
 				    px[10 * 64 + 10], px[50 * 64 + 50], tri > 1000 ? "METAL-TRIANGLE-ON-MALI-OK" : "METAL-TRIANGLE-FAIL");
+
+				/* phase 2c: CoreAnimation's own vertex shader (std_vert0_lpf), translated AIR -> NIR -> Valhall */
+				NSError *lerr = nil;
+				id<MTLLibrary> lib = [d newLibraryWithURL:[NSURL fileURLWithPath:@"/System/Library/Frameworks/QuartzCore.framework/default.metallib"] error:&lerr];
+				id<MTLFunction> vf = [lib newFunctionWithName:@"std_vert0_lpf"];
+				id<MTLFunction> ff = [lib newFunctionWithName:@"no_fragment_yet"];
+				MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+				vd.attributes[0].format = MTLVertexFormatFloat4; vd.attributes[0].offset = 0; vd.attributes[0].bufferIndex = 0;
+				vd.attributes[3].format = MTLVertexFormatFloat4; vd.attributes[3].offset = 16; vd.attributes[3].bufferIndex = 0;
+				vd.layouts[0].stride = 32;
+				MTLRenderPipelineDescriptor *pd2 = [MTLRenderPipelineDescriptor new];
+				pd2.vertexFunction = vf; pd2.fragmentFunction = ff; pd2.vertexDescriptor = vd;
+				pd2.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+				id<MTLRenderPipelineState> ps2 = [d newRenderPipelineStateWithDescriptor:pd2 error:&perr];
+				/* clip-space triangle that maps to window (4,4) (60,4) (4,60) on 64x64; w = 2 to exercise the divide */
+				static const float vtx[3 * 8] = {
+					-1.75f,  1.75f, 1.0f, 2.0f,   1, 0, 0, 1,
+					 1.75f,  1.75f, 1.0f, 2.0f,   0, 1, 0, 1,
+					-1.75f, -1.75f, 1.0f, 2.0f,   0, 0, 1, 1 };
+				static const float mvp[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+				id<MTLBuffer> vb = [d newBufferWithBytes:vtx length:sizeof vtx options:0];
+				rp.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 1.0, 1.0);
+				cb = [q commandBuffer];
+				enc = [cb renderCommandEncoderWithDescriptor:rp];
+				[enc setRenderPipelineState:ps2];
+				[enc setVertexBuffer:vb offset:0 atIndex:0];
+				[enc setVertexBytes:mvp length:sizeof mvp atIndex:2];
+				[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+				[enc endEncoding];
+				[cb commit];
+				[cb waitUntilCompleted];
+				[tex getBytes:px bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+				tri = 0; bg = 0;
+				for (int i = 0; i < 64 * 64; i++) { if (px[i] == 0xFF00FF00u) tri++; else if (px[i] == 0xFFFF0000u) bg++; }
+				ulog("mtltest: AIR vs status=%lu tri=%d bg=%d p(10,10)=%08x p(50,50)=%08x %s", (unsigned long)cb.status, tri, bg,
+				    px[10 * 64 + 10], px[50 * 64 + 50], tri > 1000 ? "APPLE-VS-ON-MALI-OK" : "APPLE-VS-FAIL");
 			}
 		}
 		for (int n = 0;; n++) {

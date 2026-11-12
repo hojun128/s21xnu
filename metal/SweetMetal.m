@@ -307,6 +307,254 @@ static uint32_t sm_draw(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	return sm_submit(0, D + OFF_FJOB);
 }
 
+
+/* ------------------------------------------------------------------ shader pack (tools/air: air2nir.py + airc) */
+typedef struct {
+	char name[64];
+	uint32_t stage, size; uint64_t preload;
+	uint32_t push_words, work_regs, sec_off, flags; uint64_t sec_preload;
+	uint32_t nvar, rsv;
+	const uint8_t *bin;
+} sm_shader;
+static sm_shader *sm_pack; static uint32_t sm_pack_n;
+
+static void sm_pack_load(void)
+{
+	static bool tried; if (tried) return; tried = true;
+	const char *path = "/System/Library/Extensions/SweetMetal.bundle/shaders.smsp";
+	FILE *f = fopen(path, "rb");
+	if (!f) { slog("SweetMTL: no shader pack at %s", path); return; }
+	fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+	uint8_t *d = malloc(n); fread(d, 1, n, f); fclose(f);
+	if (n < 8 || memcmp(d, "SMSP", 4)) { slog("SweetMTL: bad shader pack"); return; }
+	uint32_t cnt; memcpy(&cnt, d + 4, 4);
+	sm_pack = calloc(cnt, sizeof(sm_shader));
+	long o = 8;
+	for (uint32_t i = 0; i < cnt && o + 112 <= n; i++) {
+		sm_shader *e = &sm_pack[i];
+		memcpy(e, d + o, 112); o += 112;
+		e->bin = d + o; o += (e->size + 15) & ~15u;
+	}
+	sm_pack_n = cnt;
+	slog("SweetMTL: shader pack: %u shaders", cnt);
+}
+
+static const sm_shader *sm_find(NSString *name)
+{
+	sm_pack_load();
+	if (!name) return NULL;
+	const char *c = name.UTF8String;
+	for (uint32_t i = 0; i < sm_pack_n; i++) if (!strcmp(sm_pack[i].name, c)) return &sm_pack[i];
+	return NULL;
+}
+
+/* One draw as recorded by the encoder */
+typedef struct {
+	const sm_shader *vs, *fs;
+	uint32_t vcount, vstart;
+	uint64_t buf[31];                /* GPU VA bound at each Metal buffer index */
+	struct { uint32_t fmt, off, bidx; } attr[16];
+	uint32_t stride[31];
+} sm_drawrec;
+
+#define SMP_BUF 0
+#define SMP_ATTR 64
+#define SMP_VP 192
+#define SMP_BYTES 256
+
+static void sm_shader_desc(void *dst, const sm_shader *s, uint32_t stage, uint64_t bin_va, uint64_t preload, uint32_t wr)
+{
+	pan_pack(dst, SHADER_PROGRAM, sp) {
+		sp.stage = stage;
+		sp.register_allocation = wr > 32 ? MALI_SHADER_REGISTER_ALLOCATION_64_PER_THREAD : MALI_SHADER_REGISTER_ALLOCATION_32_PER_THREAD;
+		sp.binary = bin_va;
+		sp.preload.r48_r63 = (uint32_t)(preload >> 48);
+	}
+}
+
+/* A whole render pass: clear + N draws (one MALLOC_VERTEX job each, shared tiler context) + one FRAGMENT job. */
+static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w, uint32_t h, uint32_t stride,
+    uint32_t packed, bool bgra, const sm_drawrec *dr, uint32_t ndraw, uint32_t *vstatus)
+{
+	uint8_t *cpu = desc->cpu;
+	uint64_t D = desc->gpu;
+	memset(cpu, 0, 0x1000);
+	memset(heap->cpu, 0, heap->size);
+	/* pass-wide state, same layout as the fixed-shader path */
+	pan_pack(cpu + OFF_THEAP, TILER_HEAP, heap_d) {
+		heap_d.size = heap->size; heap_d.base = heap->gpu; heap_d.bottom = heap->gpu; heap_d.top = heap->gpu + heap->size;
+	}
+	pan_pack(cpu + OFF_TCTX, TILER_CONTEXT, t) {
+		t.hierarchy_mask = 0x28; t.fb_width = w; t.fb_height = h; t.heap = D + OFF_THEAP;
+		t.sample_pattern = MALI_SAMPLE_PATTERN_SINGLE_SAMPLED; t.first_provoking_vertex = true;
+	}
+	{ uint16_t *sp = (uint16_t *)(cpu + OFF_SAMP); for (int i = 0; i < 128; i++) sp[i] = 128; }
+	void *fbd = cpu + OFF_FBD;
+	pan_section_pack(fbd, FRAMEBUFFER, PARAMETERS, cfg) {
+		cfg.pre_frame_0 = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
+		cfg.pre_frame_1 = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
+		cfg.post_frame = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
+		cfg.width = w; cfg.height = h; cfg.bound_max_x = w - 1; cfg.bound_max_y = h - 1;
+		cfg.effective_tile_size = 256; cfg.tie_break_rule = MALI_TIE_BREAK_RULE_MINUS_180_IN_0_OUT;
+		cfg.render_target_count = 1; cfg.z_internal_format = MALI_Z_INTERNAL_FORMAT_D24;
+		cfg.color_buffer_allocation = 1024; cfg.sample_count = 1; cfg.sample_pattern = MALI_SAMPLE_PATTERN_SINGLE_SAMPLED;
+		cfg.tiler = D + OFF_TCTX; cfg.sample_locations = D + OFF_SAMP; cfg.first_provoking_vertex = true;
+	}
+	pan_section_pack(fbd, FRAMEBUFFER, PADDING, padding) {}
+	pan_pack((uint8_t *)fbd + pan_size(FRAMEBUFFER), RENDER_TARGET, rt) {
+		rt.clean_pixel_write_enable = true;
+		rt.clear.color_0 = rt.clear.color_1 = rt.clear.color_2 = rt.clear.color_3 = packed;
+		rt.write_enable = true; rt.dithering_enable = true;
+		rt.internal_format = MALI_COLOR_BUFFER_INTERNAL_FORMAT_R8G8B8A8;
+		rt.writeback_format = MALI_COLOR_FORMAT_R8G8B8A8;
+		rt.writeback_block_format = MALI_BLOCK_FORMAT_LINEAR; rt.writeback_msaa = MALI_MSAA_SINGLE;
+		rt.swizzle = bgra ? (2 | (1 << 3) | (0 << 6) | (3 << 9)) : (0 | (1 << 3) | (2 << 6) | (3 << 9));
+		rt.rgb.base = target_va; rt.rgb.row_stride = stride;
+	}
+	pan_pack(cpu + OFF_TLS, LOCAL_STORAGE, tl) { tl.wls_instances = MALI_LOCAL_STORAGE_NO_WORKGROUP_MEM; }
+	pan_pack(cpu + OFF_DS, DEPTH_STENCIL, d) {
+		d.depth_function = MALI_FUNC_ALWAYS; d.front_compare_function = MALI_FUNC_ALWAYS; d.back_compare_function = MALI_FUNC_ALWAYS;
+		d.front_write_mask = 0xFF; d.back_write_mask = 0xFF; d.front_value_mask = 0xFF; d.back_value_mask = 0xFF;
+	}
+	pan_pack(cpu + OFF_BLEND, BLEND, b) {
+		b.round_to_fb_precision = true;
+		b.equation.color_mask = 0xF;
+		b.equation.rgb.a = MALI_BLEND_OPERAND_A_SRC; b.equation.rgb.b = MALI_BLEND_OPERAND_B_SRC; b.equation.rgb.c = MALI_BLEND_OPERAND_C_ZERO;
+		b.equation.alpha.a = MALI_BLEND_OPERAND_A_SRC; b.equation.alpha.b = MALI_BLEND_OPERAND_B_SRC; b.equation.alpha.c = MALI_BLEND_OPERAND_C_ZERO;
+		b.internal.mode = MALI_BLEND_MODE_OPAQUE;
+		b.internal.fixed_function.num_comps = 4; b.internal.fixed_function.rt = 0;
+		b.internal.fixed_function.conversion.memory_format = (MALI_RGBA8_TB << 12) | MALI_RGB_COMPONENT_ORDER_RGBA;
+	}
+	/* per draw: 0x2000 bytes at 0x1000 + i*0x2000: job 0x000, shader descs 0x200, push 0x300, VS bin 0x400, FS bin 0x1000 */
+	uint32_t vs_all = 0;
+	for (uint32_t i = 0; i < ndraw; i++) {
+		const sm_drawrec *r = &dr[i];
+		uint32_t base = 0x1000 + i * 0x2000;
+		uint8_t *P = cpu + base; uint64_t PV = D + base;
+		memset(P, 0, 0x2000);
+		const sm_shader *vs = r->vs, *fs = r->fs;
+		uint64_t vs_bin = PV + 0x400, fs_bin = PV + 0x1000;
+		memcpy(P + 0x400, vs->bin, vs->size);
+		uint32_t fs_preload_hi, fs_wr, fs_push;
+		if (fs) { memcpy(P + 0x1000, fs->bin, fs->size); fs_preload_hi = 0; fs_wr = fs->work_regs; fs_push = fs->push_words; }
+		else { memcpy(P + 0x1000, FS_GREEN, sizeof FS_GREEN); fs_wr = 32; fs_push = 0; }
+		sm_shader_desc(P + 0x200, vs, MALI_SHADER_STAGE_VERTEX, vs_bin, vs->preload, vs->work_regs);
+		bool sec = (vs->flags & 1) != 0;
+		if (sec) sm_shader_desc(P + 0x220, vs, MALI_SHADER_STAGE_VERTEX, vs_bin + vs->sec_off, vs->sec_preload, vs->work_regs);
+		sm_shader_desc(P + 0x240, fs, MALI_SHADER_STAGE_FRAGMENT, fs_bin, fs ? fs->preload : FS_GREEN_PRELOAD, fs_wr);
+		(void)fs_preload_hi;
+		/* push constants (see air2nir.py ABI) */
+		uint8_t *push = P + 0x300;
+		for (int k = 0; k < 8; k++) memcpy(push + SMP_BUF + 8 * k, &r->buf[k], 8);
+		for (int L = 0; L < 8; L++) {
+			uint32_t bi = r->attr[L].bidx;
+			uint64_t va = bi < 31 && r->buf[bi] ? r->buf[bi] + r->attr[L].off : 0;
+			uint32_t st = bi < 31 ? r->stride[bi] : 0;
+			memcpy(push + SMP_ATTR + 16 * L, &va, 8); memcpy(push + SMP_ATTR + 16 * L + 8, &st, 4);
+		}
+		float vp[6] = { w * 0.5f, -(float)h * 0.5f, 1.0f, w * 0.5f, h * 0.5f, 0.0f };
+		memcpy(push + SMP_VP, vp, sizeof vp);
+		uint32_t vs_fau = (vs->push_words + 1) / 2, fs_fau = (fs_push + 1) / 2;
+		if (vs_fau == 0) vs_fau = 1;
+		uint32_t nvar = vs->nvar; if (fs && fs->nvar > nvar) nvar = fs->nvar;
+		void *vj = P;
+		pan_section_pack(vj, MALLOC_VERTEX_JOB, PRIMITIVE, cfg) {
+			cfg.draw_mode = MALI_DRAW_MODE_TRIANGLES; cfg.index_count = r->vcount; cfg.base_vertex_offset = r->vstart;
+			cfg.allow_rotating_primitives = true; cfg.secondary_shader = sec;
+		}
+		pan_section_pack(vj, MALLOC_VERTEX_JOB, INSTANCE_COUNT, cfg) { cfg.count = 1; }
+		pan_section_pack(vj, MALLOC_VERTEX_JOB, ALLOCATION, cfg) {
+			cfg.vertex_attribute_stride = sec ? 16 * nvar : 0;
+			cfg.vertex_packet_stride = 16 + (sec ? 16 * nvar : 0);
+		}
+		pan_section_pack(vj, MALLOC_VERTEX_JOB, TILER, cfg) { cfg.address = D + OFF_TCTX; }
+		pan_section_pack(vj, MALLOC_VERTEX_JOB, SCISSOR, cfg) {
+			cfg.scissor_minimum_x = 0; cfg.scissor_minimum_y = 0; cfg.scissor_maximum_x = w - 1; cfg.scissor_maximum_y = h - 1;
+		}
+		pan_section_pack(vj, MALLOC_VERTEX_JOB, PRIMITIVE_SIZE, cfg) {}
+		pan_section_pack(vj, MALLOC_VERTEX_JOB, INDICES, cfg) { cfg.address = 0; }
+		pan_section_pack(vj, MALLOC_VERTEX_JOB, DRAW, cfg) {
+			cfg.allow_forward_pixel_to_kill = true; cfg.allow_forward_pixel_to_be_killed = true;
+			cfg.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY; cfg.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
+			cfg.sample_mask = 0xFFFF; cfg.single_sampled_lines = true; cfg.vertex_array.packet = true;
+			cfg.minimum_z = 0.0f; cfg.maximum_z = 1.0f; cfg.depth_stencil = D + OFF_DS;
+			cfg.render_target_mask = 1; cfg.blend = D + OFF_BLEND; cfg.blend_count = 1;
+			cfg.overdraw_alpha0 = true; cfg.overdraw_alpha1 = true;
+			cfg.shader.thread_storage = D + OFF_TLS; cfg.shader.shader = PV + 0x240;
+			cfg.shader.fau = PV + 0x300; cfg.shader.fau_count = fs_fau ? fs_fau : 1;
+		}
+		pan_section_pack(vj, MALLOC_VERTEX_JOB, POSITION, cfg) {
+			cfg.thread_storage = D + OFF_TLS; cfg.shader = PV + 0x200; cfg.fau = PV + 0x300; cfg.fau_count = vs_fau;
+		}
+		pan_section_pack(vj, MALLOC_VERTEX_JOB, VARYING, cfg) {
+			if (sec) { cfg.thread_storage = D + OFF_TLS; cfg.shader = PV + 0x220; cfg.fau = PV + 0x300; cfg.fau_count = vs_fau; }
+		}
+		pan_section_pack(vj, MALLOC_VERTEX_JOB, HEADER, header) { header.type = MALI_JOB_TYPE_MALLOC_VERTEX; header.index = 1; }
+		uint32_t vst = sm_submit(1, PV);
+		uint32_t vexc = *(volatile uint32_t *)P;
+		slog("SweetMTL: draw%u vs=%s fs=%s n=%u sec=%d nvar=%u job=%x exc=%x", i, vs->name, fs ? fs->name : "(FS_GREEN)",
+		    r->vcount, sec, nvar, vst, vexc);
+		vs_all |= vst;
+	}
+	if (vstatus) *vstatus = vs_all;
+	pan_section_pack(cpu + OFF_FJOB, FRAGMENT_JOB, PAYLOAD, cfg) {
+		cfg.bound_min_x = 0; cfg.bound_min_y = 0; cfg.bound_max_x = (w - 1) >> 4; cfg.bound_max_y = (h - 1) >> 4;
+		cfg.tile_render_order = MALI_TILE_RENDER_ORDER_Z_ORDER; cfg.framebuffer = D + OFF_FBD;
+	}
+	pan_section_pack(cpu + OFF_FJOB, FRAGMENT_JOB, HEADER, header) { header.type = MALI_JOB_TYPE_FRAGMENT; header.index = 1; }
+	return sm_submit(0, D + OFF_FJOB);
+}
+
+@interface SweetMTLBuffer : NSObject
+@property (nonatomic, readonly) NSUInteger length;
+@end
+@implementation SweetMTLBuffer { sm_bo _bo; }
+- (instancetype)initWithLength:(NSUInteger)len bytes:(const void *)p
+{
+	self = [super init];
+	if (!sm_bo_alloc(&_bo, len ? len : 16)) return nil;
+	_length = len;
+	if (p) memcpy(_bo.cpu, p, len);
+	return self;
+}
+- (void *)contents { return _bo.cpu; }
+- (uint64_t)gpuAddress { return _bo.gpu; }
+- (MTLStorageMode)storageMode { return MTLStorageModeShared; }
+- (void)didModifyRange:(NSRange)r {}
+- (void)setLabel:(NSString *)l {}
+@end
+
+@interface SweetMTLFunction : NSObject
+@property (nonatomic, copy) NSString *name;
+@end
+@implementation SweetMTLFunction
+- (MTLFunctionType)functionType
+{
+	const sm_shader *s = sm_find(_name);
+	return s && s->stage == 4 ? MTLFunctionTypeFragment : MTLFunctionTypeVertex;
+}
+- (void)setLabel:(NSString *)l {}
+@end
+
+@interface SweetMTLLibrary : NSObject
+@end
+@implementation SweetMTLLibrary
+- (id)newFunctionWithName:(NSString *)name
+{
+	SweetMTLFunction *f = [SweetMTLFunction new]; f.name = name;
+	slog("SweetMTL: function %s -> %s", name.UTF8String, sm_find(name) ? "translated" : "NOT in pack");
+	return f;
+}
+- (NSArray *)functionNames
+{
+	sm_pack_load();
+	NSMutableArray *a = [NSMutableArray array];
+	for (uint32_t i = 0; i < sm_pack_n; i++) [a addObject:@(sm_pack[i].name)];
+	return a;
+}
+- (void)setLabel:(NSString *)l {}
+@end
+
 /* ------------------------------------------------------------------ Metal objects (phase 2a) */
 @interface SweetMTLTexture : NSObject
 @property (nonatomic, readonly) NSUInteger width, height, pixelFormat, bytesPerRow;
@@ -339,6 +587,18 @@ static uint32_t sm_draw(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 }
 @end
 
+@interface SweetMTLRenderPipelineState : NSObject
+@property (nonatomic, copy) NSString *vsName, *fsName;
+@property (nonatomic) const sm_shader *vs, *fs;
+@end
+@implementation SweetMTLRenderPipelineState {
+@public
+	struct { uint32_t fmt, off, bidx; } _attr[16];
+	uint32_t _stride[31];
+}
+- (void)setLabel:(NSString *)l {}
+@end
+
 @interface SweetMTLCommandBuffer : NSObject
 @property (nonatomic, strong) NSMutableArray *passes;
 @property (nonatomic) NSUInteger status;
@@ -349,18 +609,48 @@ static uint32_t sm_draw(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 @property (nonatomic, strong) SweetMTLTexture *target;
 @property (nonatomic) BOOL clear;
 @property (nonatomic) uint32_t packed;
-@property (nonatomic) uint32_t vertexCount;
+@property (nonatomic, strong) SweetMTLRenderPipelineState *pipeline;
+@property (nonatomic, strong) NSMutableArray *keep;     /* buffers referenced by recorded draws */
 @end
-@implementation SweetMTLRenderEncoder
+@implementation SweetMTLRenderEncoder {
+@public
+	uint64_t _buf[31];
+	sm_drawrec _draws[32];
+	uint32_t _ndraw;
+}
+- (instancetype)init { self = [super init]; _keep = [NSMutableArray array]; return self; }
 - (void)endEncoding {}
-- (void)setRenderPipelineState:(id)ps {}
+- (void)setLabel:(NSString *)l {}
+- (void)setRenderPipelineState:(id)ps { _pipeline = ps; }
 - (void)setViewport:(MTLViewport)vp {}
+- (void)setCullMode:(MTLCullMode)m {}
+- (void)setFrontFacingWinding:(MTLWinding)w {}
+- (void)setVertexBuffer:(id)buf offset:(NSUInteger)off atIndex:(NSUInteger)i
+{
+	if (i < 31) { _buf[i] = buf ? [(SweetMTLBuffer *)buf gpuAddress] + off : 0; if (buf) [_keep addObject:buf]; }
+}
+- (void)setVertexBytes:(const void *)p length:(NSUInteger)len atIndex:(NSUInteger)i
+{
+	SweetMTLBuffer *b = [[SweetMTLBuffer alloc] initWithLength:len bytes:p];
+	if (b) { [_keep addObject:b]; if (i < 31) _buf[i] = [b gpuAddress]; }
+}
+- (void)setFragmentBuffer:(id)buf offset:(NSUInteger)off atIndex:(NSUInteger)i { [self setVertexBuffer:buf offset:off atIndex:i]; }
+- (void)setFragmentBytes:(const void *)p length:(NSUInteger)len atIndex:(NSUInteger)i { [self setVertexBytes:p length:len atIndex:i]; }
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
 {
-	if (type == MTLPrimitiveTypeTriangle) _vertexCount += (uint32_t)count;
-	else slog("SweetMTL: draw type %lu not supported yet", (unsigned long)type);
+	if (type != MTLPrimitiveTypeTriangle) { slog("SweetMTL: draw type %lu not supported yet", (unsigned long)type); return; }
+	if (_ndraw >= 32) { slog("SweetMTL: too many draws in one pass"); return; }
+	sm_drawrec *r = &_draws[_ndraw];
+	memset(r, 0, sizeof *r);
+	r->vs = _pipeline.vs; r->fs = _pipeline.fs;
+	r->vcount = (uint32_t)count; r->vstart = (uint32_t)start;
+	memcpy(r->buf, _buf, sizeof _buf);
+	if (_pipeline) {
+		for (int k = 0; k < 16; k++) { r->attr[k].fmt = _pipeline->_attr[k].fmt; r->attr[k].off = _pipeline->_attr[k].off; r->attr[k].bidx = _pipeline->_attr[k].bidx; }
+		memcpy(r->stride, _pipeline->_stride, sizeof r->stride);
+	}
+	_ndraw++;
 }
-- (void)setLabel:(NSString *)l {}
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
 {
 	NSMethodSignature *m = [super methodSignatureForSelector:sel];
@@ -390,19 +680,28 @@ static uint32_t sm_draw(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 - (void)commit
 {
 	static sm_bo desc; static bool have;
-	if (!have) have = sm_bo_alloc(&desc, 0x10000);
+	if (!have) have = sm_bo_alloc(&desc, 0x80000);
 	_status = 4; /* MTLCommandBufferStatusCompleted */
 	for (SweetMTLRenderEncoder *e in _passes) {
 		if (!have || !e.target) { _status = 5; continue; }
 		bool bgra = e.target.pixelFormat == MTLPixelFormatBGRA8Unorm;
-		if (e.vertexCount) {
+		if (e->_ndraw) {
 			static sm_bo heap; static bool haveheap;
 			if (!haveheap) haveheap = sm_bo_alloc(&heap, 4u << 20);
 			if (!haveheap) { _status = 5; continue; }
+			bool generic = true;
+			for (uint32_t i = 0; i < e->_ndraw; i++) if (!e->_draws[i].vs) generic = false;
 			uint32_t vs = 0;
-			_lastJobStatus = sm_draw(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
-			    (uint32_t)e.target.bytesPerRow, e.packed, bgra, e.vertexCount, &vs);
-			slog("SweetMTL: draw %u verts vertex job=%x fragment job=%x", e.vertexCount, vs, _lastJobStatus);
+			if (generic) {
+				_lastJobStatus = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
+				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, e->_draws, e->_ndraw, &vs);
+			} else {
+				/* no translated vertex shader: fixed Mesa shaders (phase 2b) */
+				uint32_t n = 0; for (uint32_t i = 0; i < e->_ndraw; i++) n += e->_draws[i].vcount;
+				_lastJobStatus = sm_draw(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
+				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, n, &vs);
+			}
+			slog("SweetMTL: pass %u draws (%s) vertex=%x fragment=%x", e->_ndraw, generic ? "translated" : "fixed", vs, _lastJobStatus);
 			if (_lastJobStatus != 0 || vs != 0) _status = 5;
 		} else if (e.clear) {
 			_lastJobStatus = sm_clear(&desc, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
@@ -415,12 +714,6 @@ static uint32_t sm_draw(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 - (void)waitUntilCompleted {}
 - (void)presentDrawable:(id)d {}
 - (NSError *)error { return nil; }
-- (void)setLabel:(NSString *)l {}
-@end
-
-@interface SweetMTLRenderPipelineState : NSObject
-@end
-@implementation SweetMTLRenderPipelineState
 - (void)setLabel:(NSString *)l {}
 @end
 
@@ -487,10 +780,26 @@ static uint32_t sm_draw(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 - (id)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)n { return [SweetMTLCommandQueue new]; }
 - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err
 {
-	/* phase 2b: the shader functions are ignored, the fixed Mesa-compiled pair is used */
 	if (err) *err = nil;
-	return [SweetMTLRenderPipelineState new];
+	SweetMTLRenderPipelineState *ps = [SweetMTLRenderPipelineState new];
+	ps.vsName = d.vertexFunction.name; ps.fsName = d.fragmentFunction.name;
+	ps.vs = sm_find(ps.vsName); ps.fs = sm_find(ps.fsName);
+	MTLVertexDescriptor *vd = d.vertexDescriptor;
+	for (int i = 0; i < 16 && vd; i++) {
+		ps->_attr[i].fmt = (uint32_t)vd.attributes[i].format;
+		ps->_attr[i].off = (uint32_t)vd.attributes[i].offset;
+		ps->_attr[i].bidx = (uint32_t)vd.attributes[i].bufferIndex;
+	}
+	for (int i = 0; i < 31 && vd; i++) ps->_stride[i] = (uint32_t)vd.layouts[i].stride;
+	slog("SweetMTL: pipeline vs=%s(%s) fs=%s(%s)", ps.vsName.UTF8String ?: "-", ps.vs ? "ok" : "missing",
+	    ps.fsName.UTF8String ?: "-", ps.fs ? "ok" : "fallback");
+	return ps;
 }
+- (id)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)o { return [[SweetMTLBuffer alloc] initWithLength:len bytes:NULL]; }
+- (id)newBufferWithBytes:(const void *)p length:(NSUInteger)len options:(MTLResourceOptions)o { return [[SweetMTLBuffer alloc] initWithLength:len bytes:p]; }
+- (id)newLibraryWithURL:(NSURL *)url error:(NSError **)err { if (err) *err = nil; return [SweetMTLLibrary new]; }
+- (id)newLibraryWithFile:(NSString *)path error:(NSError **)err { if (err) *err = nil; return [SweetMTLLibrary new]; }
+- (id)newDefaultLibrary { return [SweetMTLLibrary new]; }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d { return [[SweetMTLTexture alloc] initWithDevice:self descriptor:d]; }
 - (uint64_t)registryID { return 0x53574545; }
 - (BOOL)isLowPower { return NO; }
