@@ -574,6 +574,19 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 
 /* Base for every SweetMTL object: selectors CoreAnimation sends that are not implemented yet are logged
  * once and answered with zero instead of raising "unrecognized selector". */
+static void sm_zero_return(NSInvocation *inv)
+{
+	const char *rt = inv.methodSignature.methodReturnType;
+	const char *sn = sel_getName(inv.selector);
+	if (rt[0] == '@' && (!strncmp(sn, "new", 3) || strstr(sn, "Encoder"))) {
+		/* unimplemented factory: hand back a placeholder that swallows every message */
+		void *o = (__bridge_retained void *)[NSClassFromString(@"SweetMTLObject") new];
+		[inv setReturnValue:&o];
+		return;
+	}
+	uint8_t z[128] = {0};
+	if (inv.methodSignature.methodReturnLength && inv.methodSignature.methodReturnLength <= sizeof z) [inv setReturnValue:z];
+}
 static __weak id sm_device;
 @interface SweetMTLObject : NSObject
 @property (nonatomic, copy) NSString *label;
@@ -592,8 +605,7 @@ static __weak id sm_device;
 	BOOL first = NO;
 	@synchronized (seen) { if (![seen containsObject:k]) { [seen addObject:k]; first = YES; } }
 	if (first) slog("SweetMTL: stub %s", k.UTF8String);
-	uint8_t z[128] = {0};
-	if (inv.methodSignature.methodReturnLength && inv.methodSignature.methodReturnLength <= sizeof z) [inv setReturnValue:z];
+	sm_zero_return(inv);
 }
 @end
 
@@ -1074,6 +1086,7 @@ static void sm_diag_install(void)
 	    ps.fsName.UTF8String ?: "-", ps.fs ? "ok" : "fallback");
 	return ps;
 }
+- (id)newDepthStencilStateWithDescriptor:(id)d { return [SweetMTLObject new]; }
 - (id)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d
 {
 	SweetMTLSampler *smp = [SweetMTLSampler new];
@@ -1094,7 +1107,7 @@ static void sm_diag_install(void)
 
 - (BOOL)respondsToSelector:(SEL)sel
 {
-	BOOL r = [super respondsToSelector:sel];
+	BOOL r = sel == @selector(targetDeviceInfo) ? NO : [super respondsToSelector:sel];
 	static int nlog;
 	if (nlog < 120) { nlog++; slog("SweetMTL: responds %s -> %d", sel_getName(sel), r); }
 	return r;
@@ -1112,8 +1125,7 @@ static void sm_diag_install(void)
 	NSString *k = @(sel_getName(inv.selector)); BOOL first = NO;
 	@synchronized (seen) { if (![seen containsObject:k]) { [seen addObject:k]; first = YES; } }
 	if (first) slog("SweetMTL: unimplemented -%s", k.UTF8String);
-	uint8_t z[128] = {0};
-	if (inv.methodSignature.methodReturnLength && inv.methodSignature.methodReturnLength <= sizeof z) [inv setReturnValue:z];
+	sm_zero_return(inv);
 }
 
 @end
