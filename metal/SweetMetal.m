@@ -163,13 +163,19 @@ static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uin
 }
 
 static bool sm_gpu_off;   /* a job timed out (or the kernel fenced the GPU): no more GPU work this boot */
+static char sm_off_reason[160];   /* why, repeated in every "alive" line so a wrapped pmsg log still shows it */
+static char sm_cur_pass[96];      /* what was being drawn */
 static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 {
 	if (sm_gpu_off) return 0xFFFCu;
 	uint64_t in[3] = { slot, jc, 2000 }, out[1] = { 0xdead }; uint32_t oc = 1;
 	kern_return_t kr = IOConnectCallMethod(sm_conn, 3, in, 3, NULL, 0, out, &oc, NULL, NULL);
 	uint32_t r = kr ? 0xffff0000u | (uint32_t)kr : (uint32_t)out[0];
-	if (r == 0xFFFFu || r == 0xFFFCu || (r >> 16) == 0xffff) { sm_gpu_off = true; slog("SweetMTL: GPU off after status %x", r); }
+	if (r == 0xFFFFu || r == 0xFFFCu || (r >> 16) == 0xffff) {
+		sm_gpu_off = true;
+		snprintf(sm_off_reason, sizeof sm_off_reason, "status %x slot %u in %s", r, slot, sm_cur_pass);
+		slog("SweetMTL: GPU off: %s", sm_off_reason);
+	}
 	return r;
 }
 
@@ -572,6 +578,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
     uint32_t packed, bool bgra, const sm_drawrec *dr, uint32_t ndraw, uint32_t *vstatus, bool preload)
 {
 	if (preload) { const sm_shader *rs = sm_find(@"read_surf_frag"); if (!rs || rs->size > 0x300) preload = false; }
+	snprintf(sm_cur_pass, sizeof sm_cur_pass, "%ux%u n%u %s", w, h, ndraw, ndraw && dr[0].fs ? dr[0].fs->name : "-");
 	uint8_t *cpu = desc->cpu;
 	uint64_t D = desc->gpu;
 	memset(cpu, 0, 0x1000);
@@ -1611,7 +1618,7 @@ static void sm_fc_hook(void)
 					if (gy == gx) px[gy] = v;
 				}
 				sm_capture(c, W, H, bpr, (uint32_t)e.target.pixelFormat, (uint32_t)nsamp);
-				if (nsamp == 3) sm_thumb(c, W, H, bpr, (uint32_t)nsamp);
+				/* early thumbnails dropped: the late ones (600/800/1000 s) need the log space */
 				slog("SweetMTL: target %ux%u fmt %lu nz=%u/16 hash=%08x diag %08x %08x %08x %08x", W, H, (unsigned long)e.target.pixelFormat, nz, hsh, px[0], px[1], px[2], px[3]);
 			}
 			if (_lastJobStatus != 0 || vs != 0) _status = 5;
@@ -1764,7 +1771,7 @@ static void *sm_watchdog(void *arg)
 	for (int t = 1;; t++) {
 		sleep(10);
 		uint32_t c = sm_commits;
-		if (t % 3 == 0) slog("SweetMTL: alive %ds commits=%u", t * 10, c);
+		if (t % 3 == 0) slog("SweetMTL: alive %ds commits=%u%s%s", t * 10, c, sm_off_reason[0] ? " OFF: " : "", sm_off_reason);
 		if (c && c == last && dumps < 2) { slog("SweetMTL: STALL at commit %u, threads:", c); sm_dump_threads(); dumps++; }
 		last = c;
 	}
@@ -1964,7 +1971,7 @@ static bool sm_process_allowed(void)
 	@synchronized (seen) { if (![seen containsObject:k]) { [seen addObject:k]; first = YES; } }
 	Method sm = sm_super_cls ? class_getInstanceMethod(sm_super_cls, inv.selector) : NULL;
 	if (sm) {
-		if (first) slog("SweetMTL: inherited -%s", k.UTF8String);
+		(void)first;   /* inherited-method discovery done; these lines filled the pmsg log */
 		[inv invokeUsingIMP:method_getImplementation(sm)];
 		return;
 	}
