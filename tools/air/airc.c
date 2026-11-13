@@ -84,6 +84,24 @@ static bool lower_rt_conv(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 	return true;
 }
 
+/* Valhall fragment shaders always read smooth varyings with a 32-bit source format (bi_emit_load_vary), so a
+ * 16-bit varying written by the vertex shader reads back as garbage (half4 colours came out black). Widen every
+ * 16-bit generic varying store to 32 bits. */
+static bool widen_vary_store(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+	if (intr->intrinsic != nir_intrinsic_store_output) return false;
+	if (nir_intrinsic_io_semantics(intr).location < VARYING_SLOT_VAR0) return false;
+	nir_alu_type T = nir_intrinsic_src_type(intr);
+	if (nir_alu_type_get_type_size(T) != 16) return false;
+	b->cursor = nir_before_instr(&intr->instr);
+	nir_def *v = intr->src[0].ssa;
+	nir_alu_type base = nir_alu_type_get_base_type(T);
+	nir_def *w = base == nir_type_float ? nir_f2f32(b, v) : base == nir_type_int ? nir_i2i32(b, v) : nir_u2u32(b, v);
+	nir_src_rewrite(&intr->src[0], w);
+	nir_intrinsic_set_src_type(intr, base | 32);
+	return true;
+}
+
 /* sample with texture/sampler indices that may be computed at run time (if-converted selects) */
 static nir_def *sm_tex_dyn(nir_builder *b, nir_def *coord, nir_def *tex, nir_def *smp, unsigned bits)
 {
@@ -200,6 +218,7 @@ int main(int argc, char **argv)
 	const char *only = getenv("AIRC_ONLY");
 	for (unsigned i = 0; i < n; i++) {
 		if (only && strcmp(only, all[i].name)) continue;
+		if (getenv("AIRC_VS_ONLY") && all[i].stage != MESA_SHADER_VERTEX) continue;
 		int pfd[2];
 		if (pipe(pfd)) return 1;
 		pid_t pid = getenv("AIRC_NOFORK") ? 0 : fork();
@@ -219,6 +238,8 @@ int main(int argc, char **argv)
 		struct util_dynarray bin; util_dynarray_init(&bin, NULL);
 		struct pan_shader_info info; memset(&info, 0, sizeof info);
 		if (getenv("AIRC_PRINT")) nir_print_shader(b.shader, stderr);
+		if (all[i].stage == MESA_SHADER_VERTEX)
+			nir_shader_intrinsics_pass(b.shader, widen_vary_store, nir_metadata_block_index | nir_metadata_dominance, NULL);
 		bifrost_preprocess_nir(b.shader, GPU_ID);
 		nir_shader_intrinsics_pass(b.shader, lower_rt_conv, nir_metadata_block_index | nir_metadata_dominance, NULL);
 		if (getenv("AIRC_PRINT")) nir_print_shader(b.shader, stderr);
