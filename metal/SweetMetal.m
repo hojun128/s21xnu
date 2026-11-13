@@ -1474,6 +1474,14 @@ static void sm_fc_hook(void)
 						}
 					}
 					const sm_drawrec *o = &e->_draws[i];
+					slog("SweetMTL: cov%d.%u real %x %u px mid %08x top %08x:%u %08x:%u", ndiag, i, st[1], cnt[1], mid[1], top[1][0], topn[1][0], top[1][1], topn[1][1]);
+					for (uint32_t k = 0; k < o->ntex; k++) {
+						SweetMTLTexture *t = e->_tex[k];
+						if (!t || !t.bo || !t.bo->cpu) continue;
+						const uint32_t *px = (const uint32_t *)t.bo->cpu; uint64_t nw = (uint64_t)t.bytesPerRow * t.height / 4, nzc = 0; uint32_t any = 0;
+						for (uint64_t q = 0; q < nw; q += 7) if (px[q]) { nzc++; any = px[q]; }
+						slog("SweetMTL: cov%d.%u tex%u %lux%lu imp %u nz %llu/%llu sample %08x", ndiag, i, k, (unsigned long)t.width, (unsigned long)t.height, t.bo->imported, nzc, nw / 7, any);
+					}
 					slog("SweetMTL: cover pass%d draw%u fs=%s blend=%u wmask=%x sc=%u: green %x %u px c00 %08x mid %08x | real %x %u px c00 %08x mid %08x top %08x:%u %08x:%u %08x:%u", ndiag, i,
 					    o->fs ? o->fs->name : "-", o->blend_on, o->wmask, o->has_scissor, st[0], cnt[0], c00[0], mid[0], st[1], cnt[1], c00[1], mid[1],
 					    top[1][0], topn[1][0], top[1][1], topn[1][1], top[1][2], topn[1][2]);
