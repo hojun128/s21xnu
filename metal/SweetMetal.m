@@ -672,7 +672,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 			memcpy(push + SMP_CDATA_VS, &cv, 8); memcpy(push + SMP_CDATA_FS, &cf, 8); memcpy(push + SMP_DUMMY, &dv, 8);
 			memcpy(push + SMP_FC, r->fc, sizeof r->fc);
 		}
-		for (int k = 0; k < 8; k++) memcpy(push + SMP_BUF + 8 * k, &r->buf[k], 8);
+		for (int k = 0; k < 8; k++) { uint64_t v = r->buf[k] ? r->buf[k] : (havedummy ? dummy.gpu : 0); memcpy(push + SMP_BUF + 8 * k, &v, 8); }
 		for (int L = 0; L < 8; L++) {
 			uint32_t bi = r->attr[L].bidx;
 			uint64_t va = bi < 31 && r->buf[bi] ? r->buf[bi] + r->attr[L].off : 0;
@@ -683,7 +683,8 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		memcpy(push + SMP_VP, vp, sizeof vp);
 		/* fragment stage: same push block but its own buffer table */
 		memcpy(P + 0xE00, push, SMP_BYTES);
-		for (int k = 0; k < 8; k++) memcpy(P + 0xE00 + SMP_BUF + 8 * k, &r->fbuf[k], 8);
+		/* unbound fragment buffers point at the zeroed dummy page instead of address 0 */
+		for (int k = 0; k < 8; k++) { uint64_t v = r->fbuf[k] ? r->fbuf[k] : (havedummy ? dummy.gpu : 0); memcpy(P + 0xE00 + SMP_BUF + 8 * k, &v, 8); }
 		/* fragment resources: SAMPLER table (3) x16 at 0xA00 (slot 15 = constexpr sampler), TEXTURE table (4) x8 at 0xC00
 		 * (slot 7 = 1x1 null 2D, slot 6 = 1x1x1 null 3D, both pointing at the zeroed dummy page) */
 		uint64_t res_va = 0;
