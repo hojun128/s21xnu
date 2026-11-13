@@ -1481,12 +1481,17 @@ static void sm_fc_hook(void)
 			{
 				/* late thumbnails of full-screen targets: a normal boot reaches the lock screen after ~18 min */
 				static int nlate;
-				static const double at[3] = { 800, 1100, 1400 };
+				static const double at[3] = { 600, 800, 1000 };
 				struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
 				if (nlate < 3 && ts.tv_sec >= at[nlate] && e.target.width == 1125 && e.target.bo && e.target.bo->cpu) {
 					nlate++;
 					slog("SweetMTL: late thumb %d at %lds fragment=%x gpuoff=%d", nlate, (long)ts.tv_sec, _lastJobStatus, sm_gpu_off);
 					sm_thumb(e.target.bo->cpu, (uint32_t)e.target.width, (uint32_t)e.target.height, (uint32_t)e.target.bytesPerRow, (uint32_t)(10 + nlate));
+					if (nlate == 3) {
+						/* got what the test needs: end the run now instead of waiting for the autorec timer */
+						slog("SweetMTL: last thumb taken, rebooting to recovery");
+						IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
+					}
 				}
 			}
 			static int ndiag;
