@@ -178,7 +178,8 @@ static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uin
 {
 	if (!c) return;
 	const uint32_t S = 12, w = W / S, h = H / S;
-	uint32_t n = w * h; uint8_t *px = malloc(n);
+	bool hi = id >= 20;                       /* ids >= 20: RGB565 (2 bytes/pixel, no colour banding) */
+	uint32_t n = w * h * (hi ? 2 : 1); uint8_t *px = malloc(n);
 	for (uint32_t y = 0; y < h; y++)
 		for (uint32_t x = 0; x < w; x++) {
 			uint32_t r = 0, g = 0, b = 0;
@@ -187,9 +188,12 @@ static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uin
 				b += q[0]; g += q[1]; r += q[2];
 			}
 			r >>= 2; g >>= 2; b >>= 2;
-			px[y * w + x] = (uint8_t)((r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6));
+			if (hi) {
+				uint16_t v = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+				px[2 * (y * w + x)] = (uint8_t)v; px[2 * (y * w + x) + 1] = (uint8_t)(v >> 8);
+			} else px[y * w + x] = (uint8_t)((r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6));
 		}
-	slog("SweetMTL: THUMB %u %ux%u rgb332 %u bytes", id, w, h, n);
+	slog("SweetMTL: THUMB %u %ux%u %s %u bytes", id, w, h, hi ? "rgb565" : "rgb332", n);
 	static const char *B = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 	char line[140]; uint32_t seq = 0;
 	for (uint32_t o = 0; o < n; o += 84, seq++) {
@@ -1881,14 +1885,14 @@ static void *sm_watchdog(void *arg)
 		{
 			/* timed thumbnails of the last full-screen frame; a normal boot reaches the lock screen after ~15 min */
 			static int nlate;
-			static const long at[3] = { 1000, 1150, 1300 };
+			static const long at[3] = { 1000, 1150, 1300 };   /* first one rgb332, the last two rgb565 */
 			struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
 			id tg = sm_last_target;
 			if (nlate < 3 && ts.tv_sec >= at[nlate] && tg) {
 				nlate++;
 				SweetMTLTexture *tx = tg;
 				slog("SweetMTL: late thumb %d at %lds commits=%u gpuoff=%d", nlate, (long)ts.tv_sec, c, sm_gpu_off);
-				sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, (uint32_t)(10 + nlate));
+				sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, (uint32_t)(nlate == 1 ? 11 : 20 + nlate));
 				if (nlate == 3) {
 					/* replay the collected report last, so it is the newest part of the ring, then end the run */
 					char *save = strdup(sm_rep), *line, *ctx = NULL;
