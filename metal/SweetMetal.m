@@ -701,18 +701,20 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 				bool real = k < r->ntex && r->tex[k].va;
 				bool is3d = !real && k == 6;
 				uint64_t va = real ? r->tex[k].va : (havedummy ? dummy.gpu : 0);
-				uint32_t tw = real ? r->tex[k].w : 1, th = real ? r->tex[k].h : 1, ts = real ? r->tex[k].stride : 4;
+				/* the null texture is 16x16 with a 64-byte row: a 1x1/4-byte plane makes the texel fetch run past
+				 * the plane size and the fragment job dies with a bus fault (run32 bisect) */
+				uint32_t tw = real ? r->tex[k].w : 16, th = real ? r->tex[k].h : 16, ts = real ? r->tex[k].stride : 64;
 				uint32_t fmt = real ? r->tex[k].fmt : ((MALI_RGBA8_UNORM << 12) | MALI_RGB_COMPONENT_ORDER_RGBA);
 				pan_pack(P + 0xD00 + 32 * k, PLANE, pl) {
 					pl.plane_type = MALI_PLANE_TYPE_GENERIC;
 					pl.clump_format = MALI_CLUMP_FORMAT_RAW32;
 					pl.clump_ordering = MALI_CLUMP_ORDERING_LINEAR;
-					pl.pointer = va; pl.row_stride = ts; pl.size = ts * th; pl.slice_stride = ts * th;
+					pl.pointer = va; pl.row_stride = ts; pl.size = real ? ts * th : 0x10000; pl.slice_stride = ts * th;
 				}
 				pan_pack(P + 0xC00 + 32 * k, TEXTURE, tx) {
 					tx.dimension = is3d ? MALI_TEXTURE_DIMENSION_3D : MALI_TEXTURE_DIMENSION_2D;
 					tx.format = fmt; tx.width = tw; tx.height = th;
-					if (is3d) tx.depth = 1; else tx.sample_count = 1;
+					if (is3d) tx.depth = 16; else tx.sample_count = 1;
 					tx.swizzle = 0 | (1 << 3) | (2 << 6) | (3 << 9);
 					tx.levels = 1; tx.array_size = 1;
 					tx.surfaces = PV + 0xD00 + 32 * k;
