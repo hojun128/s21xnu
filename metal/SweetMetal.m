@@ -413,6 +413,8 @@ typedef struct {
 	const uint8_t *bin, *cdata;
 } sm_shader;
 static sm_shader *sm_pack; static uint32_t sm_pack_n;
+#define SMF_READS_TILE (1u << 8)
+#define SMF_DISCARD (1u << 9)
 
 static void sm_pack_load(void)
 {
@@ -431,6 +433,15 @@ static void sm_pack_load(void)
 		memcpy(e, d + o, 112); o += 112;
 		e->bin = d + o; o += (e->size + 15) & ~15u;
 		e->cdata = d + o; o += (e->cdata_size + 15) & ~15u;
+		if (e->stage == 4) {
+			/* scan the Valhall code: LD_TILE (0x78) = framebuffer fetch, DISCARD.f32 (0x20) = may discard */
+			for (uint32_t k = 0; k + 8 <= e->size; k += 8) {
+				uint64_t w; memcpy(&w, e->bin + k, 8);
+				uint32_t op = (uint32_t)(w >> 48) & 0x1FF;
+				if (op == 0x78) e->flags |= SMF_READS_TILE;
+				if (op == 0x20) e->flags |= SMF_DISCARD;
+			}
+		}
 	}
 	sm_pack_n = cnt;
 	slog("SweetMTL: shader pack: %u shaders", cnt);
@@ -748,13 +759,16 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		}
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, PRIMITIVE_SIZE, cfg) {}
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, INDICES, cfg) { cfg.address = r->index_va; }
+		/* forward pixel kill would drop the earlier draws' pixels under a draw that reads them back
+		 * (framebuffer fetch, blending) or may not write them (discard): luma_boost read 0 (run37) */
+		bool fpk = !(r->blend_on || (fs && (fs->flags & (SMF_READS_TILE | SMF_DISCARD))));
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, DRAW, cfg) {
-			cfg.allow_forward_pixel_to_kill = true; cfg.allow_forward_pixel_to_be_killed = true;
+			cfg.allow_forward_pixel_to_kill = fpk; cfg.allow_forward_pixel_to_be_killed = true;
 			cfg.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY; cfg.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
 			cfg.sample_mask = 0xFFFF; cfg.single_sampled_lines = true; cfg.vertex_array.packet = true;
 			cfg.minimum_z = 0.0f; cfg.maximum_z = 1.0f; cfg.depth_stencil = D + OFF_DS;
 			cfg.render_target_mask = 1; cfg.blend = PV + 0x300; cfg.blend_count = 1;
-			cfg.overdraw_alpha0 = true; cfg.overdraw_alpha1 = true;
+			cfg.overdraw_alpha0 = false; cfg.overdraw_alpha1 = false;
 			cfg.shader.thread_storage = D + OFF_TLS; cfg.shader.shader = PV + 0x240;
 			cfg.shader.fau = PV + 0xE00; cfg.shader.fau_count = fs_fau ? fs_fau : 1;
 			cfg.shader.resources = res_va;
