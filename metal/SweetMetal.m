@@ -864,6 +864,23 @@ static __weak id sm_device;
 @property (nonatomic, strong) NSDictionary *constants;      /* index -> uint32 */
 @end
 static NSMutableDictionary *sm_fc_dict(id obj);
+/* function constant name -> [[function_constant(N)]] index, from the library's CNST metadata (fcmap.txt, made on the Mac) */
+static NSDictionary *sm_fc_names(void)
+{
+	static NSDictionary *m;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		NSMutableDictionary *d = [NSMutableDictionary dictionary];
+		NSString *t = [NSString stringWithContentsOfFile:@"/System/Library/Extensions/SweetMetal.bundle/fcmap.txt" encoding:NSUTF8StringEncoding error:NULL];
+		for (NSString *line in [t componentsSeparatedByString:@"\n"]) {
+			NSArray *p = [line componentsSeparatedByString:@" "];
+			if (p.count == 2) d[p[0]] = @([p[1] integerValue]);
+		}
+		m = d;
+		slog("SweetMTL: fcmap %lu names", (unsigned long)d.count);
+	});
+	return m;
+}
 static NSMutableDictionary *sm_fc_read(id cv);
 @implementation SweetMTLFunction
 - (MTLFunctionType)functionType
@@ -939,6 +956,15 @@ static NSString *sm_match_variant(NSString *base, NSDictionary *cv)
 	SweetMTLFunction *f = [SweetMTLFunction new]; f.name = use;
 	f.constants = cv ? [sm_fc_read(cv) copy] : @{};
 	slog("SweetMTL: function %s (specialized %s) -> %s", name.UTF8String, sp ? sp.UTF8String : "-", sm_find(use) ? "translated" : "NOT in pack");
+	{
+		/* which keys arrive: indices or names (the pipeline only applies index keys) */
+		static int nl;
+		if (nl++ < 12) {
+			NSMutableString *ks = [NSMutableString string];
+			for (id k in f.constants) { if (ks.length > 150) break; [ks appendFormat:@"%@=%@ ", k, f.constants[k]]; }
+			slog("SweetMTL: fc %s: %s", use.UTF8String, ks.UTF8String);
+		}
+	}
 	return f;
 }
 - (void)newFunctionWithName:(NSString *)name constantValues:(id)cv functionCache:(id)fc specializedName:(NSString *)sp completionHandler:(void (^)(id, NSError *))h
@@ -1722,8 +1748,10 @@ static void *sm_watchdog(void *arg)
 	for (id fobj in @[ d.vertexFunction ?: (id)[NSNull null], d.fragmentFunction ?: (id)[NSNull null] ]) {
 		if (![fobj isKindOfClass:[SweetMTLFunction class]]) continue;
 		[((SweetMTLFunction *)fobj).constants enumerateKeysAndObjectsUsingBlock:^(NSNumber *k, NSNumber *v, BOOL *stop) {
-			if (![k isKindOfClass:[NSNumber class]]) return;
-			NSUInteger i = k.unsignedIntegerValue;
+			NSUInteger i;
+			if ([k isKindOfClass:[NSNumber class]]) i = k.unsignedIntegerValue;
+			else if ([k isKindOfClass:[NSString class]]) { NSNumber *m = sm_fc_names()[k]; if (!m) return; i = m.unsignedIntegerValue; }
+			else return;
 			if (i < 64) { ps->_fc[i] = v.unsignedIntValue; ps->_fcdef |= 1ull << i; }
 		}];
 	}
