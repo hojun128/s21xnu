@@ -50,6 +50,7 @@ extern kern_return_t IOConnectMapMemory64(io_connect_t, uint32_t, task_port_t, m
 #include "genxml/gen_macros.h"
 
 typedef struct { uint64_t handle, gpu; uint8_t *cpu; uint64_t size; uint32_t imported; } sm_bo;
+static volatile uint32_t sm_commits;
 static uint64_t sm_next_va = 0x30000000ULL;
 
 static bool sm_bo_alloc(sm_bo *bo, uint64_t size)
@@ -1089,6 +1090,7 @@ static void sm_fc_hook(void)
 	static sm_bo desc; static bool have;
 	if (!have) have = sm_bo_alloc(&desc, 0x10000 + 32 * SM_DRAW_STRIDE);
 	_status = 4; /* MTLCommandBufferStatusCompleted */
+	sm_commits++;
 	for (SweetMTLRenderEncoder *e in _passes) {
 		if (!have || !e.target) { _status = 5; continue; }
 		bool bgra = e.target.pixelFormat == MTLPixelFormatBGRA8Unorm;
@@ -1154,6 +1156,8 @@ static void sm_fc_hook(void)
 #include <execinfo.h>
 #include <dlfcn.h>
 #include <sys/ucontext.h>
+#include <pthread.h>
+#include <mach/mach.h>
 static void sm_sym(const char *tag, void *pc)
 {
 	Dl_info di; memset(&di, 0, sizeof di);
@@ -1218,6 +1222,52 @@ static void sm_trace_install(Class me)
 	slog("SweetMTL: tracing %u inherited _MTLDevice methods", added);
 }
 
+static const char *sm_symof(uint64_t a, char *buf, size_t n)
+{
+	Dl_info di; memset(&di, 0, sizeof di);
+	if (a && dladdr((void *)a, &di)) {
+		const char *im = di.dli_fname ? strrchr(di.dli_fname, '/') : NULL;
+		if (di.dli_sname && strcmp(di.dli_sname, "<redacted>"))
+			snprintf(buf, n, "%s:%s+%lx", im ? im + 1 : "?", di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr));
+		else snprintf(buf, n, "%s:+%lx", im ? im + 1 : "?", (unsigned long)(a - (uint64_t)di.dli_fbase));
+	} else snprintf(buf, n, "%llx", (unsigned long long)a);
+	return buf;
+}
+static void sm_dump_threads(void)
+{
+	thread_act_array_t th; mach_msg_type_number_t nth = 0;
+	if (task_threads(mach_task_self(), &th, &nth) != KERN_SUCCESS) return;
+	thread_t me = mach_thread_self();
+	for (mach_msg_type_number_t i = 0; i < nth && i < 40; i++) {
+		if (th[i] == me) continue;
+		if (thread_suspend(th[i]) != KERN_SUCCESS) continue;
+		arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+		uint64_t pcs[8] = {0}; int np = 0;
+		if (thread_get_state(th[i], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
+			pcs[np++] = arm_thread_state64_get_pc(st);
+			pcs[np++] = arm_thread_state64_get_lr(st);
+			uint64_t *fp = (uint64_t *)arm_thread_state64_get_fp(st);
+			for (int k = 0; k < 6 && fp && np < 8 && ((uint64_t)fp & 7) == 0; k++) { uint64_t ret = fp[1]; fp = (uint64_t *)fp[0]; pcs[np++] = ret & 0xFFFFFFFFFULL; }
+		}
+		thread_resume(th[i]);
+		char a[48], b[48], c[48];
+		slog("SweetMTL: T%u %s < %s < %s", i, sm_symof(pcs[0], a, sizeof a), sm_symof(pcs[1], b, sizeof b), sm_symof(pcs[2], c, sizeof c));
+		slog("SweetMTL: T%u .. %s < %s < %s", i, sm_symof(pcs[3], a, sizeof a), sm_symof(pcs[4], b, sizeof b), sm_symof(pcs[5], c, sizeof c));
+	}
+}
+static void *sm_watchdog(void *arg)
+{
+	uint32_t last = 0; int dumps = 0;
+	for (int t = 1;; t++) {
+		sleep(10);
+		uint32_t c = sm_commits;
+		if (t % 3 == 0) slog("SweetMTL: alive %ds commits=%u", t * 10, c);
+		if (c && c == last && dumps < 2) { slog("SweetMTL: STALL at commit %u, threads:", c); sm_dump_threads(); dumps++; }
+		last = c;
+	}
+	return NULL;
+}
+
 @interface SweetMTLDevice : _MTLDevice <MTLDevice, MTLDeviceSPI>
 @end
 
@@ -1246,7 +1296,11 @@ static void sm_trace_install(Class me)
 	}
 	self = [super init];
 	slog("SweetMTL: super init -> %p", self);
-	if (self) { _smPort = port; sm_device = self; }
+	if (self) {
+		_smPort = port; sm_device = self;
+		static dispatch_once_t wonce;
+		if (pn && strcmp(pn, "malitest")) dispatch_once(&wonce, ^{ pthread_t t; pthread_create(&t, NULL, sm_watchdog, NULL); pthread_detach(t); });
+	}
 	return self;
 }
 

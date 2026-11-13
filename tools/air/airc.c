@@ -191,7 +191,7 @@ int main(int argc, char **argv)
 	FILE *f = fopen(argc > 1 ? argv[1] : "shaders.smsp", "wb");
 	unsigned nair = sizeof(air_shaders) / sizeof(air_shaders[0]), ndbg = sizeof(dbg_shaders) / sizeof(dbg_shaders[0]);
 	unsigned n = nair + ndbg, ok = 0;
-	struct { const char *name; int stage; void (*build)(nir_builder *); const unsigned char *cdata; unsigned cdata_size; } all[256];
+	struct { const char *name; int stage; void (*build)(nir_builder *); const unsigned char *cdata; unsigned cdata_size; } all[2048];
 	for (unsigned i = 0; i < nair; i++) { all[i].name = air_shaders[i].name; all[i].stage = air_shaders[i].stage; all[i].build = air_shaders[i].build; all[i].cdata = air_shaders[i].cdata; all[i].cdata_size = air_shaders[i].cdata_size; }
 	for (unsigned i = 0; i < ndbg; i++) { all[nair + i].name = dbg_shaders[i].name; all[nair + i].stage = dbg_shaders[i].stage; all[nair + i].build = dbg_shaders[i].build; all[nair + i].cdata = NULL; all[nair + i].cdata_size = 0; }
 	fwrite("SMSP", 1, 4, f);
@@ -203,7 +203,7 @@ int main(int argc, char **argv)
 		int pfd[2];
 		if (pipe(pfd)) return 1;
 		pid_t pid = getenv("AIRC_NOFORK") ? 0 : fork();
-		if (pid == 0) {
+		if (pid == 0) { alarm(getenv("AIRC_TIMEOUT") ? atoi(getenv("AIRC_TIMEOUT")) : 240);
 			close(pfd[0]);
 			FILE *rf = fdopen(pfd[1], "wb");
 
