@@ -1724,9 +1724,14 @@ static void *sm_watchdog(void *arg)
 	static int all = -1;
 	if (all < 0) {
 		char ba[1024] = {0}; size_t bl = sizeof(ba) - 1;
-		all = (sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetmetal=2")) ? 1 : 0;
+		bool ok = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0;
+		/* sweetmetal=2: the render server only (app content is composited by backboardd; SpringBoard's own Metal
+		 * users such as SiriUICore crashed on shaders we cannot translate, run44); sweetmetal=4: every process */
+		all = ok && strstr(ba, "sweetmetal=4") ? 2 : ok && strstr(ba, "sweetmetal=2") ? 1 : 0;
 	}
-	if (!all && (pn == NULL || strcmp(pn, "malitest") != 0)) {
+	bool allowed = pn && (!strcmp(pn, "malitest") || (all >= 1 && !strcmp(pn, "backboardd")) || all == 2);
+	if (!allowed) {
+		slog("SweetMTL: no Metal device for %s", pn ? pn : "?");
 		return nil;
 	}
 	self = [super init];
