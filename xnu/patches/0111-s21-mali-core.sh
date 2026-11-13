@@ -273,6 +273,25 @@ mali_power(int on)
 	return r;
 }
 
+/* ---- recovery: a faulted job leaves the job manager wedged (every later job reports 0x5b), so soft-reset
+ * the GPU and power it back up; the next submit re-programs the address space ---- */
+static void
+mali_recover(const char *why)
+{
+	wr(R_GPU_IRQ_CLEAR, 0xFFFFFFFFU);
+	wr(R_GPU_CMD, GPU_CMD_SOFT_RESET);
+	uint32_t t = wait_reg(R_GPU_IRQ_RAW, 0x100U, 0x100U, 100);
+	wr(R_GPU_IRQ_CLEAR, 0xFFFFFFFFU);
+	wr(R_GPU_IRQ_MASK, 0);
+	wr(R_JOB_IRQ_MASK, 0);
+	wr(R_MMU_IRQ_MASK, 0);
+	wr(R_JOB_IRQ_CLEAR, 0xFFFFFFFFU);
+	wr(R_MMU_IRQ_CLEAR, 0xFFFFFFFFU);
+	mali.powered = 0;
+	int p = mali_power(1);
+	mali_log("recover after %s: reset %s, power %s", why, t == 0xFFFFFFFFU ? "timed out" : "ok", p ? "failed" : "ok");
+}
+
 /* ---- job submission (polling) ---- */
 /* returns 0 on DONE, else the JS_STATUS exception code (or 0xFFFF on timeout) */
 static uint32_t
@@ -301,6 +320,7 @@ mali_submit_wait(struct mali_ctx *c, uint32_t slot, uint64_t jc_va, uint32_t tim
 		wr(R_JS(slot, 0x60), JS_COMMAND_HARD_STOP);
 		us(20000);
 		wr(R_JOB_IRQ_CLEAR, 0xFFFFFFFFU);
+		mali_recover("timeout");
 		return 0xFFFFU;
 	}
 	uint32_t js = rd(R_JS(slot, 0x24));
@@ -309,6 +329,7 @@ mali_submit_wait(struct mali_ctx *c, uint32_t slot, uint64_t jc_va, uint32_t tim
 		uint32_t as = (uint32_t)c->as;
 		mali_log("job failed slot %u js=%x mmu=%x fault=%x/%x", slot, js, rd(R_MMU_IRQ_RAW), rd(R_AS(as, 0x1C)), rd(R_AS(as, 0x20)));
 		wr(R_MMU_IRQ_CLEAR, 0xFFFFFFFFU);
+		mali_recover("fault");
 		return js ? js : 0xFFFEU;
 	}
 	return 0;

@@ -1392,6 +1392,30 @@ static void sm_fc_hook(void)
 				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, n, &vs);
 			}
 			slog("SweetMTL: pass %u draws (%s) load=%d clear=%d blend0=%u vertex=%x fragment=%x", e->_ndraw, generic ? "translated" : "fixed", e.load, e.clear, e->_draws[0].blend_on ? (e->_draws[0].rgb_sf << 8 | e->_draws[0].rgb_df) : 0, vs, _lastJobStatus);
+			static int nbis;
+			if (generic && _lastJobStatus && nbis++ < 3) {
+				/* fragment fault: replay each draw alone (the kernel resets the GPU after a fault), once as recorded
+				 * and once with its fragment buffers redirected to the dummy page, to find which binding faults */
+				for (uint32_t i = 0; i < e->_ndraw; i++) {
+					sm_drawrec one = e->_draws[i];
+					uint32_t v1 = 0, v2 = 0;
+					uint32_t f1 = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
+					    (uint32_t)e.target.bytesPerRow, e.packed, bgra, &one, 1, &v1, false);
+					memset(one.fbuf, 0, sizeof one.fbuf);
+					uint32_t f2 = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
+					    (uint32_t)e.target.bytesPerRow, e.packed, bgra, &one, 1, &v2, false);
+					one = e->_draws[i]; one.ntex = 0;
+					uint32_t v3 = 0;
+					uint32_t f3 = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
+					    (uint32_t)e.target.bytesPerRow, e.packed, bgra, &one, 1, &v3, false);
+					slog("SweetMTL: bisect pass%d draw%u fs=%s ntex=%u: as-is %x/%x, nofbuf %x/%x, notex %x/%x", nbis, i,
+					    one.fs ? one.fs->name : "-", e->_draws[i].ntex, v1, f1, v2, f2, v3, f3);
+				}
+				uint32_t v0 = 0;
+				uint32_t f0 = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
+				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, e->_draws, e->_ndraw, &v0, e.load);
+				slog("SweetMTL: bisect pass%d full replay %x/%x", nbis, v0, f0);
+			}
 			static int nsamp;
 			if (nsamp++ < 16) {
 				/* sample a 4x4 grid of the target: proves the GPU wrote real content */
