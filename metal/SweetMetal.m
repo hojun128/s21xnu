@@ -574,9 +574,12 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 
 /* Base for every SweetMTL object: selectors CoreAnimation sends that are not implemented yet are logged
  * once and answered with zero instead of raising "unrecognized selector". */
+static __weak id sm_device;
 @interface SweetMTLObject : NSObject
+@property (nonatomic, copy) NSString *label;
 @end
 @implementation SweetMTLObject
+- (id)device { return sm_device; }
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
 {
 	NSMethodSignature *m = [super methodSignatureForSelector:sel];
@@ -610,7 +613,6 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 - (uint64_t)gpuAddress { return _bo.gpu; }
 - (MTLStorageMode)storageMode { return MTLStorageModeShared; }
 - (void)didModifyRange:(NSRange)r {}
-- (void)setLabel:(NSString *)l {}
 @end
 
 @interface SweetMTLFunction : SweetMTLObject
@@ -624,7 +626,6 @@ static NSMutableDictionary *sm_fc_dict(id obj);
 	const sm_shader *s = sm_find(_name);
 	return s && s->stage == 4 ? MTLFunctionTypeFragment : MTLFunctionTypeVertex;
 }
-- (void)setLabel:(NSString *)l {}
 @end
 
 @interface SweetMTLLibrary : SweetMTLObject
@@ -674,7 +675,6 @@ static NSMutableDictionary *sm_fc_dict(id obj);
 	for (uint32_t i = 0; i < sm_pack_n; i++) [a addObject:@(sm_pack[i].name)];
 	return a;
 }
-- (void)setLabel:(NSString *)l {}
 @end
 
 
@@ -770,20 +770,20 @@ static void sm_fc_hook(void)
 	uint32_t _stride[31];
 	uint32_t _fc[64]; uint64_t _fcdef;
 }
-- (void)setLabel:(NSString *)l {}
 @end
 
 @interface SweetMTLSampler : SweetMTLObject
 @property (nonatomic) uint32_t nearest;
 @end
 @implementation SweetMTLSampler
-- (void)setLabel:(NSString *)l {}
 @end
 
 @interface SweetMTLCommandBuffer : SweetMTLObject
 @property (nonatomic, strong) NSMutableArray *passes;
 @property (nonatomic) NSUInteger status;
 @property (nonatomic) uint32_t lastJobStatus;
+@property (nonatomic, weak) id commandQueue;
+@property (nonatomic, strong) NSMutableArray *scheduled, *completed;
 @end
 
 @interface SweetMTLRenderEncoder : SweetMTLObject
@@ -803,7 +803,6 @@ static void sm_fc_hook(void)
 }
 - (instancetype)init { self = [super init]; _keep = [NSMutableArray array]; return self; }
 - (void)endEncoding {}
-- (void)setLabel:(NSString *)l {}
 - (void)setRenderPipelineState:(id)ps { _pipeline = ps; }
 - (void)setViewport:(MTLViewport)vp {}
 - (void)setCullMode:(MTLCullMode)m {}
@@ -854,8 +853,40 @@ static void sm_fc_hook(void)
 }
 @end
 
+/* blit/compute encoders: accepted and dropped for now (logged once per selector by the base) */
+@interface SweetMTLStubEncoder : SweetMTLObject
+@end
+@implementation SweetMTLStubEncoder
+- (void)endEncoding {}
+@end
+@interface SweetMTLCommandQueue : SweetMTLObject
+@property (nonatomic, strong) dispatch_queue_t submissionQueue, completionQueue;
+@end
 @implementation SweetMTLCommandBuffer
-- (instancetype)init { self = [super init]; _passes = [NSMutableArray array]; return self; }
+- (instancetype)init { self = [super init]; _passes = [NSMutableArray array]; _scheduled = [NSMutableArray array]; _completed = [NSMutableArray array]; return self; }
+- (void)addScheduledHandler:(void (^)(id))h { if (h) [_scheduled addObject:[h copy]]; }
+- (void)addCompletedHandler:(void (^)(id))h { if (h) [_completed addObject:[h copy]]; }
+- (id)blitCommandEncoder { return [SweetMTLStubEncoder new]; }
+- (id)blitCommandEncoderWithDescriptor:(id)d { return [SweetMTLStubEncoder new]; }
+- (id)computeCommandEncoder { return [SweetMTLStubEncoder new]; }
+- (id)computeCommandEncoderWithDispatchType:(NSUInteger)t { return [SweetMTLStubEncoder new]; }
+- (id)computeCommandEncoderWithDescriptor:(id)d { return [SweetMTLStubEncoder new]; }
+- (BOOL)retainedReferences { return YES; }
+- (void)enqueue {}
+- (void)waitUntilScheduled {}
+- (double)GPUStartTime { return CFAbsoluteTimeGetCurrent(); }
+- (double)GPUEndTime { return CFAbsoluteTimeGetCurrent(); }
+- (double)kernelStartTime { return CFAbsoluteTimeGetCurrent(); }
+- (double)kernelEndTime { return CFAbsoluteTimeGetCurrent(); }
+- (void)sm_runHandlers
+{
+	NSArray *sch = [_scheduled copy], *cmp = [_completed copy];
+	[_scheduled removeAllObjects]; [_completed removeAllObjects];
+	for (void (^h)(id) in sch) h(self);
+	if (!cmp.count) return;
+	dispatch_queue_t q = ((SweetMTLCommandQueue *)_commandQueue).completionQueue ?: dispatch_get_global_queue(0, 0);
+	dispatch_async(q, ^{ for (void (^h)(id) in cmp) h(self); });
+}
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d
 {
 	SweetMTLRenderEncoder *e = [SweetMTLRenderEncoder new];
@@ -901,18 +932,18 @@ static void sm_fc_hook(void)
 			if (_lastJobStatus != 0) _status = 5;
 		}
 	}
+	[self sm_runHandlers];
 }
 - (void)waitUntilCompleted {}
 - (void)presentDrawable:(id)d {}
 - (NSError *)error { return nil; }
-- (void)setLabel:(NSString *)l {}
 @end
 
-@interface SweetMTLCommandQueue : SweetMTLObject
-@end
 @implementation SweetMTLCommandQueue
-- (id)commandBuffer { return [SweetMTLCommandBuffer new]; }
-- (void)setLabel:(NSString *)l {}
+- (id)commandBuffer { SweetMTLCommandBuffer *b = [SweetMTLCommandBuffer new]; b.commandQueue = self; return b; }
+- (id)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
+- (id)commandBufferWithDescriptor:(id)d { return [self commandBuffer]; }
+- (void)insertDebugCaptureBoundary {}
 @end
 
 /*
@@ -1000,7 +1031,7 @@ static void sm_diag_install(void)
 	}
 	self = [super init];
 	slog("SweetMTL: super init -> %p", self);
-	if (self) _smPort = port;
+	if (self) { _smPort = port; sm_device = self; }
 	return self;
 }
 
