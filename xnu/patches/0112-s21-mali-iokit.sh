@@ -52,7 +52,7 @@ void sweet_mali_log_str(const char *s);
 
 #define SM_MAX_BO        256
 #define SM_MAX_BO_BYTES  (15ULL << 20)     /* BOs >= 16 MiB stalled the system (2026-11 notes) */
-#define SM_MAX_TOTAL     (320ULL << 20)    /* wired kernel memory; run46 hung late in a long boot */
+#define SM_MAX_TOTAL     (512ULL << 20)    /* wired kernel memory (the kernel sees 2 GiB) */
 
 enum {
 	kSMGetInfo = 0,
@@ -623,6 +623,10 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		uint64_t uva = args->scalarInput[0], len = args->scalarInput[1], va = args->scalarInput[2];
 		if ((uva & 0xFFF) || (len & 0xFFF) || len == 0 || len > SM_MAX_BO_BYTES || (va & 0xFFF) || va >= (1ULL << 47) ||
 		    sm_total + len > SM_MAX_TOTAL) {
+			static int nl;
+			if (nl++ < 8) {
+				sm_log("import refused: len %llx va %llx total %llu MB", len, va, sm_total >> 20);
+			}
 			ret = kIOReturnBadArgument;
 			break;
 		}

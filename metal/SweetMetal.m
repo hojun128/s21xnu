@@ -1269,7 +1269,16 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 	_height = IOSurfaceGetHeightOfPlane(ios, plane) ?: IOSurfaceGetHeight(ios);
 	_bytesPerRow = IOSurfaceGetBytesPerRowOfPlane(ios, plane) ?: IOSurfaceGetBytesPerRow(ios);
 	void *base = IOSurfaceGetBaseAddressOfPlane(ios, plane) ?: IOSurfaceGetBaseAddress(ios);
-	if (!base || !sm_bo_import(&_store, base, (uint64_t)_bytesPerRow * _height)) return nil;
+	if (!base) return nil;
+	if (_bytesPerRow & 63) {
+		/* unaligned pitch (230x186 RG8 at 480 bytes bus-faulted the lock screen pass, run55): sample an aligned
+		 * copy refreshed before every draw instead of the surface itself */
+		NSUInteger abpr = (_width * sm_pf_bpp(_pixelFormat) + 63) & ~(NSUInteger)63;
+		if (!sm_bo_alloc(&_shadow, abpr * (_height ? _height : 1))) return nil;
+		_hasShadow = true; _src = base; _srcBpr = _bytesPerRow;
+		_store = _shadow; _bytesPerRow = abpr;
+		[self sm_sync];
+	} else if (!sm_bo_import(&_store, base, (uint64_t)_bytesPerRow * _height)) return nil;
 	_surface = ios; CFRetain(ios);
 	_bo = &_store;
 	static int nl; if (nl++ < 8) slog("SweetMTL: iosurface %u %lux%lu bpr %lu fmt %lu -> gpu %llx", IOSurfaceGetID(ios),
