@@ -78,6 +78,17 @@ sm_log(const char *fmt, uint64_t a, uint64_t b, uint64_t c)
 }
 
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
+extern "C" vm_offset_t gPhysBase, gPhysSize;     /* osfmk/arm64/arm_vm_init.c: the physmap */
+
+/* flush_dcache64(phys) goes through phystokv(), which panics for pages outside the physmap (IOSurface/carve-out
+ * pages at 0x93fd00000 killed backboardd's kernel in run46): those are skipped */
+static void
+sm_flush_pa(uint64_t pa, unsigned len)
+{
+	if (pa >= gPhysBase && pa + len <= gPhysBase + gPhysSize) {
+		flush_dcache64(pa, len, TRUE);
+	}
+}
 
 /* The GPU is not cache coherent: clean+invalidate a buffer's pages by physical address. */
 static void
@@ -87,7 +98,7 @@ sm_flush_md(IOMemoryDescriptor *md, uint32_t pages)
 		IOByteCount len = 0;
 		addr64_t pa = md->getPhysicalSegment((IOByteCount)k << 12, &len, kIOMemoryMapperNone);
 		if (pa != 0) {
-			flush_dcache64(pa, page_size, TRUE);
+			sm_flush_pa(pa, (unsigned)page_size);
 		}
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -875,7 +886,7 @@ sweet_mali_blit(IOMemoryDescriptor *srcmd, uint64_t srcoff, uint32_t srcbpr, uin
 		IOByteCount l = 0;
 		uint64_t pa = srcmd->getPhysicalSegment((IOByteCount)o, &l, kIOMemoryMapperNone);
 		if (pa != 0) {
-			flush_dcache64(pa & ~0xFFFULL, 4096, TRUE);
+			sm_flush_pa(pa & ~0xFFFULL, 4096);
 		}
 	}
 	{

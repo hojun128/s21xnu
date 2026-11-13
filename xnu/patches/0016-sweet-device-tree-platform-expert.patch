@@ -30,7 +30,7 @@ diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPl
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,114 @@
 +/*
 + * Minimal device-tree platform expert for Redmi Note 10 Pro (sweet).
 + * Uses XNU's normal platform, power-domain and nub initialization. Hardware
@@ -48,6 +48,7 @@ new file mode 100644
 +
 +public:
 +	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
 +	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
 +	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
 +	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
@@ -57,9 +58,36 @@ new file mode 100644
 +
 +OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
 +
++/* S21: PMU_ALIVE, mapped at start so a panic can reboot without allocating */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++static volatile uint32_t *sweet_pmu;
++
++/*
++ * A panic must not leave the phone on the panic screen (needs a person to reboot it): reboot into the
++ * recovery like the SM-G991N kernel does (inform 0x808/0x80c/0x810, then SWRESET 0x3c00 = 2). The panic log
++ * is already in the pmsg ramoops zone, which survives this warm reset.
++ */
++int
++SweetPlatformExpert::haltRestart(unsigned int type)
++{
++	if ((type == kPEPanicRestartCPU || type == kPEPanicRestartCPUNoCallouts) && sweet_pmu != NULL) {
++		volatile uint32_t *r = sweet_pmu;
++		r[0x808 / 4] = (r[0x808 / 4] & ~0x00FF0000U) | 0x004E0000U;
++		r[0x80c / 4] = 0x12345604U;
++		r[0x810 / 4] = 0xFFU;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		r[0x3c00 / 4] = 0x2U;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (;;) {
++		}
++	}
++	return IODTPlatformExpert::haltRestart(type);
++}
++
 +bool
 +SweetPlatformExpert::start(IOService *provider)
 +{
++	sweet_pmu = (volatile uint32_t *)ml_io_map(0x15860000U, 0x4000);
 +	IOLog("SWEET: starting device-tree platform expert\n");
 +	if (!IODTPlatformExpert::start(provider)) {
 +		return false;
