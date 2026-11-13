@@ -1552,10 +1552,20 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 			}
 			slog("SweetMTL: pass %u draws (%s) load=%d clear=%d blend0=%u vertex=%x fragment=%x", e->_ndraw, generic ? "translated" : "fixed", e.load, e.clear, e->_draws[0].blend_on ? (e->_draws[0].rgb_sf << 8 | e->_draws[0].rgb_df) : 0, vs, _lastJobStatus);
 			if (generic && _lastJobStatus && _lastJobStatus != 0xFFFCu) {
-				/* fragment fault: quarantine every fragment shader of this pass (the GPU was reset by the kernel) */
+				/* fragment fault: describe the pass once, then quarantine the texturing fragment shaders of this pass
+				 * (draws without textures never faulted; the GPU was reset by the kernel) */
+				static int ndesc;
+				if (ndesc++ < 2) {
+					for (uint32_t i = 0; i < e->_ndraw; i++) {
+						const sm_drawrec *o = &e->_draws[i];
+						slog("SweetMTL: fd%u %.60s nt=%u ns=%u n=%u bl=%u", i, o->fs ? o->fs->name : "-", o->ntex, o->nsmp, o->vcount, o->blend_on);
+						for (uint32_t k = 0; k < o->ntex; k++)
+							if (o->tex[k].va) slog("SweetMTL:  t%u %ux%u pf%u st%u va%llx imp%u", k, o->tex[k].w, o->tex[k].h, o->tex[k].pf, o->tex[k].stride, o->tex[k].va, o->tex[k].imp);
+					}
+				}
 				for (uint32_t i = 0; i < e->_ndraw; i++) {
 					sm_shader *f = (sm_shader *)e->_draws[i].fs;
-					if (f && !f->bad) { f->bad = 1; slog("SweetMTL: quarantined %s after fragment status %x", f->name, _lastJobStatus); }
+					if (f && !f->bad && e->_draws[i].ntex) { f->bad = 1; slog("SweetMTL: quarantined %s after fragment status %x", f->name, _lastJobStatus); }
 				}
 			}
 			static int nbis;
@@ -1599,7 +1609,7 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 			{
 				/* late thumbnails of full-screen targets: a normal boot reaches the lock screen after ~18 min */
 				static int nlate;
-				static const double at[3] = { 600, 800, 1000 };
+				static const double at[3] = { 1000, 1150, 1300 };   /* lock screen content starts ~900 s */
 				struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
 				if (nlate < 3 && ts.tv_sec >= at[nlate] && e.target.width == 1125 && e.target.bo && e.target.bo->cpu) {
 					nlate++;
