@@ -130,6 +130,38 @@ static void sm_capture(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, u
 	slot++;
 }
 
+/* Thumbnail through the log (the rootfs is a RAM overlay, so files do not survive): 1/12 scale, RGB332,
+ * base64 in 112-char lines "THn <seq> <data>"; the Mac rebuilds a PNG from the pstore log. */
+static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uint32_t id)
+{
+	if (!c) return;
+	const uint32_t S = 12, w = W / S, h = H / S;
+	uint32_t n = w * h; uint8_t *px = malloc(n);
+	for (uint32_t y = 0; y < h; y++)
+		for (uint32_t x = 0; x < w; x++) {
+			uint32_t r = 0, g = 0, b = 0;
+			for (uint32_t k = 0; k < 4; k++) {   /* average 4 samples in the cell */
+				const uint8_t *q = c + (size_t)(y * S + (k >> 1) * 6) * bpr + (size_t)(x * S + (k & 1) * 6) * 4;
+				b += q[0]; g += q[1]; r += q[2];
+			}
+			r >>= 2; g >>= 2; b >>= 2;
+			px[y * w + x] = (uint8_t)((r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6));
+		}
+	slog("SweetMTL: THUMB %u %ux%u rgb332 %u bytes", id, w, h, n);
+	static const char *B = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	char line[140]; uint32_t seq = 0;
+	for (uint32_t o = 0; o < n; o += 84, seq++) {
+		int L = snprintf(line, sizeof line, "TH%u %u ", id, seq);
+		for (uint32_t i = o; i < o + 84 && i < n; i += 3) {
+			uint32_t v = (uint32_t)px[i] << 16 | (i + 1 < n ? (uint32_t)px[i + 1] << 8 : 0) | (i + 2 < n ? px[i + 2] : 0);
+			line[L++] = B[(v >> 18) & 63]; line[L++] = B[(v >> 12) & 63]; line[L++] = B[(v >> 6) & 63]; line[L++] = B[v & 63];
+		}
+		line[L] = 0;
+		slog("%s", line);
+	}
+	free(px);
+}
+
 static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 {
 	uint64_t in[3] = { slot, jc, 2000 }, out[1] = { 0xdead }; uint32_t oc = 1;
@@ -1241,6 +1273,7 @@ static void sm_fc_hook(void)
 					if (gy == gx) px[gy] = v;
 				}
 				sm_capture(c, W, H, bpr, (uint32_t)e.target.pixelFormat, (uint32_t)nsamp);
+				if (nsamp == 1 || nsamp == 3) sm_thumb(c, W, H, bpr, (uint32_t)nsamp);
 				slog("SweetMTL: target %ux%u fmt %lu nz=%u/16 hash=%08x diag %08x %08x %08x %08x", W, H, (unsigned long)e.target.pixelFormat, nz, hsh, px[0], px[1], px[2], px[3]);
 			}
 			if (_lastJobStatus != 0 || vs != 0) _status = 5;
