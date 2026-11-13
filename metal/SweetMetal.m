@@ -1184,6 +1184,39 @@ static void sm_trace_install(Class me)
 - (id)newDefaultLibrary { return [SweetMTLLibrary new]; }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d { return [[SweetMTLTexture alloc] initWithDevice:self descriptor:d]; }
 - (uint64_t)registryID { return 0x53574545; }
+- (NSString *)vendorName { return @"ARM"; }
+- (NSUInteger)maxTextureWidth2D { return 8192; }
+- (NSUInteger)maxTextureHeight2D { return 8192; }
+- (NSUInteger)maxTextureWidth3D { return 2048; }
+- (NSUInteger)maxTextureHeight3D { return 2048; }
+- (NSUInteger)maxTextureDepth3D { return 2048; }
+- (NSUInteger)maxTextureDimensionCube { return 8192; }
+- (NSUInteger)maxTextureArrayLayers { return 2048; }
+- (NSUInteger)maxColorAttachments { return 8; }
+- (NSUInteger)maxFragmentTextures { return 16; }
+- (NSUInteger)maxVertexTextures { return 16; }
+- (NSUInteger)maxFragmentSamplers { return 16; }
+- (NSUInteger)maxVertexSamplers { return 16; }
+- (NSUInteger)maxFragmentBuffers { return 16; }
+- (NSUInteger)maxVertexBuffers { return 16; }
+- (NSUInteger)maxVertexAttributes { return 16; }
+- (NSUInteger)maxThreadgroupMemoryLength { return 16384; }
+- (NSUInteger)minConstantBufferAlignmentBytes { return 16; }
+- (NSUInteger)minBufferNoCopyAlignmentBytes { return 16384; }
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes { return 16; }
+- (NSUInteger)iosurfaceTextureAlignmentBytes { return 16; }
+- (NSUInteger)linearTextureAlignmentBytes { return 64; }
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)f { return 64; }
+- (BOOL)sm_featureSet:(NSUInteger)fs
+{
+	/* iOS GPU families 1-3 (no imageblocks / tile shaders, which the translator cannot do yet) */
+	return fs <= 14 && fs != 11;
+}
+- (BOOL)supportsFeatureSet:(NSUInteger)fs { return [self sm_featureSet:fs]; }
+- (BOOL)deviceSupportsFeatureSet:(NSUInteger)fs { return [self sm_featureSet:fs]; }
+- (BOOL)deviceOrFeatureProfileSupportsFeatureSet:(NSUInteger)fs { return [self sm_featureSet:fs]; }
+- (BOOL)supportsFamily:(NSInteger)fam { return fam == 1001 || fam == 1002 || fam == 1003 || fam == 3001; }
+- (BOOL)supportsTextureSampleCount:(NSUInteger)n { return n == 1 || n == 4; }
 - (BOOL)isLowPower { return NO; }
 - (BOOL)isHeadless { return NO; }
 - (BOOL)isRemovable { return NO; }
