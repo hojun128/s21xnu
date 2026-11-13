@@ -26,11 +26,22 @@ extern kern_return_t IOConnectCallMethod(io_connect_t, uint32_t, const uint64_t 
 
 static io_connect_t sm_conn;
 
+/* Lines worth keeping are also collected here and replayed at the end of a test run: the 128 KiB pmsg ring
+ * otherwise loses them under the thumbnails (run53). */
+static char sm_rep[12288]; static size_t sm_rep_len;
+static const char *const sm_rep_keys[] = { " fd", "  t", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
+	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
 	va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
 	fprintf(stderr, "%s\n", b);
+	for (size_t i = 0; i < sizeof sm_rep_keys / sizeof *sm_rep_keys; i++) {
+		if (!strstr(b, sm_rep_keys[i])) continue;
+		size_t n = strlen(b);
+		if (sm_rep_len + n + 2 < sizeof sm_rep) { memcpy(sm_rep + sm_rep_len, b, n); sm_rep_len += n; sm_rep[sm_rep_len++] = '\n'; sm_rep[sm_rep_len] = 0; }
+		break;
+	}
 	if (!sm_conn) {
 		io_service_t s = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("SweetMali"));
 		if (s) IOServiceOpen(s, mach_task_self(), 0, &sm_conn);
@@ -1617,6 +1628,11 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 					sm_thumb(e.target.bo->cpu, (uint32_t)e.target.width, (uint32_t)e.target.height, (uint32_t)e.target.bytesPerRow, (uint32_t)(10 + nlate));
 					if (nlate == 3) {
 						/* got what the test needs: end the run now instead of waiting for the autorec timer */
+						/* replay the collected report last, so it is the newest part of the ring */
+						char *save = strdup(sm_rep), *line, *ctx = NULL;
+						sm_rep_len = sizeof sm_rep;   /* stop collecting while replaying */
+						for (line = strtok_r(save, "\n", &ctx); line; line = strtok_r(NULL, "\n", &ctx)) slog("R %s", line);
+						free(save);
 						slog("SweetMTL: last thumb taken, rebooting to recovery");
 						IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
 					}
