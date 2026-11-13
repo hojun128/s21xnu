@@ -207,7 +207,8 @@ static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uin
 static bool sm_gpu_off;   /* a job timed out (or the kernel fenced the GPU): no more GPU work this boot */
 static char sm_off_reason[160];   /* why, repeated in every "alive" line so a wrapped pmsg log still shows it */
 static char sm_cur_pass[96];      /* what was being drawn */
-static char sm_fail_log[240];     /* first GPU failures, also repeated in the alive lines */
+static char sm_fail_log[240];
+static id sm_last_target;         /* last full-screen render target (thumbnails are timed, an idle lock screen draws nothing) */     /* first GPU failures, also repeated in the alive lines */
 static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 {
 	if (sm_gpu_off) return 0xFFFCu;
@@ -1664,27 +1665,7 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, e->_draws, e->_ndraw, &v0, e.load);
 				slog("SweetMTL: bisect pass%d full replay %x/%x", nbis, v0, f0);
 			}
-			{
-				/* late thumbnails of full-screen targets: a normal boot reaches the lock screen after ~18 min */
-				static int nlate;
-				static const double at[3] = { 1000, 1150, 1300 };   /* lock screen content starts ~900 s */
-				struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-				if (nlate < 3 && ts.tv_sec >= at[nlate] && e.target.width == 1125 && e.target.bo && e.target.bo->cpu) {
-					nlate++;
-					slog("SweetMTL: late thumb %d at %lds fragment=%x gpuoff=%d", nlate, (long)ts.tv_sec, _lastJobStatus, sm_gpu_off);
-					sm_thumb(e.target.bo->cpu, (uint32_t)e.target.width, (uint32_t)e.target.height, (uint32_t)e.target.bytesPerRow, (uint32_t)(10 + nlate));
-					if (nlate == 3) {
-						/* got what the test needs: end the run now instead of waiting for the autorec timer */
-						/* replay the collected report last, so it is the newest part of the ring */
-						char *save = strdup(sm_rep), *line, *ctx = NULL;
-						sm_rep_len = sizeof sm_rep;   /* stop collecting while replaying */
-						for (line = strtok_r(save, "\n", &ctx); line; line = strtok_r(NULL, "\n", &ctx)) slog("R %s", line);
-						free(save);
-						slog("SweetMTL: last thumb taken, rebooting to recovery");
-						IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
-					}
-				}
-			}
+			if (e.target.width == 1125 && e.target.bo && e.target.bo->cpu) sm_last_target = e.target;   /* for the timed thumbnails */
 			static int ndiag;
 			if (generic && !_lastJobStatus && ndiag++ < 0) {
 				/* coverage check: replay each draw alone over a cleared target, once with the green test shader and once
@@ -1897,7 +1878,29 @@ static void *sm_watchdog(void *arg)
 			    sm_off_reason[0] ? " OFF: " : "", sm_off_reason);
 			if (sm_fail_log[0]) slog("SweetMTL: fails: %s", sm_fail_log);
 		}
-		if (c && c == last && dumps < 2) { slog("SweetMTL: STALL at commit %u, threads:", c); sm_dump_threads(); dumps++; }
+		{
+			/* timed thumbnails of the last full-screen frame; a normal boot reaches the lock screen after ~15 min */
+			static int nlate;
+			static const long at[3] = { 1000, 1150, 1300 };
+			struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+			id tg = sm_last_target;
+			if (nlate < 3 && ts.tv_sec >= at[nlate] && tg) {
+				nlate++;
+				SweetMTLTexture *tx = tg;
+				slog("SweetMTL: late thumb %d at %lds commits=%u gpuoff=%d", nlate, (long)ts.tv_sec, c, sm_gpu_off);
+				sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, (uint32_t)(10 + nlate));
+				if (nlate == 3) {
+					/* replay the collected report last, so it is the newest part of the ring, then end the run */
+					char *save = strdup(sm_rep), *line, *ctx = NULL;
+					sm_rep_len = sizeof sm_rep;
+					for (line = strtok_r(save, "\n", &ctx); line; line = strtok_r(NULL, "\n", &ctx)) slog("R %s", line);
+					free(save);
+					slog("SweetMTL: last thumb taken, rebooting to recovery");
+					IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
+				}
+			}
+		}
+		if (c && c == last && dumps < 0) { slog("SweetMTL: STALL at commit %u, threads:", c); sm_dump_threads(); dumps++; }
 		last = c;
 	}
 	return NULL;
