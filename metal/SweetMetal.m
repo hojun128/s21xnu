@@ -1111,6 +1111,19 @@ static void sm_fc_hook(void)
 				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, n, &vs);
 			}
 			slog("SweetMTL: pass %u draws (%s) vertex=%x fragment=%x", e->_ndraw, generic ? "translated" : "fixed", vs, _lastJobStatus);
+			static int nsamp;
+			if (nsamp++ < 16) {
+				/* sample a 4x4 grid of the target: proves the GPU wrote real content */
+				const uint8_t *c = e.target.bo->cpu; uint32_t W = (uint32_t)e.target.width, H = (uint32_t)e.target.height, bpr = (uint32_t)e.target.bytesPerRow;
+				uint32_t nz = 0, hsh = 2166136261u, px[4] = {0};
+				for (uint32_t gy = 0; gy < 4 && c; gy++) for (uint32_t gx = 0; gx < 4; gx++) {
+					uint32_t v; memcpy(&v, c + (uint64_t)((2 * gy + 1) * H / 8) * bpr + ((2 * gx + 1) * W / 8) * 4, 4);
+					if (v) nz++;
+					hsh = (hsh ^ v) * 16777619u;
+					if (gy == gx) px[gy] = v;
+				}
+				slog("SweetMTL: target %ux%u fmt %lu nz=%u/16 hash=%08x diag %08x %08x %08x %08x", W, H, (unsigned long)e.target.pixelFormat, nz, hsh, px[0], px[1], px[2], px[3]);
+			}
 			if (_lastJobStatus != 0 || vs != 0) _status = 5;
 		} else if (e.clear) {
 			_lastJobStatus = sm_clear(&desc, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
@@ -1362,6 +1375,19 @@ static void *sm_watchdog(void *arg)
 }
 - (uint64_t)registryID { return 0x53574545; }
 - (NSString *)vendorName { return @"ARM"; }
+/* render targets are RGBA8/BGRA8 only for now: keep CoreAnimation off the 10-bit extended-range formats */
+- (BOOL)supportsExtendedXR10Formats { return NO; }
+- (BOOL)supportsPublicXR10Formats { return NO; }
+- (BOOL)supportsBGR10A2 { return NO; }
+- (BOOL)supportsRGBA10A2Gamma { return NO; }
+- (BOOL)supportsYCBCRPackedFormats12 { return NO; }
+- (BOOL)supportsExtendedYUVFormats { return NO; }
+- (BOOL)supportsCompressedTextureViewSPI { return NO; }
+- (BOOL)supportsMemorylessRenderTargets { return NO; }
+- (BOOL)supportsProgrammableBlending { return NO; }
+- (BOOL)supportsImageBlocks { return NO; }
+- (BOOL)supportsTileShaders { return NO; }
+- (BOOL)supportsRasterOrderGroups { return NO; }
 - (NSUInteger)maxTextureWidth2D { return 8192; }
 - (NSUInteger)maxTextureHeight2D { return 8192; }
 - (NSUInteger)maxTextureWidth3D { return 2048; }
