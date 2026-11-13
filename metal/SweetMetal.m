@@ -1434,6 +1434,40 @@ static void sm_fc_hook(void)
 				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, e->_draws, e->_ndraw, &v0, e.load);
 				slog("SweetMTL: bisect pass%d full replay %x/%x", nbis, v0, f0);
 			}
+			static int ndiag;
+			if (generic && !_lastJobStatus && ndiag++ < 3) {
+				/* coverage check: replay each draw alone over a cleared target, once with the green test shader and once
+				 * as translated; count changed pixels and the most common written values */
+				const uint8_t *c = e.target.bo->cpu; uint32_t W = (uint32_t)e.target.width, H = (uint32_t)e.target.height, bpr = (uint32_t)e.target.bytesPerRow;
+				for (uint32_t i = 0; i < e->_ndraw && c; i++) {
+					uint32_t cnt[2] = {0}, top[2][3] = {{0}}, topn[2][3] = {{0}}, st[2] = {0}, c00[2] = {0}, mid[2] = {0};
+					for (int mode = 0; mode < 2; mode++) {
+						sm_drawrec one = e->_draws[i];
+						if (mode == 0) one.fs = NULL;
+						uint32_t vv = 0;
+						st[mode] = sm_pass(&desc, &heap, e.target.bo->gpu, W, H, bpr, e.packed, bgra, &one, 1, &vv, false);
+						uint32_t ref; memcpy(&ref, c, 4);
+						uint32_t clr = 0; bool clrset = false;
+						for (uint32_t y = 0; y < H; y += 2) for (uint32_t x = 0; x < W; x += 2) {
+							uint32_t v; memcpy(&v, c + (uint64_t)y * bpr + x * 4, 4);
+							if (!clrset) { clr = v; clrset = true; c00[mode] = v; }
+							if (y == (H / 2 & ~1u) && x == (W / 2 & ~1u)) mid[mode] = v;
+							(void)ref;
+							if (v == clr) continue;
+							cnt[mode]++;
+							int j; for (j = 0; j < 3 && topn[mode][j] && top[mode][j] != v; j++);
+							if (j < 3) { if (!topn[mode][j]) top[mode][j] = v; topn[mode][j]++; }
+						}
+					}
+					const sm_drawrec *o = &e->_draws[i];
+					slog("SweetMTL: cover pass%d draw%u fs=%s blend=%u wmask=%x sc=%u: green %x %u px c00 %08x mid %08x | real %x %u px c00 %08x mid %08x top %08x:%u %08x:%u %08x:%u", ndiag, i,
+					    o->fs ? o->fs->name : "-", o->blend_on, o->wmask, o->has_scissor, st[0], cnt[0], c00[0], mid[0], st[1], cnt[1], c00[1], mid[1],
+					    top[1][0], topn[1][0], top[1][1], topn[1][1], top[1][2], topn[1][2]);
+				}
+				uint32_t v0 = 0;
+				sm_pass(&desc, &heap, e.target.bo->gpu, W, H, bpr, e.packed, bgra, e->_draws, e->_ndraw, &v0, e.load);
+				slog("SweetMTL: cover pass%d clear %08x first px after replay %08x", ndiag, e.packed, c ? *(const uint32_t *)c : 0);
+			}
 			static int nsamp;
 			if (nsamp++ < 16) {
 				/* sample a 4x4 grid of the target: proves the GPU wrote real content */
