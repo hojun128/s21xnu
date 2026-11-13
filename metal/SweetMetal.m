@@ -1715,8 +1715,25 @@ static void *sm_watchdog(void *arg)
 	uint32_t _smPort;
 }
 
+/* Which processes get our Metal device. sweetmetal=2: the render server only (app content is composited by
+ * backboardd; SpringBoard's own Metal users such as SiriUICore crashed on shaders we cannot translate, run44);
+ * sweetmetal=4: every process. */
+static bool sm_process_allowed(void)
+{
+	static int all = -1;
+	if (all < 0) {
+		char ba[1024] = {0}; size_t bl = sizeof(ba) - 1;
+		bool ok = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0;
+		all = ok && strstr(ba, "sweetmetal=4") ? 2 : ok && strstr(ba, "sweetmetal=2") ? 1 : 0;
+	}
+	const char *pn = getprogname();
+	return pn && (!strcmp(pn, "malitest") || (all >= 1 && !strcmp(pn, "backboardd")) || all == 2);
+}
+
 + (void)load
 {
+	/* refused processes stay silent: their crash reports filled the 128 KiB pmsg log (run47, AegirPoster) */
+	if (!sm_process_allowed()) return;
 	sm_fc_hook();
 	if (getprogname() && strcmp(getprogname(), "malitest")) { sm_diag_install(); sm_trace_install(self); }
 	slog("SweetMTL: +load in %s, super=%s", getprogname() ? getprogname() : "?", class_getName(class_getSuperclass(self)));
@@ -1725,23 +1742,13 @@ static void *sm_watchdog(void *arg)
 - (instancetype)initWithAcceleratorPort:(uint32_t)port
 {
 	const char *pn = getprogname();
-	slog("SweetMTL: initWithAcceleratorPort:%u in %s", port, pn ? pn : "?");
-	static int all = -1;
-	if (all < 0) {
-		char ba[1024] = {0}; size_t bl = sizeof(ba) - 1;
-		bool ok = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0;
-		/* sweetmetal=2: the render server only (app content is composited by backboardd; SpringBoard's own Metal
-		 * users such as SiriUICore crashed on shaders we cannot translate, run44); sweetmetal=4: every process */
-		all = ok && strstr(ba, "sweetmetal=4") ? 2 : ok && strstr(ba, "sweetmetal=2") ? 1 : 0;
-	}
-	bool allowed = pn && (!strcmp(pn, "malitest") || (all >= 1 && !strcmp(pn, "backboardd")) || all == 2);
-	if (!allowed) {
-		slog("SweetMTL: no Metal device for %s", pn ? pn : "?");
+	if (!sm_process_allowed()) {
 		/* never let ARC release this half-built object: _MTLDevice -dealloc on an uninitialised device crashed
 		 * inside Metal (run45, SpringBoard). One small leak per refused process. */
 		(void)CFBridgingRetain(self);
 		return nil;
 	}
+	slog("SweetMTL: initWithAcceleratorPort:%u in %s", port, pn ? pn : "?");
 	self = [super init];
 	slog("SweetMTL: super init -> %p", self);
 	if (self) {
