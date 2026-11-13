@@ -8,6 +8,7 @@
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <mach/mach.h>
@@ -48,7 +49,7 @@ extern kern_return_t IOConnectMapMemory64(io_connect_t, uint32_t, task_port_t, m
 #define PAN_ARCH 9
 #include "genxml/gen_macros.h"
 
-typedef struct { uint64_t handle, gpu; uint8_t *cpu; uint64_t size; } sm_bo;
+typedef struct { uint64_t handle, gpu; uint8_t *cpu; uint64_t size; uint32_t imported; } sm_bo;
 static uint64_t sm_next_va = 0x30000000ULL;
 
 static bool sm_bo_alloc(sm_bo *bo, uint64_t size)
@@ -65,6 +66,41 @@ static bool sm_bo_alloc(sm_bo *bo, uint64_t size)
 	bo->handle = out[0]; bo->gpu = sm_next_va; bo->cpu = (uint8_t *)ua; bo->size = size;
 	sm_next_va += size + 0x10000;
 	return true;
+}
+
+extern kern_return_t IOConnectUnmapMemory64(io_connect_t, uint32_t, task_port_t, mach_vm_address_t);
+static void sm_bo_free(sm_bo *bo)
+{
+	if (!sm_conn || !bo->handle) return;
+	if (!bo->imported && bo->cpu) IOConnectUnmapMemory64(sm_conn, (uint32_t)bo->handle, mach_task_self(), (mach_vm_address_t)bo->cpu);
+	uint64_t in[1] = { bo->handle }; uint32_t oc = 0;
+	IOConnectCallMethod(sm_conn, 4, in, 1, NULL, 0, NULL, &oc, NULL, NULL);
+	memset(bo, 0, sizeof *bo);
+}
+/* Wire a range of this process's memory (an IOSurface) and map it into the GPU address space. */
+static bool sm_bo_import(sm_bo *bo, void *uva, uint64_t len)
+{
+	if (!sm_conn) return false;
+	uint64_t a0 = (uint64_t)uva & ~0x3FFFULL, a1 = ((uint64_t)uva + len + 0x3FFF) & ~0x3FFFULL;
+	uint64_t in[3] = { a0, a1 - a0, sm_next_va }, out[1] = { 0 }; uint32_t oc = 1;
+	kern_return_t kr = IOConnectCallMethod(sm_conn, 8, in, 3, NULL, 0, out, &oc, NULL, NULL);
+	if (kr) { static int nl; if (nl++ < 6) slog("SweetMTL: import %llx+%llx failed %x", a0, a1 - a0, kr); return false; }
+	bo->handle = out[0]; bo->gpu = sm_next_va + ((uint64_t)uva - a0); bo->cpu = uva; bo->size = len; bo->imported = 1;
+	sm_next_va += (a1 - a0) + 0x10000;
+	return true;
+}
+/* transient bytes (setVertexBytes & co): one ring, reused every pass */
+static uint64_t sm_ring_put(const void *p, uint64_t len, uint8_t **cpu_out)
+{
+	static sm_bo ring; static bool have; static uint64_t off;
+	if (!have) have = sm_bo_alloc(&ring, 8u << 20);
+	if (!have || len > ring.size) return 0;
+	off = (off + 255) & ~255ULL;
+	if (off + len > ring.size) off = 0;
+	if (p) memcpy(ring.cpu + off, p, len);
+	if (cpu_out) *cpu_out = ring.cpu + off;
+	uint64_t va = ring.gpu + off; off += len;
+	return va;
 }
 
 static uint32_t sm_submit(uint32_t slot, uint64_t jc)
@@ -354,6 +390,8 @@ static const sm_shader *sm_find(NSString *name)
 typedef struct {
 	const sm_shader *vs, *fs;
 	uint32_t vcount, vstart;
+	uint64_t index_va; uint32_t index_type; int32_t base_vertex;
+	uint32_t sc_x0, sc_y0, sc_x1, sc_y1, has_scissor;
 	uint64_t buf[31];                /* GPU VA bound at each Metal buffer index */
 	struct { uint32_t fmt, off, bidx; } attr[16];
 	uint32_t stride[31];
@@ -525,7 +563,8 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		uint32_t nvar = vs->nvar; if (fs && fs->nvar > nvar) nvar = fs->nvar;
 		void *vj = P;
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, PRIMITIVE, cfg) {
-			cfg.draw_mode = MALI_DRAW_MODE_TRIANGLES; cfg.index_count = r->vcount; cfg.base_vertex_offset = r->vstart;
+			cfg.draw_mode = MALI_DRAW_MODE_TRIANGLES; cfg.index_count = r->vcount;
+			cfg.index_type = r->index_type; cfg.base_vertex_offset = r->index_type ? r->base_vertex : (int32_t)r->vstart;
 			cfg.allow_rotating_primitives = true; cfg.secondary_shader = sec;
 		}
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, INSTANCE_COUNT, cfg) { cfg.count = 1; }
@@ -535,10 +574,11 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		}
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, TILER, cfg) { cfg.address = D + OFF_TCTX; }
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, SCISSOR, cfg) {
-			cfg.scissor_minimum_x = 0; cfg.scissor_minimum_y = 0; cfg.scissor_maximum_x = w - 1; cfg.scissor_maximum_y = h - 1;
+			if (r->has_scissor) { cfg.scissor_minimum_x = r->sc_x0; cfg.scissor_minimum_y = r->sc_y0; cfg.scissor_maximum_x = r->sc_x1; cfg.scissor_maximum_y = r->sc_y1; }
+			else { cfg.scissor_minimum_x = 0; cfg.scissor_minimum_y = 0; cfg.scissor_maximum_x = w - 1; cfg.scissor_maximum_y = h - 1; }
 		}
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, PRIMITIVE_SIZE, cfg) {}
-		pan_section_pack(vj, MALLOC_VERTEX_JOB, INDICES, cfg) { cfg.address = 0; }
+		pan_section_pack(vj, MALLOC_VERTEX_JOB, INDICES, cfg) { cfg.address = r->index_va; }
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, DRAW, cfg) {
 			cfg.allow_forward_pixel_to_kill = true; cfg.allow_forward_pixel_to_be_killed = true;
 			cfg.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY; cfg.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
@@ -621,6 +661,7 @@ static __weak id sm_device;
 	if (p) memcpy(_bo.cpu, p, len);
 	return self;
 }
+- (void)dealloc { sm_bo_free(&_bo); }
 - (void *)contents { return _bo.cpu; }
 - (uint64_t)gpuAddress { return _bo.gpu; }
 - (MTLStorageMode)storageMode { return MTLStorageModeShared; }
@@ -751,15 +792,38 @@ static void sm_fc_hook(void)
 @property (nonatomic, readonly) sm_bo *bo;
 @property (nonatomic, weak) id device;
 @end
-@implementation SweetMTLTexture { sm_bo _store; }
+@implementation SweetMTLTexture { sm_bo _store; IOSurfaceRef _surface; }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d
 {
 	self = [super init];
 	_device = dev; _width = d.width; _height = d.height; _pixelFormat = d.pixelFormat; _bytesPerRow = _width * 4;
-	if (!sm_bo_alloc(&_store, _bytesPerRow * _height)) { slog("SweetMTL: texture bo alloc failed"); return nil; }
+	if (!sm_bo_alloc(&_store, _bytesPerRow * _height)) {
+		static int nl; if (nl++ < 6) slog("SweetMTL: texture bo alloc failed %lux%lu fmt %lu", (unsigned long)_width, (unsigned long)_height, (unsigned long)_pixelFormat);
+		return nil;
+	}
 	_bo = &_store;
 	return self;
 }
+- (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)ios plane:(NSUInteger)plane
+{
+	self = [super init];
+	_device = dev; _pixelFormat = d.pixelFormat;
+	_width = IOSurfaceGetWidthOfPlane(ios, plane) ?: IOSurfaceGetWidth(ios);
+	_height = IOSurfaceGetHeightOfPlane(ios, plane) ?: IOSurfaceGetHeight(ios);
+	_bytesPerRow = IOSurfaceGetBytesPerRowOfPlane(ios, plane) ?: IOSurfaceGetBytesPerRow(ios);
+	void *base = IOSurfaceGetBaseAddressOfPlane(ios, plane) ?: IOSurfaceGetBaseAddress(ios);
+	if (!base || !sm_bo_import(&_store, base, (uint64_t)_bytesPerRow * _height)) return nil;
+	_surface = ios; CFRetain(ios);
+	_bo = &_store;
+	static int nl; if (nl++ < 8) slog("SweetMTL: iosurface %u %lux%lu bpr %lu fmt %lu -> gpu %llx", IOSurfaceGetID(ios),
+	    (unsigned long)_width, (unsigned long)_height, (unsigned long)_bytesPerRow, (unsigned long)_pixelFormat, _store.gpu);
+	return self;
+}
+- (void)dealloc { sm_bo_free(&_store); if (_surface) CFRelease(_surface); }
+- (IOSurfaceRef)iosurface { return _surface; }
+- (NSUInteger)iosurfacePlane { return 0; }
+- (MTLStorageMode)storageMode { return MTLStorageModeShared; }
+- (MTLTextureUsage)usage { return MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget; }
 - (uint32_t)maliFormat
 {
 	bool bgra = _pixelFormat == MTLPixelFormatBGRA8Unorm;
@@ -837,6 +901,9 @@ static void sm_fc_hook(void)
 	__unsafe_unretained SweetMTLSampler *_smp[8];
 	sm_drawrec _draws[32];
 	uint32_t _ndraw;
+	uint64_t _bufBase[31];
+	MTLScissorRect _scissor;
+	BOOL _hasScissor;
 }
 - (instancetype)init { self = [super init]; _keep = [NSMutableArray array]; return self; }
 - (void)endEncoding {}
@@ -846,12 +913,12 @@ static void sm_fc_hook(void)
 - (void)setFrontFacingWinding:(MTLWinding)w {}
 - (void)setVertexBuffer:(id)buf offset:(NSUInteger)off atIndex:(NSUInteger)i
 {
-	if (i < 31) { _buf[i] = buf ? [(SweetMTLBuffer *)buf gpuAddress] + off : 0; if (buf) [_keep addObject:buf]; }
+	if (i < 31) { _bufBase[i] = buf ? [(SweetMTLBuffer *)buf gpuAddress] : 0; _buf[i] = buf ? _bufBase[i] + off : 0; if (buf) [_keep addObject:buf]; }
 }
 - (void)setVertexBytes:(const void *)p length:(NSUInteger)len atIndex:(NSUInteger)i
 {
-	SweetMTLBuffer *b = [[SweetMTLBuffer alloc] initWithLength:len bytes:p];
-	if (b) { [_keep addObject:b]; if (i < 31) _buf[i] = [b gpuAddress]; }
+	uint64_t va = sm_ring_put(p, len, NULL);
+	if (i < 31) { _bufBase[i] = 0; _buf[i] = va; }
 }
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i
 {
@@ -862,15 +929,64 @@ static void sm_fc_hook(void)
 	if (i < 8) { _smp[i] = smp; if (smp) [_keep addObject:smp]; }
 }
 - (void)setFragmentBuffer:(id)buf offset:(NSUInteger)off atIndex:(NSUInteger)i { [self setVertexBuffer:buf offset:off atIndex:i]; }
+- (void)setVertexBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i { if (i < 31 && _bufBase[i]) _buf[i] = _bufBase[i] + off; }
+- (void)setFragmentBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i { [self setVertexBufferOffset:off atIndex:i]; }
 - (void)setFragmentBytes:(const void *)p length:(NSUInteger)len atIndex:(NSUInteger)i { [self setVertexBytes:p length:len atIndex:i]; }
+- (void)setScissorRect:(MTLScissorRect)sr
+{
+	_scissor = sr; _hasScissor = YES;
+}
+- (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count instanceCount:(NSUInteger)ic
+{
+	if (ic == 1) [self drawPrimitives:type vertexStart:start vertexCount:count];
+}
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)it indexBuffer:(id)ib indexBufferOffset:(NSUInteger)off
+{
+	sm_drawrec *r = [self sm_record:type];
+	if (!r) return;
+	r->vcount = (uint32_t)count;
+	r->index_type = it == MTLIndexTypeUInt16 ? 2 : 3;
+	r->index_va = (uint64_t)[ib gpuAddress] + off;
+	if (ib) [_keep addObject:ib];
+	r->base_vertex = 0;
+	_ndraw++;
+}
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)it indexBuffer:(id)ib indexBufferOffset:(NSUInteger)off instanceCount:(NSUInteger)ic
+{
+	if (ic == 1) [self drawIndexedPrimitives:type indexCount:count indexType:it indexBuffer:ib indexBufferOffset:off];
+}
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)it indexBuffer:(id)ib indexBufferOffset:(NSUInteger)off instanceCount:(NSUInteger)ic baseVertex:(NSInteger)bv baseInstance:(NSUInteger)bi
+{
+	if (ic != 1) return;
+	[self drawIndexedPrimitives:type indexCount:count indexType:it indexBuffer:ib indexBufferOffset:off];
+	if (_ndraw && _draws[_ndraw - 1].index_va) _draws[_ndraw - 1].base_vertex = (int32_t)bv;
+}
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
 {
-	if (type != MTLPrimitiveTypeTriangle) { slog("SweetMTL: draw type %lu not supported yet", (unsigned long)type); return; }
-	if (_ndraw >= 32) { slog("SweetMTL: too many draws in one pass"); return; }
+	sm_drawrec *r = [self sm_record:type];
+	if (!r) return;
+	r->vcount = (uint32_t)count; r->vstart = (uint32_t)start;
+	_ndraw++;
+}
+- (sm_drawrec *)sm_record:(MTLPrimitiveType)type
+{
+	if (type != MTLPrimitiveTypeTriangle) {
+		static int nl; if (nl++ < 4) slog("SweetMTL: draw type %lu not supported yet", (unsigned long)type);
+		return NULL;
+	}
+	if (_ndraw >= 32) { static int nl; if (nl++ < 4) slog("SweetMTL: too many draws in one pass"); return NULL; }
 	sm_drawrec *r = &_draws[_ndraw];
 	memset(r, 0, sizeof *r);
+	if (_hasScissor && _target) {
+		uint32_t W = (uint32_t)_target.width, H = (uint32_t)_target.height;
+		uint32_t x0 = (uint32_t)_scissor.x, y0 = (uint32_t)_scissor.y;
+		uint32_t x1 = (uint32_t)(_scissor.x + _scissor.width), y1 = (uint32_t)(_scissor.y + _scissor.height);
+		if (x1 > W) x1 = W;
+		if (y1 > H) y1 = H;
+		if (x0 >= x1 || y0 >= y1) return NULL;  /* empty scissor: nothing to draw */
+		r->has_scissor = 1; r->sc_x0 = x0; r->sc_y0 = y0; r->sc_x1 = x1 - 1; r->sc_y1 = y1 - 1;
+	}
 	r->vs = _pipeline.vs; r->fs = _pipeline.fs;
-	r->vcount = (uint32_t)count; r->vstart = (uint32_t)start;
 	memcpy(r->buf, _buf, sizeof _buf);
 	if (_pipeline) {
 		for (int k = 0; k < 16; k++) { r->attr[k].fmt = _pipeline->_attr[k].fmt; r->attr[k].off = _pipeline->_attr[k].off; r->attr[k].bidx = _pipeline->_attr[k].bidx; }
@@ -886,7 +1002,7 @@ static void sm_fc_hook(void)
 		}
 		if (_smp[k]) { r->smp[k].nearest = _smp[k].nearest; r->nsmp = k + 1; }
 	}
-	_ndraw++;
+	return r;
 }
 @end
 
@@ -1004,6 +1120,9 @@ static void sm_fc_hook(void)
 	[self sm_runHandlers];
 }
 - (void)waitUntilCompleted {}
+- (void)commitAndWaitUntilSubmitted { [self commit]; }
+- (void)setProtectionOptions:(uint64_t)o {}
+- (uint64_t)protectionOptions { return 0; }
 - (void)presentDrawable:(id)d {}
 - (NSError *)error { return nil; }
 @end
@@ -1183,6 +1302,10 @@ static void sm_trace_install(Class me)
 - (id)newLibraryWithFile:(NSString *)path error:(NSError **)err { if (err) *err = nil; return [SweetMTLLibrary new]; }
 - (id)newDefaultLibrary { return [SweetMTLLibrary new]; }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d { return [[SweetMTLTexture alloc] initWithDevice:self descriptor:d]; }
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)ios plane:(NSUInteger)plane
+{
+	return [[SweetMTLTexture alloc] initWithDevice:self descriptor:d iosurface:ios plane:plane];
+}
 - (uint64_t)registryID { return 0x53574545; }
 - (NSString *)vendorName { return @"ARM"; }
 - (NSUInteger)maxTextureWidth2D { return 8192; }

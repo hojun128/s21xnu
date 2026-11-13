@@ -50,9 +50,9 @@ void sweet_mali_set_asflush(int on);
 void sweet_mali_log_str(const char *s);
 }
 
-#define SM_MAX_BO        64
+#define SM_MAX_BO        256
 #define SM_MAX_BO_BYTES  (64ULL << 20)
-#define SM_MAX_TOTAL     (256ULL << 20)
+#define SM_MAX_TOTAL     (768ULL << 20)
 
 enum {
 	kSMGetInfo = 0,
@@ -63,6 +63,7 @@ enum {
 	kSMLog = 5,
 	kSMMapFB = 6,
 	kSMRebootRecovery = 7,
+	kSMImportUser = 8,
 };
 
 static IOLock *sm_lock;                 /* serializes all hardware / context calls */
@@ -268,6 +269,7 @@ struct SMBo {
 	uint32_t pages;
 	bool     mapped;
 	bool     ext;   /* external physical range (display fb): outside the physmap, never flush by phystokv */
+	bool     wired; /* imported user memory, prepare()d: complete() on free */
 };
 
 class SweetMaliUserClient : public IOUserClient {
@@ -316,6 +318,9 @@ SweetMaliUserClient::freeBo(uint32_t i)
 		}
 	}
 	sm_total -= (uint64_t)b->pages << 12;
+	if (b->wired) {
+		b->md->complete();
+	}
 	b->md->release();
 	bzero(b, sizeof(*b));
 }
@@ -522,6 +527,76 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		args->scalarOutput[3] = (fw << 16) | fh;
 		args->scalarOutputCount = 4;
 		ret = kIOReturnSuccess;
+		break;
+	}
+	case kSMImportUser: {
+		/* wire [uva, uva+len) of the calling task (an IOSurface) and map it at GPU va */
+		if (ins < 3 || outs < 1) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		uint64_t uva = args->scalarInput[0], len = args->scalarInput[1], va = args->scalarInput[2];
+		if ((uva & 0xFFF) || (len & 0xFFF) || len == 0 || len > SM_MAX_BO_BYTES || (va & 0xFFF) || va >= (1ULL << 47) ||
+		    sm_total + len > SM_MAX_TOTAL) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		uint32_t slot = SM_MAX_BO;
+		for (uint32_t i = 0; i < SM_MAX_BO; i++) {
+			if (fBo[i].md == NULL) {
+				slot = i;
+				break;
+			}
+		}
+		if (slot == SM_MAX_BO) {
+			ret = kIOReturnNoResources;
+			break;
+		}
+		if (fCtx < 0) {
+			fCtx = sweet_mali_ctx_create();
+			if (fCtx < 0) {
+				ret = kIOReturnNoResources;
+				break;
+			}
+		}
+		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uva, (mach_vm_size_t)len,
+		    kIODirectionInOut, current_task());
+		if (md == NULL) {
+			ret = kIOReturnNoMemory;
+			break;
+		}
+		if (md->prepare() != kIOReturnSuccess) {
+			md->release();
+			ret = kIOReturnVMError;
+			break;
+		}
+		uint32_t pages = (uint32_t)(len >> 12), k;
+		ret = kIOReturnSuccess;
+		for (k = 0; k < pages; k++) {
+			IOByteCount l = 0;
+			addr64_t pa = md->getPhysicalSegment((IOByteCount)k << 12, &l, kIOMemoryMapperNone);
+			if (pa == 0 || sweet_mali_ctx_map(fCtx, va + ((uint64_t)k << 12), pa)) {
+				ret = kIOReturnNoMemory;
+				break;
+			}
+		}
+		if (ret != kIOReturnSuccess) {
+			for (uint32_t u = 0; u < k; u++) {
+				sweet_mali_ctx_unmap(fCtx, va + ((uint64_t)u << 12));
+			}
+			md->complete();
+			md->release();
+			break;
+		}
+		fBo[slot].md = md;
+		fBo[slot].pages = pages;
+		fBo[slot].va = va;
+		fBo[slot].mapped = true;
+		fBo[slot].ext = false;
+		fBo[slot].wired = true;
+		sm_total += len;
+		args->scalarOutput[0] = slot + 1;
+		args->scalarOutputCount = 1;
 		break;
 	}
 	case kSMRebootRecovery: {
