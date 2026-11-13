@@ -677,6 +677,7 @@ static __weak id sm_device;
 @property (nonatomic, strong) NSDictionary *constants;      /* index -> uint32 */
 @end
 static NSMutableDictionary *sm_fc_dict(id obj);
+static NSMutableDictionary *sm_fc_read(id cv);
 @implementation SweetMTLFunction
 - (MTLFunctionType)functionType
 {
@@ -745,11 +746,11 @@ static NSString *sm_match_variant(NSString *base, NSDictionary *cv)
 	if (err) *err = nil;
 	NSString *use = (sp && sm_find(sp)) ? sp : name;
 	if (use == name && !sm_find(name) && cv) {
-		NSString *v = sm_match_variant(name, sm_fc_dict(cv));
+		NSString *v = sm_match_variant(name, sm_fc_read(cv));
 		if (v) use = v;
 	}
 	SweetMTLFunction *f = [SweetMTLFunction new]; f.name = use;
-	f.constants = cv ? [sm_fc_dict(cv) copy] : @{};
+	f.constants = cv ? [sm_fc_read(cv) copy] : @{};
 	slog("SweetMTL: function %s (specialized %s) -> %s", name.UTF8String, sp ? sp.UTF8String : "-", sm_find(use) ? "translated" : "NOT in pack");
 	return f;
 }
@@ -771,7 +772,7 @@ static NSString *sm_match_variant(NSString *base, NSDictionary *cv)
 {
 	if (err) *err = nil;
 	SweetMTLFunction *f = [self newFunctionWithName:name];
-	f.constants = cv ? [sm_fc_dict(cv) copy] : @{};
+	f.constants = cv ? [sm_fc_read(cv) copy] : @{};
 	slog("SweetMTL: function %s with %lu constants", name.UTF8String, (unsigned long)f.constants.count);
 	return f;
 }
@@ -829,6 +830,38 @@ static void sm_setN(id self, SEL _cmd, const void *v, NSUInteger type, NSRange r
 		sm_fc_dict(self)[@(r.location + i)] = @(w);
 	}
 	((void (*)(id, SEL, const void *, NSUInteger, NSRange))sm_orig_setN)(self, _cmd, v, type, r);
+}
+/* Read the constants straight out of an MTLFunctionConstantValues (works for copies made inside Metal too):
+ * newIndexedConstantArray / newNamedConstantArray hold MTLIndexedConstantValue / MTLNamedConstantValue. */
+static uint32_t sm_cv_word(id o)
+{
+	SEL sd = sel_registerName("data"), st = sel_registerName("dataType");
+	Method m = class_getInstanceMethod(object_getClass(o), sd);
+	if (!m) return 0;
+	NSUInteger type = [o respondsToSelector:st] ? ((NSUInteger (*)(id, SEL))objc_msgSend)(o, st) : 0;
+	const char *enc = method_getTypeEncoding(m);
+	const void *p = NULL;
+	if (enc && enc[0] == '@') { NSData *d = ((id (*)(id, SEL))objc_msgSend)(o, sd); p = d.bytes; }
+	else p = ((const void *(*)(id, SEL))objc_msgSend)(o, sd);
+	uint32_t w = 0;
+	if (p) { NSUInteger n = sm_dt_size(type); memcpy(&w, p, n > 4 ? 4 : (n ? n : 1)); }
+	return w;
+}
+static NSMutableDictionary *sm_fc_read(id cv)
+{
+	NSMutableDictionary *d = [NSMutableDictionary dictionary];
+	if (!cv) return d;
+	SEL si = sel_registerName("newIndexedConstantArray"), sn = sel_registerName("newNamedConstantArray");
+	if ([cv respondsToSelector:si]) {
+		NSArray *a = ((id (*)(id, SEL))objc_msgSend)(cv, si);
+		for (id o in a) d[@(((NSUInteger (*)(id, SEL))objc_msgSend)(o, sel_registerName("index")))] = @(sm_cv_word(o));
+	}
+	if ([cv respondsToSelector:sn]) {
+		NSArray *a = ((id (*)(id, SEL))objc_msgSend)(cv, sn);
+		for (id o in a) { NSString *nm = ((id (*)(id, SEL))objc_msgSend)(o, sel_registerName("name")); if (nm) d[nm] = @(sm_cv_word(o)); }
+	}
+	[d addEntriesFromDictionary:sm_fc_dict(cv)];
+	return d;
 }
 static IMP sm_orig_setName;
 static void sm_setName(id self, SEL _cmd, const void *v, NSUInteger type, NSString *name)
