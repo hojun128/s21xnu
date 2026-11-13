@@ -1072,6 +1072,32 @@ static void sm_diag_install(void)
 	for (unsigned i = 0; i < sizeof sigs / sizeof *sigs; i++) sigaction(sigs[i], &sa, NULL);
 	NSSetUncaughtExceptionHandler(sm_exc);
 }
+@interface NSInvocation (SweetPrivate)
+- (void)invokeUsingIMP:(IMP)imp;
+@end
+static Class sm_super_cls;
+/* Route every _MTLDevice method we do not override through forwardInvocation so each one is logged once
+ * and then run with the inherited implementation. */
+static void sm_trace_install(Class me)
+{
+	Class sup = class_getSuperclass(me); sm_super_cls = sup;
+	unsigned n = 0; Method *ms = class_copyMethodList(sup, &n);
+	static const char *skip[] = { "dealloc", ".cxx_destruct", "retain", "release", "autorelease", "retainCount", "description",
+	    "debugDescription", "respondsToSelector:", "methodSignatureForSelector:", "forwardInvocation:", "class", "isKindOfClass:",
+	    "conformsToProtocol:", "hash", "isEqual:", "_tryRetain", "_isDeallocating", "allowsWeakReference", "retainWeakReference", NULL };
+	unsigned added = 0;
+	for (unsigned i = 0; i < n; i++) {
+		SEL sel = method_getName(ms[i]); const char *sn = sel_getName(sel);
+		bool sk = !strncmp(sn, "init", 4);
+		for (int k = 0; skip[k] && !sk; k++) if (!strcmp(sn, skip[k])) sk = true;
+		if (sk) continue;
+		Method mine = class_getInstanceMethod(me, sel);
+		if (mine && method_getImplementation(mine) != method_getImplementation(ms[i])) continue; /* we override it */
+		if (class_addMethod(me, sel, _objc_msgForward, method_getTypeEncoding(ms[i]))) added++;
+	}
+	free(ms);
+	slog("SweetMTL: tracing %u inherited _MTLDevice methods", added);
+}
 
 @interface SweetMTLDevice : _MTLDevice <MTLDevice, MTLDeviceSPI>
 @end
@@ -1083,7 +1109,7 @@ static void sm_diag_install(void)
 + (void)load
 {
 	sm_fc_hook();
-	if (getprogname() && strcmp(getprogname(), "malitest")) sm_diag_install();
+	if (getprogname() && strcmp(getprogname(), "malitest")) { sm_diag_install(); sm_trace_install(self); }
 	slog("SweetMTL: +load in %s, super=%s", getprogname() ? getprogname() : "?", class_getName(class_getSuperclass(self)));
 }
 
@@ -1182,6 +1208,12 @@ static void sm_diag_install(void)
 	static NSMutableSet *seen; static dispatch_once_t once; dispatch_once(&once, ^{ seen = [NSMutableSet new]; });
 	NSString *k = @(sel_getName(inv.selector)); BOOL first = NO;
 	@synchronized (seen) { if (![seen containsObject:k]) { [seen addObject:k]; first = YES; } }
+	Method sm = sm_super_cls ? class_getInstanceMethod(sm_super_cls, inv.selector) : NULL;
+	if (sm) {
+		if (first) slog("SweetMTL: inherited -%s", k.UTF8String);
+		[inv invokeUsingIMP:method_getImplementation(sm)];
+		return;
+	}
 	if (first) slog("SweetMTL: unimplemented -%s", k.UTF8String);
 	sm_zero_return(inv);
 }
