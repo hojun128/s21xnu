@@ -1732,6 +1732,9 @@ static void *sm_watchdog(void *arg)
 	bool allowed = pn && (!strcmp(pn, "malitest") || (all >= 1 && !strcmp(pn, "backboardd")) || all == 2);
 	if (!allowed) {
 		slog("SweetMTL: no Metal device for %s", pn ? pn : "?");
+		/* never let ARC release this half-built object: _MTLDevice -dealloc on an uninitialised device crashed
+		 * inside Metal (run45, SpringBoard). One small leak per refused process. */
+		(void)CFBridgingRetain(self);
 		return nil;
 	}
 	self = [super init];
