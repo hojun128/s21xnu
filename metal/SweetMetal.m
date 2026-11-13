@@ -844,10 +844,14 @@ static __weak id sm_device;
 }
 @end
 
+@class SweetMTLTexture;
 @interface SweetMTLBuffer : SweetMTLObject
 @property (nonatomic, readonly) NSUInteger length;
 @end
-@implementation SweetMTLBuffer { sm_bo _bo; }
+@protocol SweetTexBufferInit
+- (instancetype)initWithBuffer:(id)buf bo:(const sm_bo *)bbo descriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off bytesPerRow:(NSUInteger)bpr;
+@end
+@implementation SweetMTLBuffer { sm_bo _bo; void (^_dealloc)(void *, NSUInteger); void *_ptr; }
 - (instancetype)initWithLength:(NSUInteger)len bytes:(const void *)p
 {
 	self = [super init];
@@ -856,7 +860,28 @@ static __weak id sm_device;
 	if (p) memcpy(_bo.cpu, p, len);
 	return self;
 }
-- (void)dealloc { sm_bo_free(&_bo); }
+- (instancetype)initWithBytesNoCopy:(void *)p length:(NSUInteger)len deallocator:(void (^)(void *, NSUInteger))dealloc
+{
+	self = [super init];
+	if (!p || !len || !sm_bo_import(&_bo, p, len)) {
+		/* not importable: fall back to a copy (contents stay the caller's pointer semantics only at creation) */
+		if (!sm_bo_alloc(&_bo, len ? len : 16)) return nil;
+		if (p && len) memcpy(_bo.cpu, p, len);
+	}
+	_length = len; _dealloc = [dealloc copy]; _ptr = p;
+	return self;
+}
+- (void)dealloc { sm_bo_free(&_bo); if (_dealloc) _dealloc(_ptr, _length); }
+- (const sm_bo *)smBo { return &_bo; }
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off bytesPerRow:(NSUInteger)bpr
+{
+	id<SweetTexBufferInit> t = (id<SweetTexBufferInit>)[NSClassFromString(@"SweetMTLTexture") alloc];
+	return [t initWithBuffer:self bo:&_bo descriptor:d offset:off bytesPerRow:bpr];
+}
+- (id)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
+{
+	return [self newTextureWithDescriptor:d offset:off bytesPerRow:bpr];
+}
 - (void *)contents { return _bo.cpu; }
 - (uint64_t)gpuAddress { return _bo.gpu; }
 - (MTLStorageMode)storageMode { return MTLStorageModeShared; }
@@ -1104,8 +1129,41 @@ static void sm_fc_hook(void)
 @property (nonatomic, readonly) NSUInteger width, height, pixelFormat, bytesPerRow;
 @property (nonatomic, readonly) sm_bo *bo;
 @property (nonatomic, weak) id device;
+- (void)sm_sync;
 @end
-@implementation SweetMTLTexture { sm_bo _store; IOSurfaceRef _surface; }
+@implementation SweetMTLTexture {
+	sm_bo _store; IOSurfaceRef _surface;
+	id _parent;                 /* buffer whose memory this texture aliases (newTextureWithDescriptor:offset:...) */
+	bool _view;                 /* _store borrowed from _parent: never freed here */
+	sm_bo _shadow; bool _hasShadow; const uint8_t *_src; NSUInteger _srcBpr;   /* unaligned pitch: GPU reads a copy */
+}
+- (instancetype)initWithBuffer:(id)buf bo:(const sm_bo *)bbo descriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off bytesPerRow:(NSUInteger)bpr
+{
+	self = [super init];
+	_pixelFormat = d.pixelFormat; _width = d.width; _height = d.height;
+	if (!bbo || !bbo->cpu || off + (uint64_t)bpr * (_height ? _height - 1 : 0) + _width * 4 > bbo->size + 0x4000) return nil;
+	_parent = buf; _view = true;
+	_store = *bbo; _store.cpu = bbo->cpu + off; _store.gpu = bbo->gpu + off; _store.size = bbo->size - off;
+	_bytesPerRow = bpr;
+	if (bpr & 63) {
+		/* Mali linear planes need a 64-byte aligned pitch (run34): sample from an aligned copy, refreshed per draw */
+		NSUInteger abpr = (_width * 4 + 63) & ~(NSUInteger)63;
+		if (!sm_bo_alloc(&_shadow, abpr * (_height ? _height : 1))) return nil;
+		_hasShadow = true; _src = _store.cpu; _srcBpr = bpr;
+		_store = _shadow; _bytesPerRow = abpr;
+		[self sm_sync];
+	}
+	static int nl; if (nl++ < 8) slog("SweetMTL: buffer texture %lux%lu fmt %lu bpr %lu off %lu%s", (unsigned long)_width, (unsigned long)_height,
+	    (unsigned long)_pixelFormat, (unsigned long)bpr, (unsigned long)off, _hasShadow ? " (shadow)" : "");
+	_bo = &_store;
+	return self;
+}
+- (void)sm_sync
+{
+	if (!_hasShadow) return;
+	NSUInteger n = _width * 4 < _srcBpr ? _width * 4 : _srcBpr;
+	for (NSUInteger y = 0; y < _height; y++) memcpy(_shadow.cpu + y * _bytesPerRow, _src + y * _srcBpr, n);
+}
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d
 {
 	self = [super init];
@@ -1133,7 +1191,7 @@ static void sm_fc_hook(void)
 	    (unsigned long)_width, (unsigned long)_height, (unsigned long)_bytesPerRow, (unsigned long)_pixelFormat, _store.gpu);
 	return self;
 }
-- (void)dealloc { sm_bo_free(&_store); if (_surface) CFRelease(_surface); }
+- (void)dealloc { if (_hasShadow) sm_bo_free(&_shadow); else if (!_view) sm_bo_free(&_store); if (_surface) CFRelease(_surface); }
 - (IOSurfaceRef)iosurface { return _surface; }
 - (NSUInteger)iosurfacePlane { return 0; }
 - (MTLStorageMode)storageMode { return MTLStorageModeShared; }
@@ -1323,7 +1381,12 @@ static void sm_fc_hook(void)
 	}
 	for (uint32_t k = 0; k < 8; k++) {
 		SweetMTLTexture *t = _tex[k];
+		if (t && ![t isKindOfClass:[SweetMTLTexture class]]) {
+			static int nl; if (nl++ < 4) slog("SweetMTL: texture slot %u holds a %s, skipped", k, object_getClassName(t));
+			t = nil;
+		}
 		if (t) {
+			[t sm_sync];
 			r->tex[k].va = t.bo->gpu; r->tex[k].w = (uint32_t)t.width; r->tex[k].h = (uint32_t)t.height;
 			r->tex[k].stride = (uint32_t)t.bytesPerRow; r->tex[k].fmt = [t maliFormat];
 			r->tex[k].pf = (uint32_t)t.pixelFormat; r->tex[k].imp = t.bo->imported;
@@ -1816,6 +1879,10 @@ static bool sm_process_allowed(void)
 }
 - (id)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)o { return [[SweetMTLBuffer alloc] initWithLength:len bytes:NULL]; }
 - (id)newBufferWithBytes:(const void *)p length:(NSUInteger)len options:(MTLResourceOptions)o { return [[SweetMTLBuffer alloc] initWithLength:len bytes:p]; }
+- (id)newBufferWithBytesNoCopy:(void *)p length:(NSUInteger)len options:(MTLResourceOptions)o deallocator:(void (^)(void *, NSUInteger))d
+{
+	return [[SweetMTLBuffer alloc] initWithBytesNoCopy:p length:len deallocator:d];
+}
 - (id)newLibraryWithURL:(NSURL *)url error:(NSError **)err { if (err) *err = nil; return [SweetMTLLibrary new]; }
 - (id)newLibraryWithFile:(NSString *)path error:(NSError **)err { if (err) *err = nil; return [SweetMTLLibrary new]; }
 - (id)newDefaultLibrary { return [SweetMTLLibrary new]; }
