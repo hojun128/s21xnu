@@ -1,0 +1,25 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -42,4 +42,6 @@
+ int sweet_mali_blit(IOMemoryDescriptor *srcmd, uint64_t srcoff, uint32_t srcbpr, uint64_t fbpa, uint32_t fbbpr,
+     uint64_t fbsize, uint64_t dstoff, uint32_t w, uint32_t h);
+ static int sweet_fb_gpu = -1;           /* boot-arg sweetgpucomp=1 */
++extern "C" void sweet_mali_log_str(const char *s);   /* bsd/dev/sweet_mali.c: line into the pmsg log */
++static uint64_t sweet_fb_presents;
+ 
+@@ -418,6 +420,15 @@
+ 		}
+ 		s->release();
+ 	}
++	/* S21: report what reaches the panel (pmsg survives the autorec reboot): first presents, then every 600th */
++	if ((++sweet_fb_presents <= 6 || (sweet_fb_presents % 600) == 0) && fPixels != 0) {
++		char line[160];
++		const uint32_t *mid = (const uint32_t *)(fPixels + (uint64_t)(fHeight / 2) * fRowBytes + (uint64_t)(fWidth / 2) * 4);
++		const uint32_t *q = (const uint32_t *)(fPixels + (uint64_t)(fHeight / 4) * fRowBytes + (uint64_t)(fWidth / 4) * 4);
++		snprintf(line, sizeof(line), "fb present %llu layers gpu %u cpu %u mask %x mid %08x q %08x",
++		    sweet_fb_presents, gpu_layers, cpu_layers, mask, *mid, *q);
++		sweet_mali_log_str(line);
++	}
+ 	/* S21 GPU compositing marker: 16x16 top-left, green = GPU copied this frame, red = CPU */
+ 	if (sweet_fb_gpu == 1 && (gpu_layers + cpu_layers) != 0) {
+ 		uint32_t c = cpu_layers == 0 ? 0xFF00FF00u : 0xFFFF0000u;
