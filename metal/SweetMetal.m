@@ -485,7 +485,7 @@ typedef struct {
 	uint64_t fbuf[31];               /* fragment-stage buffers (separate push block) */
 	struct { uint32_t fmt, off, bidx; } attr[16];
 	uint32_t stride[31];
-	struct { uint64_t va; uint32_t w, h, stride, fmt, pf, imp; } tex[8];
+	struct { uint64_t va; uint32_t w, h, stride, fmt, pf, imp, swz; } tex[8];
 	struct { uint32_t nearest, wrap; } smp[8];
 	uint32_t ntex, nsmp;
 	uint32_t fc[64]; uint64_t fc_defined;
@@ -745,7 +745,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 					tx.dimension = is3d ? MALI_TEXTURE_DIMENSION_3D : MALI_TEXTURE_DIMENSION_2D;
 					tx.format = fmt; tx.width = tw; tx.height = th;
 					if (is3d) tx.depth = 16; else tx.sample_count = 1;
-					tx.swizzle = 0 | (1 << 3) | (2 << 6) | (3 << 9);
+					tx.swizzle = real ? r->tex[k].swz : (0 | (1 << 3) | (2 << 6) | (3 << 9));
 					tx.levels = 1; tx.array_size = 1;
 					tx.surfaces = PV + 0xD00 + 32 * k;
 					tx.minimum_lod = 0; tx.maximum_lod = 0;
@@ -1140,11 +1140,39 @@ static void sm_fc_hook(void)
 	if (m3) sm_orig_setName = method_setImplementation(m3, (IMP)sm_setName);
 }
 /* ------------------------------------------------------------------ Metal objects (phase 2a) */
+/* MTLPixelFormat -> bytes per pixel, Mali format word, texture swizzle (after Mesa pan_format.c, Valhall).
+ * Swizzle: 3 bits per channel, R=0 G=1 B=2 A=3 zero=4 one=5. Unknown formats fall back to 4-byte RGBA8. */
+#define SM_SWZ(r, g, b, a) ((r) | ((g) << 3) | ((b) << 6) | ((a) << 9))
+static uint32_t sm_pf_info(NSUInteger pf, uint32_t *fmt, uint32_t *swz)
+{
+	uint32_t f = (MALI_RGBA8_UNORM << 12) | MALI_RGB_COMPONENT_ORDER_RGBA, w = SM_SWZ(0, 1, 2, 3), b = 4;
+	switch (pf) {
+	case 1:   f = MALI_R8_UNORM << 12; w = SM_SWZ(4, 4, 4, 0); b = 1; break;            /* A8Unorm */
+	case 10: case 11: f = MALI_R8_UNORM << 12; w = SM_SWZ(0, 4, 4, 5); b = 1; break;   /* R8Unorm(_sRGB) */
+	case 25:  f = MALI_R16F << 12; w = SM_SWZ(0, 4, 4, 5); b = 2; break;                /* R16Float */
+	case 30:  f = MALI_RG8_UNORM << 12; w = SM_SWZ(0, 1, 4, 5); b = 2; break;           /* RG8Unorm */
+	case 55:  f = MALI_R32F << 12; w = SM_SWZ(0, 4, 4, 5); b = 4; break;                /* R32Float */
+	case 65:  f = MALI_RG16F << 12; w = SM_SWZ(0, 1, 4, 5); b = 4; break;               /* RG16Float */
+	case 115: f = MALI_RGBA16F << 12; b = 8; break;                                      /* RGBA16Float */
+	case 125: f = MALI_RGBA32F << 12; b = 16; break;                                     /* RGBA32Float */
+	default:
+		if (sm_is_bgra(pf)) f = (MALI_RGBA8_UNORM << 12) | MALI_RGB_COMPONENT_ORDER_BGRA;
+		break;
+	}
+	if (fmt) *fmt = f;
+	if (swz) *swz = w;
+	return b;
+}
+static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
+
 @interface SweetMTLTexture : SweetMTLObject
 @property (nonatomic, readonly) NSUInteger width, height, pixelFormat, bytesPerRow;
 @property (nonatomic, readonly) sm_bo *bo;
 @property (nonatomic, weak) id device;
 - (void)sm_sync;
+- (uint32_t)maliFormat;
+- (uint32_t)maliSwizzle;
+- (uint32_t)bpp;
 @end
 @implementation SweetMTLTexture {
 	sm_bo _store; IOSurfaceRef _surface;
@@ -1156,13 +1184,13 @@ static void sm_fc_hook(void)
 {
 	self = [super init];
 	_pixelFormat = d.pixelFormat; _width = d.width; _height = d.height;
-	if (!bbo || !bbo->cpu || off + (uint64_t)bpr * (_height ? _height - 1 : 0) + _width * 4 > bbo->size + 0x4000) return nil;
+	if (!bbo || !bbo->cpu || off + (uint64_t)bpr * (_height ? _height - 1 : 0) + _width * sm_pf_bpp(_pixelFormat) > bbo->size + 0x4000) return nil;
 	_parent = buf; _view = true;
 	_store = *bbo; _store.cpu = bbo->cpu + off; _store.gpu = bbo->gpu + off; _store.size = bbo->size - off;
 	_bytesPerRow = bpr;
 	if (bpr & 63) {
 		/* Mali linear planes need a 64-byte aligned pitch (run34): sample from an aligned copy, refreshed per draw */
-		NSUInteger abpr = (_width * 4 + 63) & ~(NSUInteger)63;
+		NSUInteger abpr = (_width * sm_pf_bpp(_pixelFormat) + 63) & ~(NSUInteger)63;
 		if (!sm_bo_alloc(&_shadow, abpr * (_height ? _height : 1))) return nil;
 		_hasShadow = true; _src = _store.cpu; _srcBpr = bpr;
 		_store = _shadow; _bytesPerRow = abpr;
@@ -1176,14 +1204,14 @@ static void sm_fc_hook(void)
 - (void)sm_sync
 {
 	if (!_hasShadow) return;
-	NSUInteger n = _width * 4 < _srcBpr ? _width * 4 : _srcBpr;
+	NSUInteger n = _width * sm_pf_bpp(_pixelFormat) < _srcBpr ? _width * sm_pf_bpp(_pixelFormat) : _srcBpr;
 	for (NSUInteger y = 0; y < _height; y++) memcpy(_shadow.cpu + y * _bytesPerRow, _src + y * _srcBpr, n);
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d
 {
 	self = [super init];
 	_device = dev; _width = d.width; _height = d.height; _pixelFormat = d.pixelFormat;
-	_bytesPerRow = (_width * 4 + 63) & ~(NSUInteger)63;  /* Mali linear planes need a 64-byte aligned row stride (run34: 776 faulted) */
+	_bytesPerRow = (_width * sm_pf_bpp(_pixelFormat) + 63) & ~(NSUInteger)63;  /* Mali linear planes need a 64-byte aligned row stride (run34: 776 faulted) */
 	if (!sm_bo_alloc(&_store, _bytesPerRow * _height)) {
 		static int nl; if (nl++ < 6) slog("SweetMTL: texture bo alloc failed %lux%lu fmt %lu", (unsigned long)_width, (unsigned long)_height, (unsigned long)_pixelFormat);
 		return nil;
@@ -1211,11 +1239,9 @@ static void sm_fc_hook(void)
 - (NSUInteger)iosurfacePlane { return 0; }
 - (MTLStorageMode)storageMode { return MTLStorageModeShared; }
 - (MTLTextureUsage)usage { return MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget; }
-- (uint32_t)maliFormat
-{
-	bool bgra = sm_is_bgra(_pixelFormat);
-	return (MALI_RGBA8_UNORM << 12) | (bgra ? MALI_RGB_COMPONENT_ORDER_BGRA : MALI_RGB_COMPONENT_ORDER_RGBA);
-}
+- (uint32_t)maliFormat { uint32_t f; sm_pf_info(_pixelFormat, &f, NULL); return f; }
+- (uint32_t)maliSwizzle { uint32_t w; sm_pf_info(_pixelFormat, NULL, &w); return w; }
+- (uint32_t)bpp { return sm_pf_bpp(_pixelFormat); }
 - (NSUInteger)depth { return 1; }
 - (NSUInteger)mipmapLevelCount { return 1; }
 - (NSUInteger)sampleCount { return 1; }
@@ -1238,13 +1264,13 @@ static void sm_fc_hook(void)
 {
 	if (![self sm_inRegion:r level:lvl]) return;
 	for (NSUInteger y = 0; y < r.size.height; y++)
-		memcpy((uint8_t *)dst + y * bpr, _store.cpu + (r.origin.y + y) * _bytesPerRow + r.origin.x * 4, r.size.width * 4);
+		memcpy((uint8_t *)dst + y * bpr, _store.cpu + (r.origin.y + y) * _bytesPerRow + r.origin.x * sm_pf_bpp(_pixelFormat), r.size.width * sm_pf_bpp(_pixelFormat));
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl withBytes:(const void *)src bytesPerRow:(NSUInteger)bpr
 {
 	if (![self sm_inRegion:r level:lvl] || !src) return;
 	for (NSUInteger y = 0; y < r.size.height; y++)
-		memcpy(_store.cpu + (r.origin.y + y) * _bytesPerRow + r.origin.x * 4, (const uint8_t *)src + y * bpr, r.size.width * 4);
+		memcpy(_store.cpu + (r.origin.y + y) * _bytesPerRow + r.origin.x * sm_pf_bpp(_pixelFormat), (const uint8_t *)src + y * bpr, r.size.width * sm_pf_bpp(_pixelFormat));
 }
 @end
 
@@ -1406,6 +1432,7 @@ static void sm_fc_hook(void)
 			r->tex[k].va = t.bo->gpu; r->tex[k].w = (uint32_t)t.width; r->tex[k].h = (uint32_t)t.height;
 			r->tex[k].stride = (uint32_t)t.bytesPerRow; r->tex[k].fmt = [t maliFormat];
 			r->tex[k].pf = (uint32_t)t.pixelFormat; r->tex[k].imp = t.bo->imported;
+			r->tex[k].swz = [t maliSwizzle];
 			r->ntex = k + 1;
 		}
 		if (_smp[k]) { r->smp[k].nearest = _smp[k].nearest; r->nsmp = k + 1; }
@@ -1434,7 +1461,7 @@ static void sm_fc_hook(void)
 	NSUInteger sb = [src bytesPerRow], db = [dst bytesPerRow];
 	if (!sp || !dp) return;
 	for (NSUInteger y = 0; y < sz.height; y++)
-		memmove(dp + (dO.y + y) * db + dO.x * 4, sp + (so.y + y) * sb + so.x * 4, sz.width * 4);
+		memmove(dp + (dO.y + y) * db + dO.x * [dst bpp], sp + (so.y + y) * sb + so.x * [src bpp], sz.width * [src bpp]);
 }
 - (void)copyFromTexture:(id)src toTexture:(id)dst
 {
@@ -1501,6 +1528,11 @@ static void sm_fc_hook(void)
 	sm_commits++;
 	for (SweetMTLRenderEncoder *e in _passes) {
 		if (!have || !e.target) { _status = 5; continue; }
+		if (sm_pf_bpp(e.target.pixelFormat) != 4) {
+			/* render targets are written as 4-byte RGBA8/BGRA8 only: a 1/2/8-byte target would overflow */
+			static int nl; if (nl++ < 6) slog("SweetMTL: skipped pass into pixel format %lu", (unsigned long)e.target.pixelFormat);
+			continue;
+		}
 		bool bgra = sm_is_bgra(e.target.pixelFormat);
 		if (e->_ndraw) {
 			static sm_bo heap; static bool haveheap;
