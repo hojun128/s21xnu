@@ -767,6 +767,14 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		uint32_t vexc = *(volatile uint32_t *)P;
 		slog("SweetMTL: draw%u vs=%s fs=%s n=%u sec=%d nvar=%u job=%x exc=%x", i, vs->name, fs ? fs->name : "(FS_GREEN)",
 		    r->vcount, sec, nvar, vst, vexc);
+		{
+			static int nl;
+			if (nl++ < 12) {
+				slog("SweetMTL:  vb %llx %llx %llx fb %llx %llx %llx %llx", r->buf[0], r->buf[1], r->buf[2], r->fbuf[0], r->fbuf[1], r->fbuf[2], r->fbuf[3]);
+				slog("SweetMTL:  tex n=%u %llx %ux%u fmt %x | %llx %ux%u | push vs %u fs %u", r->ntex, r->tex[0].va, r->tex[0].w, r->tex[0].h, r->tex[0].fmt,
+				    r->tex[1].va, r->tex[1].w, r->tex[1].h, vs->push_words, fs ? fs->push_words : 0);
+			}
+		}
 		vs_all |= vst;
 	}
 	if (vstatus) *vstatus = vs_all;
