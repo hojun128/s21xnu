@@ -572,7 +572,29 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	return sm_submit(0, D + OFF_FJOB);
 }
 
-@interface SweetMTLBuffer : NSObject
+/* Base for every SweetMTL object: selectors CoreAnimation sends that are not implemented yet are logged
+ * once and answered with zero instead of raising "unrecognized selector". */
+@interface SweetMTLObject : NSObject
+@end
+@implementation SweetMTLObject
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
+{
+	NSMethodSignature *m = [super methodSignatureForSelector:sel];
+	return m ? m : [NSMethodSignature signatureWithObjCTypes:"@@:@@@@"];
+}
+- (void)forwardInvocation:(NSInvocation *)inv
+{
+	static NSMutableSet *seen; static dispatch_once_t once; dispatch_once(&once, ^{ seen = [NSMutableSet new]; });
+	NSString *k = [NSString stringWithFormat:@"%s %s", class_getName(object_getClass(self)), sel_getName(inv.selector)];
+	BOOL first = NO;
+	@synchronized (seen) { if (![seen containsObject:k]) { [seen addObject:k]; first = YES; } }
+	if (first) slog("SweetMTL: stub %s", k.UTF8String);
+	uint8_t z[128] = {0};
+	if (inv.methodSignature.methodReturnLength && inv.methodSignature.methodReturnLength <= sizeof z) [inv setReturnValue:z];
+}
+@end
+
+@interface SweetMTLBuffer : SweetMTLObject
 @property (nonatomic, readonly) NSUInteger length;
 @end
 @implementation SweetMTLBuffer { sm_bo _bo; }
@@ -591,7 +613,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 - (void)setLabel:(NSString *)l {}
 @end
 
-@interface SweetMTLFunction : NSObject
+@interface SweetMTLFunction : SweetMTLObject
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic, strong) NSDictionary *constants;      /* index -> uint32 */
 @end
@@ -605,7 +627,7 @@ static NSMutableDictionary *sm_fc_dict(id obj);
 - (void)setLabel:(NSString *)l {}
 @end
 
-@interface SweetMTLLibrary : NSObject
+@interface SweetMTLLibrary : SweetMTLObject
 @end
 @implementation SweetMTLLibrary
 - (id)newFunctionWithName:(NSString *)name
@@ -636,16 +658,6 @@ static NSMutableDictionary *sm_fc_dict(id obj);
 {
 	id f = [self newFunctionWithName:name constantValues:cv error:NULL];
 	if (h) h(f, nil);
-}
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
-{
-	NSMethodSignature *m = [super methodSignatureForSelector:sel];
-	return m ? m : [NSMethodSignature signatureWithObjCTypes:"@@:@@@@"];
-}
-- (void)forwardInvocation:(NSInvocation *)inv
-{
-	slog("SweetMTL: library unimplemented -%s", sel_getName(inv.selector));
-	void *z = NULL; [inv setReturnValue:&z];
 }
 - (id)newFunctionWithName:(NSString *)name constantValues:(id)cv error:(NSError **)err
 {
@@ -712,7 +724,7 @@ static void sm_fc_hook(void)
 	if (m2) sm_orig_setN = method_setImplementation(m2, (IMP)sm_setN);
 }
 /* ------------------------------------------------------------------ Metal objects (phase 2a) */
-@interface SweetMTLTexture : NSObject
+@interface SweetMTLTexture : SweetMTLObject
 @property (nonatomic, readonly) NSUInteger width, height, pixelFormat, bytesPerRow;
 @property (nonatomic, readonly) sm_bo *bo;
 @property (nonatomic, weak) id device;
@@ -748,7 +760,7 @@ static void sm_fc_hook(void)
 }
 @end
 
-@interface SweetMTLRenderPipelineState : NSObject
+@interface SweetMTLRenderPipelineState : SweetMTLObject
 @property (nonatomic, copy) NSString *vsName, *fsName;
 @property (nonatomic) const sm_shader *vs, *fs;
 @end
@@ -761,20 +773,20 @@ static void sm_fc_hook(void)
 - (void)setLabel:(NSString *)l {}
 @end
 
-@interface SweetMTLSampler : NSObject
+@interface SweetMTLSampler : SweetMTLObject
 @property (nonatomic) uint32_t nearest;
 @end
 @implementation SweetMTLSampler
 - (void)setLabel:(NSString *)l {}
 @end
 
-@interface SweetMTLCommandBuffer : NSObject
+@interface SweetMTLCommandBuffer : SweetMTLObject
 @property (nonatomic, strong) NSMutableArray *passes;
 @property (nonatomic) NSUInteger status;
 @property (nonatomic) uint32_t lastJobStatus;
 @end
 
-@interface SweetMTLRenderEncoder : NSObject
+@interface SweetMTLRenderEncoder : SweetMTLObject
 @property (nonatomic, strong) SweetMTLTexture *target;
 @property (nonatomic) BOOL clear;
 @property (nonatomic) uint32_t packed;
@@ -840,16 +852,6 @@ static void sm_fc_hook(void)
 	}
 	_ndraw++;
 }
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
-{
-	NSMethodSignature *m = [super methodSignatureForSelector:sel];
-	return m ? m : [NSMethodSignature signatureWithObjCTypes:"@@:@@@@"];
-}
-- (void)forwardInvocation:(NSInvocation *)inv
-{
-	slog("SweetMTL: encoder unimplemented -%s", sel_getName(inv.selector));
-	void *z = NULL; [inv setReturnValue:&z];
-}
 @end
 
 @implementation SweetMTLCommandBuffer
@@ -906,7 +908,7 @@ static void sm_fc_hook(void)
 - (void)setLabel:(NSString *)l {}
 @end
 
-@interface SweetMTLCommandQueue : NSObject
+@interface SweetMTLCommandQueue : SweetMTLObject
 @end
 @implementation SweetMTLCommandQueue
 - (id)commandBuffer { return [SweetMTLCommandBuffer new]; }
@@ -1075,9 +1077,12 @@ static void sm_diag_install(void)
 
 - (void)forwardInvocation:(NSInvocation *)inv
 {
-	slog("SweetMTL: unimplemented -%s", sel_getName(inv.selector));
-	void *z = NULL;
-	[inv setReturnValue:&z];
+	static NSMutableSet *seen; static dispatch_once_t once; dispatch_once(&once, ^{ seen = [NSMutableSet new]; });
+	NSString *k = @(sel_getName(inv.selector)); BOOL first = NO;
+	@synchronized (seen) { if (![seen containsObject:k]) { [seen addObject:k]; first = YES; } }
+	if (first) slog("SweetMTL: unimplemented -%s", k.UTF8String);
+	uint8_t z[128] = {0};
+	if (inv.methodSignature.methodReturnLength && inv.methodSignature.methodReturnLength <= sizeof z) [inv setReturnValue:z];
 }
 
 @end
