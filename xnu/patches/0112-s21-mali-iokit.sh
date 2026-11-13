@@ -126,6 +126,71 @@ sm_autorec_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1
 	sm_reboot_recovery("sweetautorec timer");
 }
 
+/*
+ * Hardware watchdog fallback (boot-arg sweetwdt=<seconds>, about 60): a kernel hang stops the autorec thread
+ * call too (run30/run40 needed a manual reboot). The reset reason is set to "recovery" up front, then
+ * watchdog_cl0 (0x10050000, S3C2410-style: WTCON 0, WTDAT 4, WTCNT 8) is armed with reset enabled and kicked
+ * every 2 s from a thread call; if the kernel stops, the counter runs out and the SoC warm-resets into TWRP
+ * (pstore survives). sweetwdttest=<seconds> stops kicking after that long, to prove the reset path.
+ * The count assumes the 26 MHz oscillator (prescaler 256, divider 128: ~793 Hz).
+ */
+static volatile uint32_t *sm_wdt;
+static uint32_t sm_wdt_count, sm_wdt_stop_ticks, sm_wdt_ticks;
+static thread_call_t sm_wdt_tc;
+
+static void
+sm_wdt_kick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	sm_wdt_ticks++;
+	if (sm_wdt_stop_ticks && sm_wdt_ticks >= sm_wdt_stop_ticks) {
+		if (sm_wdt_ticks == sm_wdt_stop_ticks) {
+			sm_log("service: sweetwdttest: no more kicks (WTCNT %llu)", sm_wdt[2], 0, 0);
+		}
+		return;
+	}
+	sm_wdt[2] = sm_wdt_count;
+	if (sm_wdt_ticks == 2 || sm_wdt_ticks == 3) {
+		sm_log("service: wdt tick %llu WTCON %llx WTCNT %llu", sm_wdt_ticks, sm_wdt[0], sm_wdt[2]);
+	}
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(2, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(sm_wdt_tc, deadline);
+}
+
+static void
+sm_wdt_arm(uint32_t secs, uint32_t test_secs)
+{
+	volatile uint32_t *pmu = (volatile uint32_t *)ml_io_map(0x15860000U, 0x4000);
+	pmu[0x808 / 4] = (pmu[0x808 / 4] & ~0x00FF0000U) | 0x004E0000U;
+	pmu[0x80c / 4] = 0x12345604U;
+	pmu[0x810 / 4] = 0xFFU;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	sm_wdt = (volatile uint32_t *)ml_io_map(0x10050000U, 0x1000);
+	if (sm_wdt == NULL) {
+		return;
+	}
+	if (secs < 10) {
+		secs = 10;
+	}
+	sm_wdt_count = secs * 793U;
+	if (sm_wdt_count > 0xFFFFU) {
+		sm_wdt_count = 0xFFFFU;
+	}
+	uint32_t old = sm_wdt[0];
+	sm_wdt[0] = 0;
+	sm_wdt[1] = sm_wdt_count;
+	sm_wdt[2] = sm_wdt_count;
+	sm_wdt[3] = 1;                                   /* WTCLRINT */
+	sm_wdt[0] = (0xFFU << 8) | (1U << 5) | (3U << 3) | 1U;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	sm_wdt_stop_ticks = test_secs / 2;
+	sm_wdt_tc = thread_call_allocate(sm_wdt_kick, NULL);
+	sm_log("service: sweetwdt armed %llu s (count %llu, old WTCON %llx)", secs, sm_wdt_count, old);
+	if (sm_wdt_tc != NULL) {
+		sm_wdt_kick(NULL, NULL);
+	}
+}
+
 /* ---------------------------------------------------------------- service */
 
 class SweetMali : public IOService {
@@ -228,6 +293,13 @@ SweetMali::start(IOService *provider)
 	sweet_mali_service_selftest();
 	IOLockUnlock(sm_lock);
 	registerService();
+	{
+		uint32_t ws = 0, wt = 0;
+		if (PE_parse_boot_argn("sweetwdt", &ws, sizeof(ws)) && ws != 0) {
+			PE_parse_boot_argn("sweetwdttest", &wt, sizeof(wt));
+			sm_wdt_arm(ws, wt);
+		}
+	}
 	{
 		/* boot-arg sweetautorec=<seconds>: unconditional reboot into the recovery after that long */
 		uint32_t secs = 0;
