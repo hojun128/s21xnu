@@ -276,7 +276,7 @@ mali_power(int on)
 /* ---- recovery: a faulted job leaves the job manager wedged (every later job reports 0x5b), so soft-reset
  * the GPU and power it back up; the next submit re-programs the address space ---- */
 static uint32_t mali_faults;     /* after MALI_MAX_FAULTS faults/timeouts the GPU is fenced off until reboot */
-#define MALI_MAX_FAULTS 3
+#define MALI_MAX_FAULTS 12
 
 static void
 mali_recover(const char *why)

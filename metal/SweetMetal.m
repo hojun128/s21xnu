@@ -165,12 +165,19 @@ static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uin
 static bool sm_gpu_off;   /* a job timed out (or the kernel fenced the GPU): no more GPU work this boot */
 static char sm_off_reason[160];   /* why, repeated in every "alive" line so a wrapped pmsg log still shows it */
 static char sm_cur_pass[96];      /* what was being drawn */
+static char sm_fail_log[240];     /* first GPU failures, also repeated in the alive lines */
 static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 {
 	if (sm_gpu_off) return 0xFFFCu;
 	uint64_t in[3] = { slot, jc, 2000 }, out[1] = { 0xdead }; uint32_t oc = 1;
 	kern_return_t kr = IOConnectCallMethod(sm_conn, 3, in, 3, NULL, 0, out, &oc, NULL, NULL);
 	uint32_t r = kr ? 0xffff0000u | (uint32_t)kr : (uint32_t)out[0];
+	static int nfail;
+	if (r && nfail < 3) {
+		nfail++;
+		size_t L = strlen(sm_fail_log);
+		snprintf(sm_fail_log + L, sizeof sm_fail_log - L, "%x/s%u@%.36s; ", r, slot, sm_cur_pass);
+	}
 	if (r == 0xFFFFu || r == 0xFFFCu || (r >> 16) == 0xffff) {
 		sm_gpu_off = true;
 		snprintf(sm_off_reason, sizeof sm_off_reason, "status %x slot %u in %s", r, slot, sm_cur_pass);
@@ -421,6 +428,7 @@ typedef struct {
 	uint32_t push_words, work_regs, sec_off, flags; uint64_t sec_preload;
 	uint32_t nvar, cdata_size;
 	const uint8_t *bin, *cdata;
+	uint32_t bad;   /* its pass faulted on the GPU: draws using it are skipped from then on */
 } sm_shader;
 static sm_shader *sm_pack; static uint32_t sm_pack_n;
 #define SMF_READS_TILE (1u << 8)
@@ -1281,7 +1289,7 @@ static void sm_fc_hook(void)
 	__unsafe_unretained SweetMTLTexture *_tex[8];
 	__unsafe_unretained SweetMTLSampler *_smp[8];
 	sm_drawrec _draws[32];
-	uint32_t _ndraw;
+	uint32_t _ndraw, _skipped;
 	uint64_t _bufBase[31];
 	uint64_t _fbuf[31], _fbufBase[31];
 	MTLScissorRect _scissor;
@@ -1375,6 +1383,7 @@ static void sm_fc_hook(void)
 		if (x0 >= x1 || y0 >= y1) return NULL;  /* empty scissor: nothing to draw */
 		r->has_scissor = 1; r->sc_x0 = x0; r->sc_y0 = y0; r->sc_x1 = x1 - 1; r->sc_y1 = y1 - 1;
 	}
+	if (_pipeline.fs && _pipeline.fs->bad) { _skipped++; return NULL; }
 	r->vs = _pipeline.vs; r->fs = _pipeline.fs; r->wmask = 0xF;
 	memcpy(r->buf, _buf, sizeof _buf);
 	memcpy(r->fbuf, _fbuf, sizeof _fbuf);
@@ -1510,8 +1519,15 @@ static void sm_fc_hook(void)
 				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, n, &vs);
 			}
 			slog("SweetMTL: pass %u draws (%s) load=%d clear=%d blend0=%u vertex=%x fragment=%x", e->_ndraw, generic ? "translated" : "fixed", e.load, e.clear, e->_draws[0].blend_on ? (e->_draws[0].rgb_sf << 8 | e->_draws[0].rgb_df) : 0, vs, _lastJobStatus);
+			if (generic && _lastJobStatus && _lastJobStatus != 0xFFFCu) {
+				/* fragment fault: quarantine every fragment shader of this pass (the GPU was reset by the kernel) */
+				for (uint32_t i = 0; i < e->_ndraw; i++) {
+					sm_shader *f = (sm_shader *)e->_draws[i].fs;
+					if (f && !f->bad) { f->bad = 1; slog("SweetMTL: quarantined %s after fragment status %x", f->name, _lastJobStatus); }
+				}
+			}
 			static int nbis;
-			if (generic && _lastJobStatus && nbis++ < 3) {
+			if (generic && _lastJobStatus && nbis++ < 0) {   /* per-draw replay off: its own faults used up the kernel fault budget (run50) */
 				/* fragment fault: replay each draw alone (the kernel resets the GPU after a fault), once as recorded
 				 * and once with its fragment buffers redirected to the dummy page, to find which binding faults */
 				for (uint32_t i = 0; i < e->_ndraw; i++) {
@@ -1565,7 +1581,7 @@ static void sm_fc_hook(void)
 				}
 			}
 			static int ndiag;
-			if (generic && !_lastJobStatus && ndiag++ < 3) {
+			if (generic && !_lastJobStatus && ndiag++ < 0) {
 				/* coverage check: replay each draw alone over a cleared target, once with the green test shader and once
 				 * as translated; count changed pixels and the most common written values */
 				const uint8_t *c = e.target.bo->cpu; uint32_t W = (uint32_t)e.target.width, H = (uint32_t)e.target.height, bpr = (uint32_t)e.target.bytesPerRow;
@@ -1771,7 +1787,10 @@ static void *sm_watchdog(void *arg)
 	for (int t = 1;; t++) {
 		sleep(10);
 		uint32_t c = sm_commits;
-		if (t % 3 == 0) slog("SweetMTL: alive %ds commits=%u%s%s", t * 10, c, sm_off_reason[0] ? " OFF: " : "", sm_off_reason);
+		if (t % 3 == 0) {
+			slog("SweetMTL: alive %ds commits=%u%s%s", t * 10, c, sm_off_reason[0] ? " OFF: " : "", sm_off_reason);
+			if (sm_fail_log[0]) slog("SweetMTL: fails: %s", sm_fail_log);
+		}
 		if (c && c == last && dumps < 2) { slog("SweetMTL: STALL at commit %u, threads:", c); sm_dump_threads(); dumps++; }
 		last = c;
 	}
