@@ -927,6 +927,49 @@ static void sm_fc_hook(void)
 @protocol MTLDeviceSPI <MTLDevice>
 @end
 
+/* ------------------------------------------------------------------ crash diagnostics */
+#include <signal.h>
+#include <execinfo.h>
+#include <dlfcn.h>
+#include <sys/ucontext.h>
+static void sm_sym(const char *tag, void *pc)
+{
+	Dl_info di; memset(&di, 0, sizeof di);
+	if (dladdr(pc, &di) && di.dli_sname)
+		slog("SweetMTL: %s %p %s+0x%lx (%s)", tag, pc, di.dli_sname, (unsigned long)((char *)pc - (char *)di.dli_saddr),
+		    di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?");
+	else
+		slog("SweetMTL: %s %p (%s+0x%lx)", tag, pc, di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?",
+		    (unsigned long)((char *)pc - (char *)di.dli_fbase));
+}
+static void sm_bt(void)
+{
+	void *f[24]; int n = backtrace(f, 24);
+	for (int i = 0; i < n; i++) sm_sym("  bt", f[i]);
+}
+static void sm_sig(int sig, siginfo_t *si, void *uc)
+{
+	ucontext_t *u = uc;
+	slog("SweetMTL: SIGNAL %d in %s addr=%p", sig, getprogname(), si ? si->si_addr : NULL);
+	if (u && u->uc_mcontext) { sm_sym("pc", (void *)u->uc_mcontext->__ss.__pc); sm_sym("lr", (void *)u->uc_mcontext->__ss.__lr); }
+	sm_bt();
+	signal(sig, SIG_DFL); raise(sig);
+}
+static void sm_exc(NSException *e)
+{
+	slog("SweetMTL: EXCEPTION %s: %s", e.name.UTF8String, e.reason.UTF8String ?: "-");
+	int i = 0;
+	for (NSNumber *a in e.callStackReturnAddresses) { if (i++ > 20) break; sm_sym("  ebt", (void *)a.unsignedLongValue); }
+}
+static void sm_diag_install(void)
+{
+	struct sigaction sa; memset(&sa, 0, sizeof sa);
+	sa.sa_sigaction = sm_sig; sa.sa_flags = SA_SIGINFO;
+	int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGTRAP, SIGFPE };
+	for (unsigned i = 0; i < sizeof sigs / sizeof *sigs; i++) sigaction(sigs[i], &sa, NULL);
+	NSSetUncaughtExceptionHandler(sm_exc);
+}
+
 @interface SweetMTLDevice : _MTLDevice <MTLDevice, MTLDeviceSPI>
 @end
 
@@ -937,6 +980,7 @@ static void sm_fc_hook(void)
 + (void)load
 {
 	sm_fc_hook();
+	if (getprogname() && strcmp(getprogname(), "malitest")) sm_diag_install();
 	slog("SweetMTL: +load in %s, super=%s", getprogname() ? getprogname() : "?", class_getName(class_getSuperclass(self)));
 }
 
@@ -1014,6 +1058,14 @@ static void sm_fc_hook(void)
 - (BOOL)isHeadless { return NO; }
 - (BOOL)isRemovable { return NO; }
 - (uint32_t)acceleratorPort { return _smPort; }
+
+- (BOOL)respondsToSelector:(SEL)sel
+{
+	BOOL r = [super respondsToSelector:sel];
+	static int nlog;
+	if (nlog < 120) { nlog++; slog("SweetMTL: responds %s -> %d", sel_getName(sel), r); }
+	return r;
+}
 
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
 {
