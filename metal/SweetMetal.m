@@ -690,7 +690,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		for (int k = 0; k < 8; k++) { uint64_t v = r->buf[k] ? r->buf[k] : (havedummy ? dummy.gpu : 0); memcpy(push + SMP_BUF + 8 * k, &v, 8); }
 		for (int L = 0; L < 8; L++) {
 			uint32_t bi = r->attr[L].bidx;
-			uint64_t va = bi < 31 && r->buf[bi] ? r->buf[bi] + r->attr[L].off : 0;
+			uint64_t va = bi < 31 && r->buf[bi] ? r->buf[bi] + r->attr[L].off : (havedummy ? dummy.gpu : 0);  /* unbound attribute: zeroed page, never VA 0 */
 			uint32_t st = bi < 31 ? r->stride[bi] : 0;
 			memcpy(push + SMP_ATTR + 16 * L, &va, 8); memcpy(push + SMP_ATTR + 16 * L + 8, &st, 4);
 		}
