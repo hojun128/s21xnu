@@ -107,6 +107,29 @@ static uint64_t sm_ring_put(const void *p, uint64_t len, uint8_t **cpu_out)
 	return va;
 }
 
+/* Frame capture for headless debugging: the first passes are written, downscaled 3x, into a preallocated file of the
+ * HFS+ rootfs (/private/var/sweetfr.bin, 8 slots of 2 MiB) that the Mac reads back from TWRP. */
+#include <fcntl.h>
+static void sm_capture(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uint32_t fmt, uint32_t passno)
+{
+	static int slot;
+	if (slot >= 8 || !c) return;
+	int fd = open("/private/var/sweetfr.bin", O_WRONLY);
+	if (fd < 0) { static int nl; if (nl++ < 2) slog("SweetMTL: capture open failed errno %d", errno); return; }
+	uint32_t w = W / 3, h = H / 3;
+	if ((uint64_t)w * h * 4 + 64 > (2u << 20)) { close(fd); return; }
+	uint8_t *buf = calloc(1, 64 + (size_t)w * h * 4);
+	memcpy(buf, "SWFRAME1", 8);
+	uint32_t hd[6] = { w, h, w * 4, fmt, passno, W };
+	memcpy(buf + 8, hd, sizeof hd);
+	for (uint32_t y = 0; y < h; y++)
+		for (uint32_t x = 0; x < w; x++) memcpy(buf + 64 + ((size_t)y * w + x) * 4, c + (size_t)(y * 3) * bpr + (size_t)x * 3 * 4, 4);
+	ssize_t r = pwrite(fd, buf, 64 + (size_t)w * h * 4, (off_t)slot * (2u << 20));
+	fsync(fd); close(fd); free(buf);
+	slog("SweetMTL: captured pass %u into slot %d (%zd bytes)", passno, slot, r);
+	slot++;
+}
+
 static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 {
 	uint64_t in[3] = { slot, jc, 2000 }, out[1] = { 0xdead }; uint32_t oc = 1;
@@ -1217,6 +1240,7 @@ static void sm_fc_hook(void)
 					hsh = (hsh ^ v) * 16777619u;
 					if (gy == gx) px[gy] = v;
 				}
+				sm_capture(c, W, H, bpr, (uint32_t)e.target.pixelFormat, (uint32_t)nsamp);
 				slog("SweetMTL: target %ux%u fmt %lu nz=%u/16 hash=%08x diag %08x %08x %08x %08x", W, H, (unsigned long)e.target.pixelFormat, nz, hsh, px[0], px[1], px[2], px[3]);
 			}
 			if (_lastJobStatus != 0 || vs != 0) _status = 5;
