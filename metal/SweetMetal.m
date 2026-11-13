@@ -456,7 +456,7 @@ typedef struct {
 	uint64_t fbuf[31];               /* fragment-stage buffers (separate push block) */
 	struct { uint32_t fmt, off, bidx; } attr[16];
 	uint32_t stride[31];
-	struct { uint64_t va; uint32_t w, h, stride, fmt; } tex[8];
+	struct { uint64_t va; uint32_t w, h, stride, fmt, pf, imp; } tex[8];
 	struct { uint32_t nearest, wrap; } smp[8];
 	uint32_t ntex, nsmp;
 	uint32_t fc[64]; uint64_t fc_defined;
@@ -1281,6 +1281,7 @@ static void sm_fc_hook(void)
 		if (t) {
 			r->tex[k].va = t.bo->gpu; r->tex[k].w = (uint32_t)t.width; r->tex[k].h = (uint32_t)t.height;
 			r->tex[k].stride = (uint32_t)t.bytesPerRow; r->tex[k].fmt = [t maliFormat];
+			r->tex[k].pf = (uint32_t)t.pixelFormat; r->tex[k].imp = t.bo->imported;
 			r->ntex = k + 1;
 		}
 		if (_smp[k]) { r->smp[k].nearest = _smp[k].nearest; r->nsmp = k + 1; }
@@ -1412,6 +1413,20 @@ static void sm_fc_hook(void)
 					    (uint32_t)e.target.bytesPerRow, e.packed, bgra, &one, 1, &v3, false);
 					slog("SweetMTL: bisect pass%d draw%u fs=%s ntex=%u: as-is %x/%x, nofbuf %x/%x, notex %x/%x", nbis, i,
 					    one.fs ? one.fs->name : "-", e->_draws[i].ntex, v1, f1, v2, f2, v3, f3);
+					if (f1 && !f3) {
+						/* textures are to blame: describe each and replay with just that one swapped for the null texture */
+						for (uint32_t k = 0; k < e->_draws[i].ntex; k++) {
+							const sm_drawrec *o = &e->_draws[i];
+							if (!o->tex[k].va) continue;
+							one = *o; one.tex[k].va = 0;
+							uint32_t v4 = 0;
+							uint32_t f4 = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
+							    (uint32_t)e.target.bytesPerRow, e.packed, bgra, &one, 1, &v4, false);
+							slog("SweetMTL: bisect  tex%u va %llx %ux%u stride %u fmt %x pf %u imp %u target %llx -> without it %x/%x", k,
+							    o->tex[k].va, o->tex[k].w, o->tex[k].h, o->tex[k].stride, o->tex[k].fmt, o->tex[k].pf, o->tex[k].imp,
+							    e.target.bo->gpu, v4, f4);
+						}
+					}
 				}
 				uint32_t v0 = 0;
 				uint32_t f0 = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
