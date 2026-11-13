@@ -30,7 +30,7 @@ diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPl
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,139 @@
 +/*
 + * Minimal device-tree platform expert for Redmi Note 10 Pro (sweet).
 + * Uses XNU's normal platform, power-domain and nub initialization. Hardware
@@ -60,6 +60,9 @@ new file mode 100644
 +
 +/* S21: PMU_ALIVE, mapped at start so a panic can reboot without allocating */
 +extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" void sweet_mali_log_str(const char *s);      /* bsd/dev/sweet_mali.c: one line into the pmsg log */
++extern "C" char *debug_buf_base;
++extern "C" char *debug_buf_ptr;
 +static volatile uint32_t *sweet_pmu;
 +
 +/*
@@ -71,6 +74,28 @@ new file mode 100644
 +SweetPlatformExpert::haltRestart(unsigned int type)
 +{
 +	if ((type == kPEPanicRestartCPU || type == kPEPanicRestartCPUNoCallouts) && sweet_pmu != NULL) {
++		/* copy the head of the panic log (panic string + backtrace) into the pmsg log first */
++		if (debug_buf_base != NULL && debug_buf_ptr > debug_buf_base) {
++			char line[180];
++			const char *p = debug_buf_base, *end = debug_buf_ptr;
++			if (end - p > 2400) {
++				end = p + 2400;
++			}
++			sweet_mali_log_str("PANIC LOG:");
++			while (p < end) {
++				int n = 0;
++				while (p < end && *p != '\n' && n < (int)sizeof(line) - 1) {
++					line[n++] = *p++;
++				}
++				line[n] = 0;
++				if (p < end && *p == '\n') {
++					p++;
++				}
++				if (n > 0) {
++					sweet_mali_log_str(line);
++				}
++			}
++		}
 +		volatile uint32_t *r = sweet_pmu;
 +		r[0x808 / 4] = (r[0x808 / 4] & ~0x00FF0000U) | 0x004E0000U;
 +		r[0x80c / 4] = 0x12345604U;

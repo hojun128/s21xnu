@@ -60,12 +60,14 @@ extern kern_return_t IOConnectMapMemory64(io_connect_t, uint32_t, task_port_t, m
 #define PAN_ARCH 9
 #include "genxml/gen_macros.h"
 
-typedef struct { uint64_t handle, gpu; uint8_t *cpu; uint64_t size; uint32_t imported; } sm_bo;
+typedef struct { uint64_t handle, gpu; uint8_t *cpu; uint64_t size; uint32_t imported; uint64_t vbase, vsize; } sm_bo;
 /* BGRA8 and the 32-bit BGR10 XR display formats CoreAnimation renders into: everything is stored as 8-bit BGRA here,
  * consistently for rendering, sampling and the kernel's copy to the panel */
 static inline bool sm_is_bgra(NSUInteger f) { return f == 80 || f == 81 || (f >= 550 && f <= 555); }
 static volatile uint32_t sm_commits;
 static uint64_t sm_next_va = 0x30000000ULL;
+static uint64_t sm_va_take(uint64_t size);
+static uint64_t sm_live_bytes; static uint32_t sm_live_n;
 
 static bool sm_bo_alloc(sm_bo *bo, uint64_t size)
 {
@@ -76,17 +78,40 @@ static bool sm_bo_alloc(sm_bo *bo, uint64_t size)
 	if (IOConnectCallMethod(sm_conn, 1, in, 1, NULL, 0, out, &oc, NULL, NULL)) return false;
 	mach_vm_address_t ua = 0; mach_vm_size_t us = 0;
 	if (IOConnectMapMemory64(sm_conn, (uint32_t)out[0], mach_task_self(), &ua, &us, 1)) return false;
-	in[0] = out[0]; in[1] = sm_next_va; oc = 0;
+	uint64_t vs = size + 0x10000, va = sm_va_take(vs);
+	in[0] = out[0]; in[1] = va; oc = 0;
 	if (IOConnectCallMethod(sm_conn, 2, in, 2, NULL, 0, NULL, &oc, NULL, NULL)) return false;
-	bo->handle = out[0]; bo->gpu = sm_next_va; bo->cpu = (uint8_t *)ua; bo->size = size;
-	sm_next_va += size + 0x10000;
+	bo->handle = out[0]; bo->gpu = va; bo->cpu = (uint8_t *)ua; bo->size = size;
+	bo->vbase = va; bo->vsize = vs; sm_live_bytes += vs; sm_live_n++;
 	return true;
 }
 
 extern kern_return_t IOConnectUnmapMemory64(io_connect_t, uint32_t, task_port_t, mach_vm_address_t);
+/* live GPU memory (for the alive line) and recycled GPU VA ranges: the kernel never frees page-table pages,
+ * so an ever-growing VA cursor slowly exhausts its 1 MiB table pool */
+static struct { uint64_t va, size; } sm_vfree[512]; static uint32_t sm_vfree_n;
+static uint64_t sm_va_take(uint64_t size)
+{
+	for (uint32_t i = 0; i < sm_vfree_n; i++) {
+		if (sm_vfree[i].size >= size) {
+			uint64_t va = sm_vfree[i].va;
+			sm_vfree[i].va += size; sm_vfree[i].size -= size;
+			if (!sm_vfree[i].size) sm_vfree[i] = sm_vfree[--sm_vfree_n];
+			return va;
+		}
+	}
+	uint64_t va = sm_next_va; sm_next_va += size;
+	return va;
+}
+static void sm_va_give(uint64_t va, uint64_t size)
+{
+	if (sm_vfree_n < 512) { sm_vfree[sm_vfree_n].va = va; sm_vfree[sm_vfree_n].size = size; sm_vfree_n++; }
+}
+void sm_va_give_ext(uint64_t va, uint64_t size) { sm_va_give(va, size); }
 static void sm_bo_free(sm_bo *bo)
 {
 	if (!sm_conn || !bo->handle) return;
+	if (bo->vsize) { sm_va_give(bo->vbase, bo->vsize); sm_live_bytes -= bo->vsize; sm_live_n--; }
 	if (!bo->imported && bo->cpu) IOConnectUnmapMemory64(sm_conn, (uint32_t)bo->handle, mach_task_self(), (mach_vm_address_t)bo->cpu);
 	uint64_t in[1] = { bo->handle }; uint32_t oc = 0;
 	IOConnectCallMethod(sm_conn, 4, in, 1, NULL, 0, NULL, &oc, NULL, NULL);
@@ -97,11 +122,17 @@ static bool sm_bo_import(sm_bo *bo, void *uva, uint64_t len)
 {
 	if (!sm_conn) return false;
 	uint64_t a0 = (uint64_t)uva & ~0x3FFFULL, a1 = ((uint64_t)uva + len + 0x3FFF) & ~0x3FFFULL;
-	uint64_t in[3] = { a0, a1 - a0, sm_next_va }, out[1] = { 0 }; uint32_t oc = 1;
+	uint64_t vs = (a1 - a0) + 0x10000, va = sm_va_take(vs);
+	uint64_t in[3] = { a0, a1 - a0, va }, out[1] = { 0 }; uint32_t oc = 1;
 	kern_return_t kr = IOConnectCallMethod(sm_conn, 8, in, 3, NULL, 0, out, &oc, NULL, NULL);
-	if (kr) { static int nl; if (nl++ < 6) slog("SweetMTL: import %llx+%llx failed %x", a0, a1 - a0, kr); return false; }
-	bo->handle = out[0]; bo->gpu = sm_next_va + ((uint64_t)uva - a0); bo->cpu = uva; bo->size = len; bo->imported = 1;
-	sm_next_va += (a1 - a0) + 0x10000;
+	if (kr) {
+		extern void sm_va_give_ext(uint64_t, uint64_t);
+		sm_va_give_ext(va, vs);
+		static int nl; if (nl++ < 6) slog("SweetMTL: import %llx+%llx failed %x (live %lluMB in %u)", a0, a1 - a0, kr, sm_live_bytes >> 20, sm_live_n);
+		return false;
+	}
+	bo->handle = out[0]; bo->gpu = va + ((uint64_t)uva - a0); bo->cpu = uva; bo->size = len; bo->imported = 1;
+	bo->vbase = va; bo->vsize = vs; sm_live_bytes += vs; sm_live_n++;
 	return true;
 }
 /* transient bytes (setVertexBytes & co): one ring, reused every pass */
@@ -1846,7 +1877,8 @@ static void *sm_watchdog(void *arg)
 		sleep(10);
 		uint32_t c = sm_commits;
 		if (t % 3 == 0) {
-			slog("SweetMTL: alive %ds commits=%u%s%s", t * 10, c, sm_off_reason[0] ? " OFF: " : "", sm_off_reason);
+			slog("SweetMTL: alive %ds commits=%u bo %lluMB/%u vfree %u%s%s", t * 10, c, sm_live_bytes >> 20, sm_live_n, sm_vfree_n,
+			    sm_off_reason[0] ? " OFF: " : "", sm_off_reason);
 			if (sm_fail_log[0]) slog("SweetMTL: fails: %s", sm_fail_log);
 		}
 		if (c && c == last && dumps < 2) { slog("SweetMTL: STALL at commit %u, threads:", c); sm_dump_threads(); dumps++; }
