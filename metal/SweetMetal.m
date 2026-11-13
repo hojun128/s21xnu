@@ -595,6 +595,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic, strong) NSDictionary *constants;      /* index -> uint32 */
 @end
+static NSMutableDictionary *sm_fc_dict(id obj);
 @implementation SweetMTLFunction
 - (MTLFunctionType)functionType
 {
