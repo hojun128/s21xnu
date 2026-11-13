@@ -451,6 +451,7 @@ typedef struct {
 	uint32_t vcount, vstart;
 	uint64_t index_va; uint32_t index_type; int32_t base_vertex;
 	uint32_t sc_x0, sc_y0, sc_x1, sc_y1, has_scissor;
+	uint32_t blend_on, rgb_op, a_op, rgb_sf, rgb_df, a_sf, a_df, wmask;
 	uint64_t buf[31];                /* GPU VA bound at each Metal buffer index */
 	struct { uint32_t fmt, off, bidx; } attr[16];
 	uint32_t stride[31];
@@ -482,10 +483,79 @@ static void sm_shader_desc(void *dst, const sm_shader *s, uint32_t stage, uint64
 	}
 }
 
+/* Metal blend state -> Mali fixed-function equation (logic after Mesa pan_blend.c, MIT) */
+static bool sm_bf_inverted(uint32_t f)   /* hardware sees ONE as inverted ZERO */
+{
+	switch (f) { case MTLBlendFactorOne: case MTLBlendFactorOneMinusSourceColor: case MTLBlendFactorOneMinusSourceAlpha:
+	case MTLBlendFactorOneMinusDestinationColor: case MTLBlendFactorOneMinusDestinationAlpha: case MTLBlendFactorOneMinusBlendColor:
+	case MTLBlendFactorOneMinusBlendAlpha: return true; default: return false; }
+}
+static uint32_t sm_bf_c(uint32_t f)
+{
+	switch (f) {
+	case MTLBlendFactorZero: case MTLBlendFactorOne: return MALI_BLEND_OPERAND_C_ZERO;
+	case MTLBlendFactorSourceAlpha: case MTLBlendFactorOneMinusSourceAlpha: return MALI_BLEND_OPERAND_C_SRC_ALPHA;
+	case MTLBlendFactorDestinationAlpha: case MTLBlendFactorOneMinusDestinationAlpha: return MALI_BLEND_OPERAND_C_DEST_ALPHA;
+	case MTLBlendFactorSourceColor: case MTLBlendFactorOneMinusSourceColor: return MALI_BLEND_OPERAND_C_SRC;
+	case MTLBlendFactorDestinationColor: case MTLBlendFactorOneMinusDestinationColor: return MALI_BLEND_OPERAND_C_DEST;
+	default: return MALI_BLEND_OPERAND_C_CONSTANT;
+	}
+}
+static uint32_t sm_bf_base(uint32_t f) { return sm_bf_c(f) | (f == MTLBlendFactorZero || f == MTLBlendFactorOne ? 0x100 : 0); }
+static bool sm_blend_func(uint32_t op, uint32_t sf, uint32_t df, struct MALI_BLEND_FUNCTION *fn)
+{
+	memset(fn, 0, sizeof *fn);
+	if (op > MTLBlendOperationReverseSubtract || sf == MTLBlendFactorSourceAlphaSaturated || df == MTLBlendFactorSourceAlphaSaturated) return false;
+	bool si = sm_bf_inverted(sf), di = sm_bf_inverted(df);
+	if (sf == MTLBlendFactorZero) {
+		fn->a = MALI_BLEND_OPERAND_A_ZERO; fn->b = MALI_BLEND_OPERAND_B_DEST; fn->negate_b = op == MTLBlendOperationSubtract;
+		fn->invert_c = di; fn->c = sm_bf_c(df);
+	} else if (sf == MTLBlendFactorOne) {
+		fn->a = MALI_BLEND_OPERAND_A_SRC; fn->b = MALI_BLEND_OPERAND_B_DEST;
+		fn->negate_b = op == MTLBlendOperationSubtract; fn->negate_a = op == MTLBlendOperationReverseSubtract;
+		fn->invert_c = di; fn->c = sm_bf_c(df);
+	} else if (df == MTLBlendFactorZero) {
+		fn->a = MALI_BLEND_OPERAND_A_ZERO; fn->b = MALI_BLEND_OPERAND_B_SRC; fn->negate_b = op == MTLBlendOperationReverseSubtract;
+		fn->invert_c = si; fn->c = sm_bf_c(sf);
+	} else if (df == MTLBlendFactorOne) {
+		fn->a = MALI_BLEND_OPERAND_A_DEST; fn->b = MALI_BLEND_OPERAND_B_SRC;
+		fn->negate_a = op == MTLBlendOperationSubtract; fn->negate_b = op == MTLBlendOperationReverseSubtract;
+		fn->invert_c = si; fn->c = sm_bf_c(sf);
+	} else if (sf == df) {
+		fn->a = MALI_BLEND_OPERAND_A_ZERO; fn->invert_c = si; fn->c = sm_bf_c(sf);
+		if (op == MTLBlendOperationAdd) fn->b = MALI_BLEND_OPERAND_B_SRC_PLUS_DEST;
+		else { fn->b = MALI_BLEND_OPERAND_B_SRC_MINUS_DEST; fn->negate_b = op == MTLBlendOperationReverseSubtract; }
+	} else if ((sm_bf_base(sf) & 0xff) == (sm_bf_base(df) & 0xff) && si != di) {
+		fn->a = MALI_BLEND_OPERAND_A_DEST; fn->invert_c = si; fn->c = sm_bf_c(sf);
+		if (op == MTLBlendOperationAdd) fn->b = MALI_BLEND_OPERAND_B_SRC_MINUS_DEST;
+		else if (op == MTLBlendOperationReverseSubtract) { fn->b = MALI_BLEND_OPERAND_B_SRC_PLUS_DEST; fn->negate_b = true; }
+		else { fn->b = MALI_BLEND_OPERAND_B_SRC_PLUS_DEST; fn->negate_a = true; }
+	} else return false;
+	return true;
+}
+static void sm_pack_blend(void *dst, const sm_drawrec *r)
+{
+	pan_pack(dst, BLEND, b) {
+		b.round_to_fb_precision = true;
+		uint32_t m = r ? r->wmask : 0xF;
+		b.equation.color_mask = ((m & 8) ? 1 : 0) | ((m & 4) ? 2 : 0) | ((m & 2) ? 4 : 0) | ((m & 1) ? 8 : 0);
+		bool ok = r && r->blend_on && sm_blend_func(r->rgb_op, r->rgb_sf, r->rgb_df, &b.equation.rgb) &&
+		    sm_blend_func(r->a_op, r->a_sf, r->a_df, &b.equation.alpha);
+		if (!ok) {
+			b.equation.rgb.a = MALI_BLEND_OPERAND_A_SRC; b.equation.rgb.b = MALI_BLEND_OPERAND_B_SRC; b.equation.rgb.c = MALI_BLEND_OPERAND_C_ZERO;
+			b.equation.alpha.a = MALI_BLEND_OPERAND_A_SRC; b.equation.alpha.b = MALI_BLEND_OPERAND_B_SRC; b.equation.alpha.c = MALI_BLEND_OPERAND_C_ZERO;
+			b.internal.mode = MALI_BLEND_MODE_OPAQUE;
+		} else { b.internal.mode = MALI_BLEND_MODE_FIXED_FUNCTION; b.load_destination = true; }
+		b.internal.fixed_function.num_comps = 4; b.internal.fixed_function.rt = 0;
+		b.internal.fixed_function.conversion.memory_format = (MALI_RGBA8_TB << 12) | MALI_RGB_COMPONENT_ORDER_RGBA;
+	}
+}
+
 /* A whole render pass: clear + N draws (one MALLOC_VERTEX job each, shared tiler context) + one FRAGMENT job. */
 static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w, uint32_t h, uint32_t stride,
-    uint32_t packed, bool bgra, const sm_drawrec *dr, uint32_t ndraw, uint32_t *vstatus)
+    uint32_t packed, bool bgra, const sm_drawrec *dr, uint32_t ndraw, uint32_t *vstatus, bool preload)
 {
+	if (preload) { const sm_shader *rs = sm_find(@"read_surf_frag"); if (!rs || rs->size > 0x300) preload = false; }
 	uint8_t *cpu = desc->cpu;
 	uint64_t D = desc->gpu;
 	memset(cpu, 0, 0x1000);
@@ -501,7 +571,8 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	{ uint16_t *sp = (uint16_t *)(cpu + OFF_SAMP); for (int i = 0; i < 128; i++) sp[i] = 128; }
 	void *fbd = cpu + OFF_FBD;
 	pan_section_pack(fbd, FRAMEBUFFER, PARAMETERS, cfg) {
-		cfg.pre_frame_0 = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
+		cfg.pre_frame_0 = preload ? MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS : MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
+		if (preload) cfg.frame_shader_dcds = D + 0x1000;
 		cfg.pre_frame_1 = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
 		cfg.post_frame = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
 		cfg.width = w; cfg.height = h; cfg.bound_max_x = w - 1; cfg.bound_max_y = h - 1;
@@ -537,6 +608,37 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	}
 	static sm_bo dummy; static bool havedummy;
 	if (!havedummy) havedummy = sm_bo_alloc(&dummy, 0x10000);
+	if (preload) {
+		/* loadAction = load: a pre-frame DCD runs read_surf_frag (texture 0 at the fragment position) over every tile */
+		const sm_shader *ps = sm_find(@"read_surf_frag");
+		uint8_t *Q = cpu + 0x1000; uint64_t QV = D + 0x1000;
+		memset(Q, 0, 0x800);
+		if (ps && ps->size <= 0x300) {
+			memcpy(Q + 0x400, ps->bin, ps->size);
+			sm_shader_desc(Q + 0x180, ps, MALI_SHADER_STAGE_FRAGMENT, QV + 0x400, ps->preload, ps->work_regs);
+			uint32_t fmt = (MALI_RGBA8_UNORM << 12) | (bgra ? MALI_RGB_COMPONENT_ORDER_BGRA : MALI_RGB_COMPONENT_ORDER_RGBA);
+			pan_pack(Q + 0x260, PLANE, pl) {
+				pl.plane_type = MALI_PLANE_TYPE_GENERIC; pl.clump_format = MALI_CLUMP_FORMAT_RAW32; pl.clump_ordering = MALI_CLUMP_ORDERING_LINEAR;
+				pl.pointer = target_va; pl.row_stride = stride; pl.size = stride * h; pl.slice_stride = stride * h;
+			}
+			pan_pack(Q + 0x240, TEXTURE, tx) {
+				tx.dimension = MALI_TEXTURE_DIMENSION_2D; tx.format = fmt; tx.width = w; tx.height = h; tx.sample_count = 1;
+				tx.swizzle = 0 | (1 << 3) | (2 << 6) | (3 << 9); tx.levels = 1; tx.array_size = 1; tx.surfaces = QV + 0x260;
+			}
+			pan_pack(Q + 0x220, SAMPLER, sc) { sc.minify_nearest = true; sc.magnify_nearest = true; sc.normalized_coordinates = true; }
+			pan_pack(Q + 0x1C0 + 3 * 16, RESOURCE, rc) { rc.address = QV + 0x220; rc.size = 32; }
+			pan_pack(Q + 0x1C0 + 4 * 16, RESOURCE, rc) { rc.address = QV + 0x240; rc.size = 32; }
+			sm_pack_blend(Q + 0x2A0, NULL);
+			pan_pack(Q, DRAW, cfg) {
+				cfg.allow_forward_pixel_to_kill = true; cfg.allow_forward_pixel_to_be_killed = true;
+				cfg.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY; cfg.zs_update_operation = MALI_PIXEL_KILL_STRONG_EARLY;
+				cfg.sample_mask = 0xFFFF; cfg.maximum_z = 1.0f; cfg.depth_stencil = D + OFF_DS;
+				cfg.render_target_mask = 1; cfg.blend = QV + 0x2A0; cfg.blend_count = 1;
+				cfg.shader.resources = (QV + 0x1C0) | 6; cfg.shader.shader = QV + 0x180;
+				cfg.shader.thread_storage = D + OFF_TLS; cfg.shader.fau = QV + 0x300; cfg.shader.fau_count = 1;
+			}
+		}
+	}
 	uint32_t vs_all = 0;
 	for (uint32_t i = 0; i < ndraw; i++) {
 		const sm_drawrec *r = &dr[i];
@@ -560,6 +662,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		if (sec) sm_shader_desc(P + 0x220, vs, MALI_SHADER_STAGE_VERTEX, vs_bin + vs->sec_off, vs->sec_preload, vs->work_regs);
 		sm_shader_desc(P + 0x240, fs, MALI_SHADER_STAGE_FRAGMENT, fs_bin, fs ? fs->preload : FS_GREEN_PRELOAD, fs_wr);
 		(void)fs_preload_hi;
+		sm_pack_blend(P + 0x300, r);
 		/* push constants (see air2nir.py ABI) */
 		uint8_t *push = P + 0x400;
 		{
@@ -643,7 +746,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 			cfg.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY; cfg.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
 			cfg.sample_mask = 0xFFFF; cfg.single_sampled_lines = true; cfg.vertex_array.packet = true;
 			cfg.minimum_z = 0.0f; cfg.maximum_z = 1.0f; cfg.depth_stencil = D + OFF_DS;
-			cfg.render_target_mask = 1; cfg.blend = D + OFF_BLEND; cfg.blend_count = 1;
+			cfg.render_target_mask = 1; cfg.blend = PV + 0x300; cfg.blend_count = 1;
 			cfg.overdraw_alpha0 = true; cfg.overdraw_alpha1 = true;
 			cfg.shader.thread_storage = D + OFF_TLS; cfg.shader.shader = PV + 0x240;
 			cfg.shader.fau = PV + 0x400; cfg.shader.fau_count = fs_fau ? fs_fau : 1;
@@ -1021,6 +1124,7 @@ static void sm_fc_hook(void)
 	struct { uint32_t fmt, off, bidx; } _attr[16];
 	uint32_t _stride[31];
 	uint32_t _fc[64]; uint64_t _fcdef;
+	uint32_t _blend[8];
 }
 @end
 
@@ -1041,6 +1145,7 @@ static void sm_fc_hook(void)
 @interface SweetMTLRenderEncoder : SweetMTLObject
 @property (nonatomic, strong) SweetMTLTexture *target;
 @property (nonatomic) BOOL clear;
+@property (nonatomic) BOOL load;
 @property (nonatomic) uint32_t packed;
 @property (nonatomic, strong) SweetMTLRenderPipelineState *pipeline;
 @property (nonatomic, strong) NSMutableArray *keep;     /* buffers referenced by recorded draws */
@@ -1137,12 +1242,15 @@ static void sm_fc_hook(void)
 		if (x0 >= x1 || y0 >= y1) return NULL;  /* empty scissor: nothing to draw */
 		r->has_scissor = 1; r->sc_x0 = x0; r->sc_y0 = y0; r->sc_x1 = x1 - 1; r->sc_y1 = y1 - 1;
 	}
-	r->vs = _pipeline.vs; r->fs = _pipeline.fs;
+	r->vs = _pipeline.vs; r->fs = _pipeline.fs; r->wmask = 0xF;
 	memcpy(r->buf, _buf, sizeof _buf);
 	if (_pipeline) {
 		for (int k = 0; k < 16; k++) { r->attr[k].fmt = _pipeline->_attr[k].fmt; r->attr[k].off = _pipeline->_attr[k].off; r->attr[k].bidx = _pipeline->_attr[k].bidx; }
 		memcpy(r->stride, _pipeline->_stride, sizeof r->stride);
 		memcpy(r->fc, _pipeline->_fc, sizeof r->fc); r->fc_defined = _pipeline->_fcdef;
+		r->blend_on = _pipeline->_blend[0]; r->rgb_op = _pipeline->_blend[1]; r->a_op = _pipeline->_blend[2];
+		r->rgb_sf = _pipeline->_blend[3]; r->rgb_df = _pipeline->_blend[4]; r->a_sf = _pipeline->_blend[5]; r->a_df = _pipeline->_blend[6];
+		r->wmask = _pipeline->_blend[7];
 	}
 	for (uint32_t k = 0; k < 8; k++) {
 		SweetMTLTexture *t = _tex[k];
@@ -1229,6 +1337,7 @@ static void sm_fc_hook(void)
 	MTLRenderPassColorAttachmentDescriptor *ca = d.colorAttachments[0];
 	e.target = (SweetMTLTexture *)ca.texture;
 	e.clear = ca.loadAction == MTLLoadActionClear;
+	e.load = ca.loadAction == MTLLoadActionLoad;
 	MTLClearColor c = ca.clearColor;
 #define SM8(v) ((uint32_t)((v) <= 0 ? 0 : (v) >= 1 ? 255 : (v) * 255.0 + 0.5))
 	e.packed = SM8(c.red) | (SM8(c.green) << 8) | (SM8(c.blue) << 16) | (SM8(c.alpha) << 24);
@@ -1253,14 +1362,14 @@ static void sm_fc_hook(void)
 			uint32_t vs = 0;
 			if (generic) {
 				_lastJobStatus = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
-				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, e->_draws, e->_ndraw, &vs);
+				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, e->_draws, e->_ndraw, &vs, e.load);
 			} else {
 				/* no translated vertex shader: fixed Mesa shaders (phase 2b) */
 				uint32_t n = 0; for (uint32_t i = 0; i < e->_ndraw; i++) n += e->_draws[i].vcount;
 				_lastJobStatus = sm_draw(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
 				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, n, &vs);
 			}
-			slog("SweetMTL: pass %u draws (%s) vertex=%x fragment=%x", e->_ndraw, generic ? "translated" : "fixed", vs, _lastJobStatus);
+			slog("SweetMTL: pass %u draws (%s) load=%d clear=%d blend0=%u vertex=%x fragment=%x", e->_ndraw, generic ? "translated" : "fixed", e.load, e.clear, e->_draws[0].blend_on ? (e->_draws[0].rgb_sf << 8 | e->_draws[0].rgb_df) : 0, vs, _lastJobStatus);
 			static int nsamp;
 			if (nsamp++ < 16) {
 				/* sample a 4x4 grid of the target: proves the GPU wrote real content */
@@ -1498,6 +1607,11 @@ static void *sm_watchdog(void *arg)
 			if (i < 64) { ps->_fc[i] = v.unsignedIntValue; ps->_fcdef |= 1ull << i; }
 		}];
 	}
+	MTLRenderPipelineColorAttachmentDescriptor *ca0 = d.colorAttachments[0];
+	ps->_blend[0] = ca0.blendingEnabled; ps->_blend[1] = (uint32_t)ca0.rgbBlendOperation; ps->_blend[2] = (uint32_t)ca0.alphaBlendOperation;
+	ps->_blend[3] = (uint32_t)ca0.sourceRGBBlendFactor; ps->_blend[4] = (uint32_t)ca0.destinationRGBBlendFactor;
+	ps->_blend[5] = (uint32_t)ca0.sourceAlphaBlendFactor; ps->_blend[6] = (uint32_t)ca0.destinationAlphaBlendFactor;
+	ps->_blend[7] = (uint32_t)ca0.writeMask;
 	MTLVertexDescriptor *vd = d.vertexDescriptor;
 	for (int i = 0; i < 16 && vd; i++) {
 		ps->_attr[i].fmt = (uint32_t)vd.attributes[i].format;
