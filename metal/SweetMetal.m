@@ -1478,6 +1478,17 @@ static void sm_fc_hook(void)
 				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, e->_draws, e->_ndraw, &v0, e.load);
 				slog("SweetMTL: bisect pass%d full replay %x/%x", nbis, v0, f0);
 			}
+			{
+				/* late thumbnails of full-screen targets: a normal boot reaches the lock screen after ~18 min */
+				static int nlate;
+				static const double at[3] = { 800, 1100, 1400 };
+				struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+				if (nlate < 3 && ts.tv_sec >= at[nlate] && e.target.width == 1125 && e.target.bo && e.target.bo->cpu) {
+					nlate++;
+					slog("SweetMTL: late thumb %d at %lds fragment=%x gpuoff=%d", nlate, (long)ts.tv_sec, _lastJobStatus, sm_gpu_off);
+					sm_thumb(e.target.bo->cpu, (uint32_t)e.target.width, (uint32_t)e.target.height, (uint32_t)e.target.bytesPerRow, (uint32_t)(10 + nlate));
+				}
+			}
 			static int ndiag;
 			if (generic && !_lastJobStatus && ndiag++ < 3) {
 				/* coverage check: replay each draw alone over a cleared target, once with the green test shader and once
@@ -1532,7 +1543,7 @@ static void sm_fc_hook(void)
 					if (gy == gx) px[gy] = v;
 				}
 				sm_capture(c, W, H, bpr, (uint32_t)e.target.pixelFormat, (uint32_t)nsamp);
-				if (nsamp == 1 || nsamp == 3) sm_thumb(c, W, H, bpr, (uint32_t)nsamp);
+				if (nsamp == 3) sm_thumb(c, W, H, bpr, (uint32_t)nsamp);
 				slog("SweetMTL: target %ux%u fmt %lu nz=%u/16 hash=%08x diag %08x %08x %08x %08x", W, H, (unsigned long)e.target.pixelFormat, nz, hsh, px[0], px[1], px[2], px[3]);
 			}
 			if (_lastJobStatus != 0 || vs != 0) _status = 5;
