@@ -51,8 +51,8 @@ void sweet_mali_log_str(const char *s);
 }
 
 #define SM_MAX_BO        256
-#define SM_MAX_BO_BYTES  (64ULL << 20)
-#define SM_MAX_TOTAL     (768ULL << 20)
+#define SM_MAX_BO_BYTES  (15ULL << 20)     /* BOs >= 16 MiB stalled the system (2026-11 notes) */
+#define SM_MAX_TOTAL     (320ULL << 20)    /* wired kernel memory; run46 hung late in a long boot */
 
 enum {
 	kSMGetInfo = 0,
@@ -101,14 +101,15 @@ sm_flush_md(IOMemoryDescriptor *md, uint32_t pages)
  */
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
+static volatile uint32_t *sm_pmu;       /* mapped when autorec is armed: mapping at fire time can block under memory pressure */
+
 static void
 sm_reboot_recovery(const char *why)
 {
 	char line[96];
 	snprintf(line, sizeof(line), "reboot to recovery (%s)", why);
 	sweet_mali_log_str(line);
-	IOSleep(400);
-	volatile uint32_t *r = (volatile uint32_t *)ml_io_map(0x15860000U, 0x4000);
+	volatile uint32_t *r = sm_pmu != NULL ? sm_pmu : (volatile uint32_t *)ml_io_map(0x15860000U, 0x4000);
 	r[0x808 / 4] = (r[0x808 / 4] & ~0x00FF0000U) | 0x004E0000U;
 	r[0x80c / 4] = 0x12345604U;
 	r[0x810 / 4] = 0xFFU;
@@ -304,6 +305,7 @@ SweetMali::start(IOService *provider)
 		/* boot-arg sweetautorec=<seconds>: unconditional reboot into the recovery after that long */
 		uint32_t secs = 0;
 		if (PE_parse_boot_argn("sweetautorec", &secs, sizeof(secs)) && secs != 0) {
+			sm_pmu = (volatile uint32_t *)ml_io_map(0x15860000U, 0x4000);
 			thread_call_t tc = thread_call_allocate(sm_autorec_fire, NULL);
 			uint64_t deadline = 0;
 			clock_interval_to_deadline(secs, NSEC_PER_SEC, &deadline);
