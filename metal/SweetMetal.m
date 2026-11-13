@@ -680,6 +680,16 @@ static NSMutableDictionary *sm_fc_dict(id obj);
 	slog("SweetMTL: function %s with %lu constants", name.UTF8String, (unsigned long)f.constants.count);
 	return f;
 }
+- (id)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)err
+{
+	NSString *sp = [d respondsToSelector:@selector(specializedName)] ? [d valueForKey:@"specializedName"] : nil;
+	return [self newFunctionWithName:d.name constantValues:d.constantValues functionCache:nil specializedName:sp error:err];
+}
+- (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d completionHandler:(void (^)(id, NSError *))h
+{
+	id f = [self newFunctionWithDescriptor:d error:NULL];
+	if (h) h(f, nil);
+}
 - (NSArray *)functionNames
 {
 	sm_pack_load();
@@ -760,13 +770,28 @@ static void sm_fc_hook(void)
 - (NSUInteger)sampleCount { return 1; }
 - (NSUInteger)arrayLength { return 1; }
 - (MTLTextureType)textureType { return MTLTextureType2D; }
+- (BOOL)sm_inRegion:(MTLRegion)r level:(NSUInteger)lvl
+{
+	return lvl == 0 && r.origin.x + r.size.width <= _width && r.origin.y + r.size.height <= _height && _store.cpu;
+}
+- (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl slice:(NSUInteger)sl withBytes:(const void *)src bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
+{
+	if (sl == 0) [self replaceRegion:r mipmapLevel:lvl withBytes:src bytesPerRow:bpr];
+}
+- (void)getBytes:(void *)dst bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl slice:(NSUInteger)sl
+{
+	if (sl == 0) [self getBytes:dst bytesPerRow:bpr fromRegion:r mipmapLevel:lvl];
+}
+- (uint8_t *)sm_cpu { return _store.cpu; }
 - (void)getBytes:(void *)dst bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl
 {
+	if (![self sm_inRegion:r level:lvl]) return;
 	for (NSUInteger y = 0; y < r.size.height; y++)
 		memcpy((uint8_t *)dst + y * bpr, _store.cpu + (r.origin.y + y) * _bytesPerRow + r.origin.x * 4, r.size.width * 4);
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl withBytes:(const void *)src bytesPerRow:(NSUInteger)bpr
 {
+	if (![self sm_inRegion:r level:lvl] || !src) return;
 	for (NSUInteger y = 0; y < r.size.height; y++)
 		memcpy(_store.cpu + (r.origin.y + y) * _bytesPerRow + r.origin.x * 4, (const uint8_t *)src + y * bpr, r.size.width * 4);
 }
@@ -871,6 +896,38 @@ static void sm_fc_hook(void)
 @implementation SweetMTLStubEncoder
 - (void)endEncoding {}
 @end
+@interface SweetMTLBlitEncoder : SweetMTLStubEncoder
+@end
+@implementation SweetMTLBlitEncoder
+- (void)copyFromTexture:(id)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)sz
+    toTexture:(id)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO
+{
+	if (![src isKindOfClass:NSClassFromString(@"SweetMTLTexture")] || ![dst isKindOfClass:NSClassFromString(@"SweetMTLTexture")]) return;
+	if (ss || sl || ds || dl) return;
+	NSUInteger sw = [src width], sh = [src height], dw = [dst width], dh = [dst height];
+	if (so.x + sz.width > sw || so.y + sz.height > sh || dO.x + sz.width > dw || dO.y + sz.height > dh) return;
+	uint8_t *sp = [src sm_cpu], *dp = [dst sm_cpu];
+	NSUInteger sb = [src bytesPerRow], db = [dst bytesPerRow];
+	if (!sp || !dp) return;
+	for (NSUInteger y = 0; y < sz.height; y++)
+		memmove(dp + (dO.y + y) * db + dO.x * 4, sp + (so.y + y) * sb + so.x * 4, sz.width * 4);
+}
+- (void)copyFromTexture:(id)src toTexture:(id)dst
+{
+	[self copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+	    sourceSize:MTLSizeMake(MIN([src width], [dst width]), MIN([src height], [dst height]), 1)
+	    toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+}
+- (void)generateMipmapsForTexture:(id)t {}
+- (void)fillBuffer:(id)b range:(NSRange)r value:(uint8_t)v
+{
+	if ([b respondsToSelector:@selector(contents)] && [b length] >= NSMaxRange(r)) memset((uint8_t *)[b contents] + r.location, v, r.length);
+}
+- (void)copyFromBuffer:(id)s sourceOffset:(NSUInteger)so toBuffer:(id)d destinationOffset:(NSUInteger)dof size:(NSUInteger)n
+{
+	if ([s length] >= so + n && [d length] >= dof + n) memmove((uint8_t *)[d contents] + dof, (uint8_t *)[s contents] + so, n);
+}
+@end
 @interface SweetMTLCommandQueue : SweetMTLObject
 @property (nonatomic, strong) dispatch_queue_t submissionQueue, completionQueue;
 @end
@@ -878,8 +935,8 @@ static void sm_fc_hook(void)
 - (instancetype)init { self = [super init]; _passes = [NSMutableArray array]; _scheduled = [NSMutableArray array]; _completed = [NSMutableArray array]; return self; }
 - (void)addScheduledHandler:(void (^)(id))h { if (h) [_scheduled addObject:[h copy]]; }
 - (void)addCompletedHandler:(void (^)(id))h { if (h) [_completed addObject:[h copy]]; }
-- (id)blitCommandEncoder { return [SweetMTLStubEncoder new]; }
-- (id)blitCommandEncoderWithDescriptor:(id)d { return [SweetMTLStubEncoder new]; }
+- (id)blitCommandEncoder { return [SweetMTLBlitEncoder new]; }
+- (id)blitCommandEncoderWithDescriptor:(id)d { return [SweetMTLBlitEncoder new]; }
 - (id)computeCommandEncoder { return [SweetMTLStubEncoder new]; }
 - (id)computeCommandEncoderWithDispatchType:(NSUInteger)t { return [SweetMTLStubEncoder new]; }
 - (id)computeCommandEncoderWithDescriptor:(id)d { return [SweetMTLStubEncoder new]; }
@@ -956,6 +1013,7 @@ static void sm_fc_hook(void)
 - (id)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
 - (id)commandBufferWithDescriptor:(id)d { return [self commandBuffer]; }
 - (void)insertDebugCaptureBoundary {}
+- (void)setGPUPriority:(NSUInteger)p {}
 @end
 
 /*
