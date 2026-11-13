@@ -452,7 +452,8 @@ typedef struct {
 	uint64_t index_va; uint32_t index_type; int32_t base_vertex;
 	uint32_t sc_x0, sc_y0, sc_x1, sc_y1, has_scissor;
 	uint32_t blend_on, rgb_op, a_op, rgb_sf, rgb_df, a_sf, a_df, wmask;
-	uint64_t buf[31];                /* GPU VA bound at each Metal buffer index */
+	uint64_t buf[31];                /* GPU VA bound at each Metal vertex-stage buffer index */
+	uint64_t fbuf[31];               /* fragment-stage buffers (separate push block) */
 	struct { uint32_t fmt, off, bidx; } attr[16];
 	uint32_t stride[31];
 	struct { uint64_t va; uint32_t w, h, stride, fmt; } tex[8];
@@ -680,6 +681,9 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		}
 		float vp[6] = { w * 0.5f, -(float)h * 0.5f, 1.0f, w * 0.5f, h * 0.5f, 0.0f };
 		memcpy(push + SMP_VP, vp, sizeof vp);
+		/* fragment stage: same push block but its own buffer table */
+		memcpy(P + 0xE00, push, SMP_BYTES);
+		for (int k = 0; k < 8; k++) memcpy(P + 0xE00 + SMP_BUF + 8 * k, &r->fbuf[k], 8);
 		/* fragment resources: SAMPLER table (3) x16 at 0xA00 (slot 15 = constexpr sampler), TEXTURE table (4) x8 at 0xC00
 		 * (slot 7 = 1x1 null 2D, slot 6 = 1x1x1 null 3D, both pointing at the zeroed dummy page) */
 		uint64_t res_va = 0;
@@ -749,7 +753,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 			cfg.render_target_mask = 1; cfg.blend = PV + 0x300; cfg.blend_count = 1;
 			cfg.overdraw_alpha0 = true; cfg.overdraw_alpha1 = true;
 			cfg.shader.thread_storage = D + OFF_TLS; cfg.shader.shader = PV + 0x240;
-			cfg.shader.fau = PV + 0x400; cfg.shader.fau_count = fs_fau ? fs_fau : 1;
+			cfg.shader.fau = PV + 0xE00; cfg.shader.fau_count = fs_fau ? fs_fau : 1;
 			cfg.shader.resources = res_va;
 		}
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, POSITION, cfg) {
@@ -1158,6 +1162,7 @@ static void sm_fc_hook(void)
 	sm_drawrec _draws[32];
 	uint32_t _ndraw;
 	uint64_t _bufBase[31];
+	uint64_t _fbuf[31], _fbufBase[31];
 	MTLScissorRect _scissor;
 	BOOL _hasScissor;
 }
@@ -1184,10 +1189,17 @@ static void sm_fc_hook(void)
 {
 	if (i < 8) { _smp[i] = smp; if (smp) [_keep addObject:smp]; }
 }
-- (void)setFragmentBuffer:(id)buf offset:(NSUInteger)off atIndex:(NSUInteger)i { [self setVertexBuffer:buf offset:off atIndex:i]; }
+- (void)setFragmentBuffer:(id)buf offset:(NSUInteger)off atIndex:(NSUInteger)i
+{
+	if (i < 31) { _fbufBase[i] = buf ? [(SweetMTLBuffer *)buf gpuAddress] : 0; _fbuf[i] = buf ? _fbufBase[i] + off : 0; if (buf) [_keep addObject:buf]; }
+}
 - (void)setVertexBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i { if (i < 31 && _bufBase[i]) _buf[i] = _bufBase[i] + off; }
-- (void)setFragmentBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i { [self setVertexBufferOffset:off atIndex:i]; }
-- (void)setFragmentBytes:(const void *)p length:(NSUInteger)len atIndex:(NSUInteger)i { [self setVertexBytes:p length:len atIndex:i]; }
+- (void)setFragmentBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i { if (i < 31 && _fbufBase[i]) _fbuf[i] = _fbufBase[i] + off; }
+- (void)setFragmentBytes:(const void *)p length:(NSUInteger)len atIndex:(NSUInteger)i
+{
+	uint64_t va = sm_ring_put(p, len, NULL);
+	if (i < 31) { _fbufBase[i] = 0; _fbuf[i] = va; }
+}
 - (void)setScissorRect:(MTLScissorRect)sr
 {
 	_scissor = sr; _hasScissor = YES;
@@ -1244,6 +1256,7 @@ static void sm_fc_hook(void)
 	}
 	r->vs = _pipeline.vs; r->fs = _pipeline.fs; r->wmask = 0xF;
 	memcpy(r->buf, _buf, sizeof _buf);
+	memcpy(r->fbuf, _fbuf, sizeof _fbuf);
 	if (_pipeline) {
 		for (int k = 0; k < 16; k++) { r->attr[k].fmt = _pipeline->_attr[k].fmt; r->attr[k].off = _pipeline->_attr[k].off; r->attr[k].bidx = _pipeline->_attr[k].bidx; }
 		memcpy(r->stride, _pipeline->_stride, sizeof r->stride);
