@@ -1065,7 +1065,8 @@ static void sm_fc_hook(void)
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d
 {
 	self = [super init];
-	_device = dev; _width = d.width; _height = d.height; _pixelFormat = d.pixelFormat; _bytesPerRow = _width * 4;
+	_device = dev; _width = d.width; _height = d.height; _pixelFormat = d.pixelFormat;
+	_bytesPerRow = (_width * 4 + 63) & ~(NSUInteger)63;  /* Mali linear planes need a 64-byte aligned row stride (run34: 776 faulted) */
 	if (!sm_bo_alloc(&_store, _bytesPerRow * _height)) {
 		static int nl; if (nl++ < 6) slog("SweetMTL: texture bo alloc failed %lux%lu fmt %lu", (unsigned long)_width, (unsigned long)_height, (unsigned long)_pixelFormat);
 		return nil;
