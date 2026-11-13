@@ -1088,7 +1088,7 @@ static void sm_trace_install(Class me)
 	unsigned added = 0;
 	for (unsigned i = 0; i < n; i++) {
 		SEL sel = method_getName(ms[i]); const char *sn = sel_getName(sel);
-		bool sk = !strncmp(sn, "init", 4);
+		bool sk = !strncmp(sn, "init", 4) || sn[0] == '_' || sn[0] == '.' || class_getInstanceMethod([NSObject class], sel) != NULL;
 		for (int k = 0; skip[k] && !sk; k++) if (!strcmp(sn, skip[k])) sk = true;
 		if (sk) continue;
 		Method mine = class_getInstanceMethod(me, sel);
