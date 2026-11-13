@@ -655,9 +655,21 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			break;
 		}
 		if (md->prepare() != kIOReturnSuccess) {
+			/* read-only client memory (decoded images, file mappings) cannot be wired for writing:
+			 * the GPU only samples it, so wire it for device reads */
 			md->release();
-			ret = kIOReturnVMError;
-			break;
+			md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uva, (mach_vm_size_t)len, kIODirectionOut, current_task());
+			if (md == NULL || md->prepare() != kIOReturnSuccess) {
+				if (md != NULL) {
+					md->release();
+				}
+				static int nl;
+				if (nl++ < 8) {
+					sm_log("import prepare failed: uva %llx len %llx", uva, len, 0);
+				}
+				ret = kIOReturnVMError;
+				break;
+			}
 		}
 		uint32_t pages = (uint32_t)(len >> 12), k;
 		ret = kIOReturnSuccess;

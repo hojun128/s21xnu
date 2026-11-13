@@ -905,10 +905,15 @@ static __weak id sm_device;
 @interface SweetMTLBuffer : SweetMTLObject
 @property (nonatomic, readonly) NSUInteger length;
 @end
+@protocol SweetBufClient
+- (const uint8_t *)sm_clientPtr;
+@end
 @protocol SweetTexBufferInit
 - (instancetype)initWithBuffer:(id)buf bo:(const sm_bo *)bbo descriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off bytesPerRow:(NSUInteger)bpr;
 @end
-@implementation SweetMTLBuffer { sm_bo _bo; void (^_dealloc)(void *, NSUInteger); void *_ptr; }
+@implementation SweetMTLBuffer { sm_bo _bo; void (^_dealloc)(void *, NSUInteger); void *_ptr; bool _copied; }
+/* not importable client memory: the GPU-side copy goes stale, so textures made on it re-copy from here */
+- (const uint8_t *)sm_clientPtr { return _copied ? (const uint8_t *)_ptr : NULL; }
 - (instancetype)initWithLength:(NSUInteger)len bytes:(const void *)p
 {
 	self = [super init];
@@ -924,6 +929,7 @@ static __weak id sm_device;
 		/* not importable: fall back to a copy (contents stay the caller's pointer semantics only at creation) */
 		if (!sm_bo_alloc(&_bo, len ? len : 16)) return nil;
 		if (p && len) memcpy(_bo.cpu, p, len);
+		_copied = (p != NULL);
 	}
 	_length = len; _dealloc = [dealloc copy]; _ptr = p;
 	return self;
@@ -1230,11 +1236,12 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 	_parent = buf; _view = true;
 	_store = *bbo; _store.cpu = bbo->cpu + off; _store.gpu = bbo->gpu + off; _store.size = bbo->size - off;
 	_bytesPerRow = bpr;
-	if (bpr & 63) {
+	const uint8_t *client = [buf respondsToSelector:@selector(sm_clientPtr)] ? [buf sm_clientPtr] : NULL;
+	if ((bpr & 63) || client) {
 		/* Mali linear planes need a 64-byte aligned pitch (run34): sample from an aligned copy, refreshed per draw */
 		NSUInteger abpr = (_width * sm_pf_bpp(_pixelFormat) + 63) & ~(NSUInteger)63;
 		if (!sm_bo_alloc(&_shadow, abpr * (_height ? _height : 1))) return nil;
-		_hasShadow = true; _src = _store.cpu; _srcBpr = bpr;
+		_hasShadow = true; _src = client ? client + off : _store.cpu; _srcBpr = bpr;
 		_store = _shadow; _bytesPerRow = abpr;
 		[self sm_sync];
 	}
