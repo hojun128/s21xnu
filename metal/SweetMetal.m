@@ -50,6 +50,9 @@ extern kern_return_t IOConnectMapMemory64(io_connect_t, uint32_t, task_port_t, m
 #include "genxml/gen_macros.h"
 
 typedef struct { uint64_t handle, gpu; uint8_t *cpu; uint64_t size; uint32_t imported; } sm_bo;
+/* BGRA8 and the 32-bit BGR10 XR display formats CoreAnimation renders into: everything is stored as 8-bit BGRA here,
+ * consistently for rendering, sampling and the kernel's copy to the panel */
+static inline bool sm_is_bgra(NSUInteger f) { return f == 80 || f == 81 || (f >= 550 && f <= 555); }
 static volatile uint32_t sm_commits;
 static uint64_t sm_next_va = 0x30000000ULL;
 
@@ -684,6 +687,52 @@ static NSMutableDictionary *sm_fc_dict(id obj);
 
 @interface SweetMTLLibrary : SweetMTLObject
 @end
+/* CoreAnimation asks for its uber shaders by base name + function constants; the pipelinelib ships them
+ * pre-specialized. variants.txt (generated on the Mac from pipelines.desc) lists every specialization:
+ *   <published name> <base function> name=value ...   -> pick the one whose constants match. */
+static NSDictionary *sm_variants;   /* base -> array of @[published, @{name: value}] */
+static void sm_variants_load(void)
+{
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		NSString *t = [NSString stringWithContentsOfFile:@"/System/Library/Extensions/SweetMetal.bundle/variants.txt" encoding:NSUTF8StringEncoding error:NULL];
+		NSMutableDictionary *m = [NSMutableDictionary dictionary]; NSUInteger nv = 0;
+		for (NSString *line in [t componentsSeparatedByString:@"\n"]) {
+			NSArray *f = [line componentsSeparatedByString:@" "];
+			if (f.count < 2) continue;
+			NSMutableDictionary *kv = [NSMutableDictionary dictionary];
+			for (NSUInteger i = 2; i < f.count; i++) {
+				NSArray *p = [f[i] componentsSeparatedByString:@"="];
+				if (p.count == 2) kv[p[0]] = @([p[1] intValue]);
+			}
+			NSMutableArray *a = m[f[1]] ?: (m[f[1]] = [NSMutableArray array]);
+			[a addObject:@[ f[0], kv ]]; nv++;
+		}
+		sm_variants = m;
+		slog("SweetMTL: %lu specialized variants of %lu base functions", (unsigned long)nv, (unsigned long)m.count);
+	});
+}
+static NSString *sm_match_variant(NSString *base, NSDictionary *cv)
+{
+	sm_variants_load();
+	NSArray *cands = sm_variants[base];
+	if (!cands.count) return nil;
+	NSString *best = nil; NSUInteger bestMiss = NSUIntegerMax;
+	for (NSArray *c in cands) {
+		NSDictionary *kv = c[1]; NSUInteger miss = 0;
+		for (NSString *k in kv) {
+			NSNumber *want = cv[k];
+			if ((want ? want.intValue : 0) != [kv[k] intValue]) miss++;
+		}
+		if (miss < bestMiss && sm_find(c[0])) { bestMiss = miss; best = c[0]; }
+		if (miss == 0 && sm_find(c[0])) break;
+	}
+	static int nl;
+	if (nl++ < 40) slog("SweetMTL: %s + %lu constants -> %s (%lu mismatches)", base.UTF8String, (unsigned long)cv.count,
+	    best ? best.UTF8String : "none", (unsigned long)(best ? bestMiss : 0));
+	return bestMiss <= 2 ? best : nil;
+}
+
 @implementation SweetMTLLibrary
 - (id)newFunctionWithName:(NSString *)name
 {
@@ -695,6 +744,10 @@ static NSMutableDictionary *sm_fc_dict(id obj);
 {
 	if (err) *err = nil;
 	NSString *use = (sp && sm_find(sp)) ? sp : name;
+	if (use == name && !sm_find(name) && cv) {
+		NSString *v = sm_match_variant(name, sm_fc_dict(cv));
+		if (v) use = v;
+	}
 	SweetMTLFunction *f = [SweetMTLFunction new]; f.name = use;
 	f.constants = cv ? [sm_fc_dict(cv) copy] : @{};
 	slog("SweetMTL: function %s (specialized %s) -> %s", name.UTF8String, sp ? sp.UTF8String : "-", sm_find(use) ? "translated" : "NOT in pack");
@@ -777,6 +830,13 @@ static void sm_setN(id self, SEL _cmd, const void *v, NSUInteger type, NSRange r
 	}
 	((void (*)(id, SEL, const void *, NSUInteger, NSRange))sm_orig_setN)(self, _cmd, v, type, r);
 }
+static IMP sm_orig_setName;
+static void sm_setName(id self, SEL _cmd, const void *v, NSUInteger type, NSString *name)
+{
+	NSUInteger n = sm_dt_size(type); uint32_t w = 0; memcpy(&w, v, n > 4 ? 4 : n);
+	if (name) sm_fc_dict(self)[name] = @(w);
+	((void (*)(id, SEL, const void *, NSUInteger, NSString *))sm_orig_setName)(self, _cmd, v, type, name);
+}
 static void sm_fc_hook(void)
 {
 	static bool done; if (done) return; done = true;
@@ -786,6 +846,8 @@ static void sm_fc_hook(void)
 	Method m2 = class_getInstanceMethod(c, @selector(setConstantValues:type:withRange:));
 	if (m1) sm_orig_set1 = method_setImplementation(m1, (IMP)sm_set1);
 	if (m2) sm_orig_setN = method_setImplementation(m2, (IMP)sm_setN);
+	Method m3 = class_getInstanceMethod(c, @selector(setConstantValue:type:withName:));
+	if (m3) sm_orig_setName = method_setImplementation(m3, (IMP)sm_setName);
 }
 /* ------------------------------------------------------------------ Metal objects (phase 2a) */
 @interface SweetMTLTexture : SweetMTLObject
@@ -827,7 +889,7 @@ static void sm_fc_hook(void)
 - (MTLTextureUsage)usage { return MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget; }
 - (uint32_t)maliFormat
 {
-	bool bgra = _pixelFormat == MTLPixelFormatBGRA8Unorm;
+	bool bgra = sm_is_bgra(_pixelFormat);
 	return (MALI_RGBA8_UNORM << 12) | (bgra ? MALI_RGB_COMPONENT_ORDER_BGRA : MALI_RGB_COMPONENT_ORDER_RGBA);
 }
 - (NSUInteger)depth { return 1; }
@@ -1093,7 +1155,7 @@ static void sm_fc_hook(void)
 	sm_commits++;
 	for (SweetMTLRenderEncoder *e in _passes) {
 		if (!have || !e.target) { _status = 5; continue; }
-		bool bgra = e.target.pixelFormat == MTLPixelFormatBGRA8Unorm;
+		bool bgra = sm_is_bgra(e.target.pixelFormat);
 		if (e->_ndraw) {
 			static sm_bo heap; static bool haveheap;
 			if (!haveheap) haveheap = sm_bo_alloc(&heap, 4u << 20);
@@ -1341,6 +1403,7 @@ static void *sm_watchdog(void *arg)
 	for (id fobj in @[ d.vertexFunction ?: (id)[NSNull null], d.fragmentFunction ?: (id)[NSNull null] ]) {
 		if (![fobj isKindOfClass:[SweetMTLFunction class]]) continue;
 		[((SweetMTLFunction *)fobj).constants enumerateKeysAndObjectsUsingBlock:^(NSNumber *k, NSNumber *v, BOOL *stop) {
+			if (![k isKindOfClass:[NSNumber class]]) return;
 			NSUInteger i = k.unsignedIntegerValue;
 			if (i < 64) { ps->_fc[i] = v.unsignedIntValue; ps->_fcdef |= 1ull << i; }
 		}];
