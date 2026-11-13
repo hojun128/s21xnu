@@ -162,11 +162,15 @@ static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uin
 	free(px);
 }
 
+static bool sm_gpu_off;   /* a job timed out (or the kernel fenced the GPU): no more GPU work this boot */
 static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 {
+	if (sm_gpu_off) return 0xFFFCu;
 	uint64_t in[3] = { slot, jc, 2000 }, out[1] = { 0xdead }; uint32_t oc = 1;
 	kern_return_t kr = IOConnectCallMethod(sm_conn, 3, in, 3, NULL, 0, out, &oc, NULL, NULL);
-	return kr ? 0xffff0000u | (uint32_t)kr : (uint32_t)out[0];
+	uint32_t r = kr ? 0xffff0000u | (uint32_t)kr : (uint32_t)out[0];
+	if (r == 0xFFFFu || r == 0xFFFCu || (r >> 16) == 0xffff) { sm_gpu_off = true; slog("SweetMTL: GPU off after status %x", r); }
+	return r;
 }
 
 /* Clear a w x h RGBA8/BGRA8 colour target with one FRAGMENT job (no tiler). Returns the job status. */
@@ -1747,10 +1751,11 @@ static void *sm_watchdog(void *arg)
 	ps.vs = sm_find(ps.vsName); ps.fs = sm_find(ps.fsName);
 	for (id fobj in @[ d.vertexFunction ?: (id)[NSNull null], d.fragmentFunction ?: (id)[NSNull null] ]) {
 		if (![fobj isKindOfClass:[SweetMTLFunction class]]) continue;
+		bool isvs = fobj == (id)d.vertexFunction;   /* named constants: vertex function only for now (run40 hung with all) */
 		[((SweetMTLFunction *)fobj).constants enumerateKeysAndObjectsUsingBlock:^(NSNumber *k, NSNumber *v, BOOL *stop) {
 			NSUInteger i;
 			if ([k isKindOfClass:[NSNumber class]]) i = k.unsignedIntegerValue;
-			else if ([k isKindOfClass:[NSString class]]) { NSNumber *m = sm_fc_names()[k]; if (!m) return; i = m.unsignedIntegerValue; }
+			else if ([k isKindOfClass:[NSString class]]) { if (!isvs) return; NSNumber *m = sm_fc_names()[k]; if (!m) return; i = m.unsignedIntegerValue; }
 			else return;
 			if (i < 64) { ps->_fc[i] = v.unsignedIntValue; ps->_fcdef |= 1ull << i; }
 		}];

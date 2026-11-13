@@ -275,9 +275,16 @@ mali_power(int on)
 
 /* ---- recovery: a faulted job leaves the job manager wedged (every later job reports 0x5b), so soft-reset
  * the GPU and power it back up; the next submit re-programs the address space ---- */
+static uint32_t mali_faults;     /* after MALI_MAX_FAULTS faults/timeouts the GPU is fenced off until reboot */
+#define MALI_MAX_FAULTS 3
+
 static void
 mali_recover(const char *why)
 {
+	if (++mali_faults >= MALI_MAX_FAULTS) {
+		mali_log("fault %u (%s): GPU fenced off until reboot", mali_faults, why);
+		return;
+	}
 	wr(R_GPU_IRQ_CLEAR, 0xFFFFFFFFU);
 	wr(R_GPU_CMD, GPU_CMD_SOFT_RESET);
 	uint32_t t = wait_reg(R_GPU_IRQ_RAW, 0x100U, 0x100U, 100);
@@ -576,6 +583,9 @@ sweet_mali_submit(int id, uint32_t slot, uint64_t jc_va, uint32_t timeout_ms)
 {
 	if (id < 0 || id >= MALI_MAX_CTX || !ctx_used[id] || slot >= 3 || !mali.up || !mali.powered) {
 		return 0xFFFDU;
+	}
+	if (mali_faults >= MALI_MAX_FAULTS) {
+		return 0xFFFCU;
 	}
 	ctx_activate(&ctxs[id]);
 	if (use_asflush) {
