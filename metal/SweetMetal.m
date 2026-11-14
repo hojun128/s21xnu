@@ -534,14 +534,14 @@ static const sm_shader *sm_find(NSString *name)
 typedef struct {
 	const sm_shader *vs, *fs;
 	uint32_t vcount, vstart;
-	uint64_t index_va; uint32_t index_type; int32_t base_vertex;
+	uint64_t index_va; uint32_t index_type; int32_t base_vertex; uint32_t strip;
 	uint32_t sc_x0, sc_y0, sc_x1, sc_y1, has_scissor;
 	uint32_t blend_on, rgb_op, a_op, rgb_sf, rgb_df, a_sf, a_df, wmask;
 	uint64_t buf[31];                /* GPU VA bound at each Metal vertex-stage buffer index */
 	uint64_t fbuf[31];               /* fragment-stage buffers (separate push block) */
 	struct { uint32_t fmt, off, bidx; } attr[16];
 	uint32_t stride[31];
-	struct { uint64_t va; uint32_t w, h, stride, fmt, pf, imp, swz; } tex[8];
+	struct { uint64_t va; uint32_t w, h, stride, fmt, pf, imp, swz, astc; } tex[8];   /* astc: bw | bh << 8 | srgb << 16 */
 	struct { uint32_t nearest, wrap; } smp[8];
 	uint32_t ntex, nsmp;
 	uint32_t fc[64]; uint64_t fc_defined;
@@ -640,6 +640,7 @@ static void sm_pack_blend(void *dst, const sm_drawrec *r)
 /* A whole render pass: clear + N draws (one MALLOC_VERTEX job each, shared tiler context) + one FRAGMENT job. */
 static uint32_t sm_pf_info(NSUInteger pf, uint32_t *fmt, uint32_t *swz);
 static uint32_t sm_pf_bpp(NSUInteger pf);
+static uint32_t sm_astc_dim(uint32_t d);
 static NSUInteger sm_target_pf = 80;   /* pixel format of the target sm_pass draws into (set by the caller) */
 /* render-target writeback for 1/2-byte targets: the tile buffer stays RGBA8 (Mesa BFMT R8/RG8/A8) */
 static uint32_t sm_rt_writeback(NSUInteger pf) { return pf == 1 || pf == 10 || pf == 11 ? MALI_COLOR_FORMAT_R8 : pf == 30 ? MALI_COLOR_FORMAT_R8G8 : MALI_COLOR_FORMAT_R8G8B8A8; }
@@ -797,11 +798,18 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 				 * the plane size and the fragment job dies with a bus fault (run32 bisect) */
 				uint32_t tw = real ? r->tex[k].w : 16, th = real ? r->tex[k].h : 16, ts = real ? r->tex[k].stride : 64;
 				uint32_t fmt = real ? r->tex[k].fmt : ((MALI_RGBA8_UNORM << 12) | MALI_RGB_COMPONENT_ORDER_RGBA);
+				uint32_t astc = real ? r->tex[k].astc : 0;
 				pan_pack(P + 0xD00 + 32 * k, PLANE, pl) {
-					pl.plane_type = MALI_PLANE_TYPE_GENERIC;
-					pl.clump_format = MALI_CLUMP_FORMAT_RAW32;
+					if (astc) {
+						pl.plane_type = MALI_PLANE_TYPE_ASTC_2D;
+						pl.astc._2d.block_width = sm_astc_dim(astc & 0xFF); pl.astc._2d.block_height = sm_astc_dim((astc >> 8) & 0xFF);
+						pl.astc.decode_hdr = false; pl.astc.decode_wide = !((astc >> 16) & 1);
+					} else pl.plane_type = MALI_PLANE_TYPE_GENERIC;
+					if (!astc) pl.clump_format = MALI_CLUMP_FORMAT_RAW32;
 					pl.clump_ordering = MALI_CLUMP_ORDERING_LINEAR;
-					pl.pointer = va; pl.row_stride = ts; pl.size = real ? ts * th : 0x10000; pl.slice_stride = ts * th;
+					pl.pointer = va; pl.row_stride = ts;
+					uint32_t prow = astc ? (th + ((astc >> 8) & 0xFF) - 1) / ((astc >> 8) & 0xFF) : th;
+					pl.size = real ? ts * prow : 0x10000; pl.slice_stride = ts * prow;
 				}
 				pan_pack(P + 0xC00 + 32 * k, TEXTURE, tx) {
 					tx.dimension = is3d ? MALI_TEXTURE_DIMENSION_3D : MALI_TEXTURE_DIMENSION_2D;
@@ -824,7 +832,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		uint32_t nvar = vs->nvar; if (fs && fs->nvar > nvar) nvar = fs->nvar;
 		void *vj = P;
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, PRIMITIVE, cfg) {
-			cfg.draw_mode = MALI_DRAW_MODE_TRIANGLES; cfg.index_count = r->vcount;
+			cfg.draw_mode = r->strip ? MALI_DRAW_MODE_TRIANGLE_STRIP : MALI_DRAW_MODE_TRIANGLES; cfg.index_count = r->vcount;
 			cfg.index_type = r->index_type; cfg.base_vertex_offset = r->index_type ? r->base_vertex : (int32_t)r->vstart;
 			cfg.allow_rotating_primitives = true; cfg.secondary_shader = sec;
 		}
@@ -1234,6 +1242,17 @@ static uint32_t sm_pf_info(NSUInteger pf, uint32_t *fmt, uint32_t *swz)
 	return b;
 }
 static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
+/* ASTC: MTLPixelFormatASTC_*_sRGB 186..200, _LDR 204..218 (no 191/209). Returns block width (0 = not ASTC). */
+static uint32_t sm_astc(NSUInteger pf, uint32_t *bh, bool *srgb)
+{
+	static const uint8_t W[15] = { 4, 5, 5, 6, 6, 0, 8, 8, 8, 10, 10, 10, 10, 12, 12 }, H[15] = { 4, 4, 5, 5, 6, 0, 5, 6, 8, 5, 6, 8, 10, 10, 12 };
+	int i = pf >= 186 && pf <= 200 ? (int)pf - 186 : pf >= 204 && pf <= 218 ? (int)pf - 204 : -1;
+	if (i < 0 || !W[i]) return 0;
+	if (bh) *bh = H[i];
+	if (srgb) *srgb = pf <= 200;
+	return W[i];
+}
+static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 6 ? 2 : d == 8 ? 4 : d == 10 ? 6 : 7; }
 
 @interface SweetMTLTexture : SweetMTLObject
 @property (nonatomic, readonly) NSUInteger width, height, pixelFormat, bytesPerRow;
@@ -1283,7 +1302,13 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 	self = [super init];
 	_device = dev; _width = d.width; _height = d.height; _pixelFormat = d.pixelFormat;
 	_bytesPerRow = (_width * sm_pf_bpp(_pixelFormat) + 63) & ~(NSUInteger)63;  /* Mali linear planes need a 64-byte aligned row stride (run34: 776 faulted) */
-	if (!sm_bo_alloc(&_store, _bytesPerRow * _height)) {
+	NSUInteger rows = _height;
+	uint32_t abh = 0, abw = sm_astc(_pixelFormat, &abh, NULL);
+	if (abw) {   /* ASTC: rows of 16-byte blocks */
+		_bytesPerRow = (((_width + abw - 1) / abw) * 16 + 63) & ~(NSUInteger)63;
+		rows = (_height + abh - 1) / abh;
+	}
+	if (!sm_bo_alloc(&_store, _bytesPerRow * rows)) {
 		static int nl; if (nl++ < 6) slog("SweetMTL: texture bo alloc failed %lux%lu fmt %lu", (unsigned long)_width, (unsigned long)_height, (unsigned long)_pixelFormat);
 		return nil;
 	}
@@ -1319,7 +1344,13 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 - (NSUInteger)iosurfacePlane { return 0; }
 - (MTLStorageMode)storageMode { return MTLStorageModeShared; }
 - (MTLTextureUsage)usage { return MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget; }
-- (uint32_t)maliFormat { uint32_t f; sm_pf_info(_pixelFormat, &f, NULL); return f; }
+- (uint32_t)maliFormat
+{
+	bool srgb = false;
+	if (sm_astc(_pixelFormat, NULL, &srgb))   /* Mesa: sRGB -> ASTC 2D LDR (narrow), linear -> ASTC 2D HDR (wide decode) */
+		return ((srgb ? MALI_ASTC_2D_LDR : MALI_ASTC_2D_HDR) << 12) | (srgb ? (1u << 20) : 0) | MALI_RGB_COMPONENT_ORDER_RGBA;
+	uint32_t f; sm_pf_info(_pixelFormat, &f, NULL); return f;
+}
 - (uint32_t)maliSwizzle { uint32_t w; sm_pf_info(_pixelFormat, NULL, &w); return w; }
 - (uint32_t)bpp { return sm_pf_bpp(_pixelFormat); }
 - (NSUInteger)depth { return 1; }
@@ -1349,6 +1380,12 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl withBytes:(const void *)src bytesPerRow:(NSUInteger)bpr
 {
 	if (![self sm_inRegion:r level:lvl] || !src) return;
+	uint32_t abh = 0, abw = sm_astc(_pixelFormat, &abh, NULL);
+	if (abw) {
+		NSUInteger bx = r.origin.x / abw, by = r.origin.y / abh, nbx = (r.size.width + abw - 1) / abw, nby = (r.size.height + abh - 1) / abh;
+		for (NSUInteger y = 0; y < nby; y++) memcpy(_store.cpu + (by + y) * _bytesPerRow + bx * 16, (const uint8_t *)src + y * bpr, nbx * 16);
+		return;
+	}
 	for (NSUInteger y = 0; y < r.size.height; y++)
 		memcpy(_store.cpu + (r.origin.y + y) * _bytesPerRow + r.origin.x * sm_pf_bpp(_pixelFormat), (const uint8_t *)src + y * bpr, r.size.width * sm_pf_bpp(_pixelFormat));
 }
@@ -1473,13 +1510,14 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 }
 - (sm_drawrec *)sm_record:(MTLPrimitiveType)type
 {
-	if (type != MTLPrimitiveTypeTriangle) {
+	if (type != MTLPrimitiveTypeTriangle && type != MTLPrimitiveTypeTriangleStrip) {
 		static int nl; if (nl++ < 4) slog("SweetMTL: draw type %lu not supported yet", (unsigned long)type);
 		return NULL;
 	}
 	if (_ndraw >= 32) { static int nl; if (nl++ < 4) slog("SweetMTL: too many draws in one pass"); return NULL; }
 	sm_drawrec *r = &_draws[_ndraw];
 	memset(r, 0, sizeof *r);
+	r->strip = type == MTLPrimitiveTypeTriangleStrip;
 	if (_hasScissor && _target) {
 		uint32_t W = (uint32_t)_target.width, H = (uint32_t)_target.height;
 		uint32_t x0 = (uint32_t)_scissor.x, y0 = (uint32_t)_scissor.y;
@@ -1513,6 +1551,7 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 			r->tex[k].stride = (uint32_t)t.bytesPerRow; r->tex[k].fmt = [t maliFormat];
 			r->tex[k].pf = (uint32_t)t.pixelFormat; r->tex[k].imp = t.bo->imported;
 			r->tex[k].swz = [t maliSwizzle];
+			{ uint32_t bh = 0; bool sr = false; uint32_t bw = sm_astc(t.pixelFormat, &bh, &sr); r->tex[k].astc = bw ? (bw | bh << 8 | (uint32_t)sr << 16) : 0; }
 			r->ntex = k + 1;
 		}
 		if (_smp[k]) { r->smp[k].nearest = _smp[k].nearest; r->nsmp = k + 1; }
@@ -1527,6 +1566,38 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 @implementation SweetMTLStubEncoder
 - (void)endEncoding {}
 @end
+/* Compute (phase 1: record and describe; GPU dispatch comes next) */
+@interface SweetMTLComputePipelineState : SweetMTLObject
+@property (nonatomic, copy) NSString *fnName;
+@property (nonatomic) const sm_shader *cs;
+@end
+@implementation SweetMTLComputePipelineState
+- (NSUInteger)maxTotalThreadsPerThreadgroup { return 256; }
+- (NSUInteger)threadExecutionWidth { return 16; }
+- (NSUInteger)staticThreadgroupMemoryLength { return 0; }
+@end
+@interface SweetMTLComputeEncoder : SweetMTLObject
+@end
+@implementation SweetMTLComputeEncoder {
+	SweetMTLComputePipelineState *_ps;
+	uint32_t _ntex, _nbuf;
+}
+- (void)endEncoding {}
+- (void)setComputePipelineState:(id)ps { _ps = [ps isKindOfClass:[SweetMTLComputePipelineState class]] ? ps : nil; }
+- (void)setTexture:(id)t atIndex:(NSUInteger)i { if (i + 1 > _ntex) _ntex = (uint32_t)i + 1; }
+- (void)setBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i { if (i + 1 > _nbuf) _nbuf = (uint32_t)i + 1; }
+- (void)setBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i { if (i + 1 > _nbuf) _nbuf = (uint32_t)i + 1; }
+- (void)setSamplerState:(id)s atIndex:(NSUInteger)i {}
+- (void)sm_log:(const char *)how grid:(MTLSize)g tg:(MTLSize)t
+{
+	static int nl;
+	if (nl++ < 24) slog("SweetMTL: compute %s %s grid %lux%lux%lu tg %lux%lux%lu tex %u buf %u", how, _ps ? _ps.fnName.UTF8String : "?",
+	    (unsigned long)g.width, (unsigned long)g.height, (unsigned long)g.depth, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth, _ntex, _nbuf);
+}
+- (void)dispatchThreadgroups:(MTLSize)g threadsPerThreadgroup:(MTLSize)t { [self sm_log:"groups" grid:g tg:t]; }
+- (void)dispatchThreads:(MTLSize)g threadsPerThreadgroup:(MTLSize)t { [self sm_log:"threads" grid:g tg:t]; }
+@end
+
 @interface SweetMTLBlitEncoder : SweetMTLStubEncoder
 @end
 @implementation SweetMTLBlitEncoder
@@ -1568,9 +1639,9 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 - (void)addCompletedHandler:(void (^)(id))h { if (h) [_completed addObject:[h copy]]; }
 - (id)blitCommandEncoder { return [SweetMTLBlitEncoder new]; }
 - (id)blitCommandEncoderWithDescriptor:(id)d { return [SweetMTLBlitEncoder new]; }
-- (id)computeCommandEncoder { return [SweetMTLStubEncoder new]; }
-- (id)computeCommandEncoderWithDispatchType:(NSUInteger)t { return [SweetMTLStubEncoder new]; }
-- (id)computeCommandEncoderWithDescriptor:(id)d { return [SweetMTLStubEncoder new]; }
+- (id)computeCommandEncoder { return [SweetMTLComputeEncoder new]; }
+- (id)computeCommandEncoderWithDispatchType:(NSUInteger)t { return [SweetMTLComputeEncoder new]; }
+- (id)computeCommandEncoderWithDescriptor:(id)d { return [SweetMTLComputeEncoder new]; }
 - (BOOL)retainedReferences { return YES; }
 - (void)enqueue {}
 - (void)waitUntilScheduled {}
@@ -2011,6 +2082,34 @@ static bool sm_process_allowed(void)
 - (NSUInteger)featureProfile { return 0; }
 - (id)newCommandQueue { return [SweetMTLCommandQueue new]; }
 - (id)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)n { return [SweetMTLCommandQueue new]; }
+- (id)newComputePipelineStateWithFunction:(id)f error:(NSError **)err
+{
+	if (err) *err = nil;
+	SweetMTLComputePipelineState *ps = [SweetMTLComputePipelineState new];
+	NSString *n = [f respondsToSelector:@selector(name)] ? [f name] : nil;
+	ps.fnName = n ?: @"?"; ps.cs = sm_find(n);
+	slog("SweetMTL: compute pipeline %s (%s, from %s)", ps.fnName.UTF8String, ps.cs ? "translated" : "NOT in pack", object_getClassName(f));
+	return ps;
+}
+- (id)newComputePipelineStateWithFunction:(id)f options:(NSUInteger)o reflection:(id *)r error:(NSError **)err
+{
+	if (r) *r = nil;
+	return [self newComputePipelineStateWithFunction:f error:err];
+}
+- (void)newComputePipelineStateWithFunction:(id)f completionHandler:(void (^)(id, NSError *))h
+{
+	id ps = [self newComputePipelineStateWithFunction:f error:NULL]; if (h) h(ps, nil);
+}
+- (void)newComputePipelineStateWithFunction:(id)f options:(NSUInteger)o completionHandler:(void (^)(id, id, NSError *))h
+{
+	id ps = [self newComputePipelineStateWithFunction:f error:NULL]; if (h) h(ps, nil, nil);
+}
+- (id)newComputePipelineStateWithDescriptor:(id)d options:(NSUInteger)o reflection:(id *)r error:(NSError **)err
+{
+	if (r) *r = nil;
+	id f = [d respondsToSelector:@selector(computeFunction)] ? [d computeFunction] : nil;
+	return [self newComputePipelineStateWithFunction:f error:err];
+}
 - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err
 {
 	if (err) *err = nil;
