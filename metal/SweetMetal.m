@@ -856,9 +856,10 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 						pl.astc.decode_hdr = false; pl.astc.decode_wide = !((astc >> 16) & 1);
 					} else pl.plane_type = MALI_PLANE_TYPE_GENERIC;
 					if (!astc) pl.clump_format = real ? sm_clump(r->tex[k].pf) : MALI_CLUMP_FORMAT_RAW32;
-					pl.clump_ordering = MALI_CLUMP_ORDERING_LINEAR;
+					pl.clump_ordering = astc ? MALI_CLUMP_ORDERING_TILED_U_INTERLEAVED : MALI_CLUMP_ORDERING_LINEAR;
 					pl.pointer = va; pl.row_stride = ts;
-					uint32_t prow = astc ? (th + ((astc >> 8) & 0xFF) - 1) / ((astc >> 8) & 0xFF) : th;
+					/* ASTC: ts is one row of 16x16-block tiles */
+					uint32_t prow = astc ? ((th + ((astc >> 8) & 0xFF) - 1) / ((astc >> 8) & 0xFF) + 15) / 16 : th;
 					pl.size = real ? ts * prow : 0x10000; pl.slice_stride = ts * prow;
 				}
 				pan_pack(P + 0xC00 + 32 * k, TEXTURE, tx) {
@@ -1373,9 +1374,12 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	uint32_t abh = 0, abw = sm_astc(_pixelFormat, &abh, NULL);
 	if (abw) { static int nl; if (nl++ < 8) slog("SweetMTL: astc create %lux%lu pf%lu mips %lu storage %lu usage %lu", (unsigned long)_width, (unsigned long)_height,
 	    (unsigned long)_pixelFormat, (unsigned long)d.mipmapLevelCount, (unsigned long)d.storageMode, (unsigned long)d.usage); }
-	if (abw) {   /* ASTC: rows of 16-byte blocks */
-		_bytesPerRow = (((_width + abw - 1) / abw) * 16 + 63) & ~(NSUInteger)63;
-		rows = (_height + abh - 1) / abh;
+	if (abw) {
+		/* ASTC in Mesa's 16x16-block u-interleaved layout (linear ASTC decoded to the magenta error colour, run80-85):
+		 * _bytesPerRow = one row of tiles = 16 bytes x 16 blocks high x block columns aligned to 16 */
+		NSUInteger bx = ((_width + abw - 1) / abw + 15) & ~(NSUInteger)15, by = ((_height + abh - 1) / abh + 15) & ~(NSUInteger)15;
+		_bytesPerRow = 16 * 16 * bx;
+		rows = by / 16;
 	}
 	if (!sm_bo_alloc(&_store, _bytesPerRow * rows)) {
 		static int nl; if (nl++ < 6) slog("SweetMTL: texture bo alloc failed %lux%lu fmt %lu", (unsigned long)_width, (unsigned long)_height, (unsigned long)_pixelFormat);
@@ -1467,7 +1471,17 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		    slog("SweetMTL: astc upload %lux%lu at %lu,%lu bpr %lu src %016llx store %p", (unsigned long)r.size.width, (unsigned long)r.size.height,
 		    (unsigned long)r.origin.x, (unsigned long)r.origin.y, (unsigned long)bpr, b0, _store.cpu); }
 		NSUInteger bx = r.origin.x / abw, by = r.origin.y / abh, nbx = (r.size.width + abw - 1) / abw, nby = (r.size.height + abh - 1) / abh;
-		for (NSUInteger y = 0; y < nby; y++) memcpy(_store.cpu + (by + y) * _bytesPerRow + bx * 16, (const uint8_t *)src + y * bpr, nbx * 16);
+		static const uint8_t dup[16] = { 0x00, 0x03, 0x0c, 0x0f, 0x30, 0x33, 0x3c, 0x3f, 0xc0, 0xc3, 0xcc, 0xcf, 0xf0, 0xf3, 0xfc, 0xff };
+		static const uint8_t sp4[16] = { 0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15, 0x40, 0x41, 0x44, 0x45, 0x50, 0x51, 0x54, 0x55 };
+		for (NSUInteger y = 0; y < nby; y++) {
+			NSUInteger Y = by + y;
+			const uint8_t *row = (const uint8_t *)src + y * bpr;
+			uint8_t *trow = _store.cpu + (Y >> 4) * _bytesPerRow;
+			for (NSUInteger x = 0; x < nbx; x++) {
+				NSUInteger X = bx + x;
+				memcpy(trow + (X >> 4) * 4096 + (size_t)(dup[Y & 15] ^ sp4[X & 15]) * 16, row + x * 16, 16);
+			}
+		}
 		return;
 	}
 	for (NSUInteger y = 0; y < r.size.height; y++)
