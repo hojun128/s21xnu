@@ -70,7 +70,7 @@ enum {
 extern "C" void sweet_hid_touch(int finger, int down, int x, int y);
 
 extern "C" void sweet_mali_keep_dump(void);
-static char sm_keep_buf[12288];
+static char sm_keep_buf[40960];
 static uint32_t sm_keep_len;
 
 static IOLock *sm_lock;                 /* serializes all hardware / context calls */

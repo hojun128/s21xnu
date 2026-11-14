@@ -26,13 +26,14 @@ extern kern_return_t IOConnectCallMethod(io_connect_t, uint32_t, const uint64_t 
     const void *, size_t, uint64_t *, uint32_t *, void *, size_t *);
 
 static io_connect_t sm_conn;
+static volatile int sm_describe;   /* >0: describe the draws of the next passes (set after the unlock swipe) */
 
 /* Lines worth keeping are also collected here and replayed at the end of a test run: the 128 KiB pmsg ring
  * otherwise loses them under the thumbnails (run53). */
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit " };
+	"poster draw", "draw type", "nomatch", "fpass", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -45,7 +46,7 @@ static void slog(const char *fmt, ...)
 		/* and into the kernel's keep buffer (all processes), replayed right before a recovery reboot */
 		if (sm_conn) {
 			static int nk; char kb[176];
-			if (nk++ < 160) {
+			if (nk++ < 300) {
 				const char *pn = getprogname();
 				int L = snprintf(kb, sizeof kb, "K %.5s %s", pn ? pn : "?", strncmp(b, "SweetMTL: ", 10) ? b : b + 10);
 				IOConnectCallMethod(sm_conn, 9, NULL, 0, kb, (size_t)(L < (int)sizeof kb ? L : (int)sizeof kb - 1), NULL, NULL, NULL, NULL);
@@ -1119,6 +1120,23 @@ static NSString *sm_match_variant(NSString *base, NSDictionary *cv)
 	static int nl;
 	if (nl++ < 40) slog("SweetMTL: %s + %lu constants -> %s (%lu mismatches)", base.UTF8String, (unsigned long)cv.count,
 	    best ? best.UTF8String : "none", (unsigned long)(best ? bestMiss : 0));
+	if (bestMiss > 2) {
+		/* no usable specialization: dump the non-zero constants so the variant can be built offline */
+		static int nm;
+		if (nm++ < 6) {
+			char b[132]; int L = snprintf(b, sizeof b, "nomatch%d %s:", nm, base.UTF8String);
+			NSMutableArray *ks0 = [NSMutableArray array];
+			for (id k in cv) if ([k isKindOfClass:[NSString class]]) [ks0 addObject:k];
+			for (NSString *k in [ks0 sortedArrayUsingSelector:@selector(compare:)]) {
+				int v = [cv[k] intValue]; if (!v) continue;
+				const char *ks = k.UTF8String; if (!strncmp(ks, "fc_", 3)) ks += 3;
+				char one[48]; int n = snprintf(one, sizeof one, " %s=%d", ks, v);
+				if (L + n >= 128) { slog("SweetMTL: %s", b); L = snprintf(b, sizeof b, "nomatch%d +", nm); }
+				memcpy(b + L, one, n + 1); L += n;
+			}
+			slog("SweetMTL: %s", b);
+		}
+	}
 	return bestMiss <= 2 ? best : nil;
 }
 
@@ -1926,6 +1944,20 @@ typedef struct {
 			static int npass; if (_lastJobStatus || vs || npass++ < 6 || (sm_is_poster(getprogname()) && npass < 40))
 			slog("SweetMTL: pass %u draws into %lux%lu pf%lu%s load=%d clear=%d vertex=%x fragment=%x", e->_ndraw, (unsigned long)e.target.width,
 			    (unsigned long)e.target.height, (unsigned long)e.target.pixelFormat, e.target.iosurface ? " ios" : "", e.load, e.clear, vs, _lastJobStatus);
+			if (sm_describe > 0 && !sm_is_poster(getprogname())) {
+				sm_describe--;
+				slog("SweetMTL: fpass %lux%lu pf%lu n=%u load=%d st=%x", (unsigned long)e.target.width, (unsigned long)e.target.height,
+				    (unsigned long)e.target.pixelFormat, e->_ndraw, e.load, _lastJobStatus);
+				for (uint32_t i = 0; i < e->_ndraw && i < 40; i++) {
+					const sm_drawrec *o = &e->_draws[i];
+					const char *fn = o->fs ? o->fs->name : "GREEN";
+					if (!strncmp(fn, "com.apple.coreanimation.frag.", 29)) fn += 29;
+					char tb[64] = ""; int tl = 0;
+					for (uint32_t k = 0; k < o->ntex && k < 3; k++)
+						tl += snprintf(tb + tl, sizeof tb - tl, " %ux%u/%u", o->tex[k].w, o->tex[k].h, o->tex[k].pf);
+					slog("SweetMTL:  fd%u %.48s n%u bl%u%s", i, fn, o->vcount, o->blend_on, tb);
+				}
+			}
 			if (generic && _lastJobStatus == 0xFFFFu && sm_is_poster(getprogname())) {
 				/* poster pass hung (timeout, not a fault): replay each draw alone, as recorded and with its ASTC textures
 				 * swapped for the null texture, to tell a shader hang from an ASTC decode hang. Once per process. */
@@ -2253,6 +2285,7 @@ static void *sm_watchdog(void *arg)
 				if (nlate < 3) {
 					slog("SweetMTL: late mark %d at %lds commits=%u", nlate, (long)ts.tv_sec, c);
 					if (getenv("SM_NOSWIPE") == NULL) sm_swipe_up();   /* unlock: the last thumbnail should show the home screen */
+					if (nlate == 2) sm_describe = 6;
 					continue;
 				}   /* one thumbnail only: keep log room for other processes' crash reports */
 				SweetMTLTexture *tx = tg;
