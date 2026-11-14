@@ -652,6 +652,27 @@ static void sm_pack_blend(void *dst, const sm_drawrec *r)
 /* A whole render pass: clear + N draws (one MALLOC_VERTEX job each, shared tiler context) + one FRAGMENT job. */
 static uint32_t sm_pf_info(NSUInteger pf, uint32_t *fmt, uint32_t *swz);
 static uint32_t sm_pf_bpp(NSUInteger pf);
+/* Thread-local storage for register spills (pack flags bits 16..31 = bytes per thread; aegir_earth_fsh spills 84 and
+ * page-faulted at TLS address 0, run74/75). Stack = next_pow2(align16(size)) x 2048 threads x 24 core ids (Mesa
+ * panfrost_get_total_stack_size with a safe thread count). */
+static void sm_pack_tls(void *dst, uint32_t tls)
+{
+	static sm_bo stack; static uint32_t have_per;
+	uint32_t per = 0;
+	if (tls) { per = 16; while (per < ((tls + 15) & ~15u)) per <<= 1; }
+	if (per && per > have_per) {
+		if (have_per) sm_bo_free(&stack);
+		have_per = sm_bo_alloc(&stack, (uint64_t)per * 2048 * 24) ? per : 0;
+		slog("SweetMTL: TLS stack %u bytes/thread -> %s", per, have_per ? "ok" : "alloc failed");
+	}
+	pan_pack(dst, LOCAL_STORAGE, tl) {
+		tl.wls_instances = MALI_LOCAL_STORAGE_NO_WORKGROUP_MEM;
+		if (per && have_per >= per) {
+			uint32_t shift = 0; while ((16u << shift) < per) shift++;
+			tl.tls_size = shift; tl.tls_address_mode = MALI_ADDRESS_MODE_PACKED; tl.tls_base_pointer = stack.gpu >> 8;
+		}
+	}
+}
 static uint32_t sm_astc_dim(uint32_t d);
 static uint32_t sm_clump(NSUInteger pf);
 static NSUInteger sm_target_pf = 80;   /* pixel format of the target sm_pass draws into (set by the caller) */
@@ -698,7 +719,14 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		rt.swizzle = sm_target_pf == 1 ? (3 | (1 << 3) | (2 << 6) | (0 << 9)) : bgra ? (2 | (1 << 3) | (0 << 6) | (3 << 9)) : (0 | (1 << 3) | (2 << 6) | (3 << 9));
 		rt.rgb.base = target_va; rt.rgb.row_stride = stride;
 	}
-	pan_pack(cpu + OFF_TLS, LOCAL_STORAGE, tl) { tl.wls_instances = MALI_LOCAL_STORAGE_NO_WORKGROUP_MEM; }
+	{
+		uint32_t tls = 0;
+		for (uint32_t i = 0; i < ndraw; i++) {
+			if (dr[i].vs && (dr[i].vs->flags >> 16) > tls) tls = dr[i].vs->flags >> 16;
+			if (dr[i].fs && (dr[i].fs->flags >> 16) > tls) tls = dr[i].fs->flags >> 16;
+		}
+		sm_pack_tls(cpu + OFF_TLS, tls);
+	}
 	pan_pack(cpu + OFF_DS, DEPTH_STENCIL, d) {
 		d.depth_function = MALI_FUNC_ALWAYS; d.front_compare_function = MALI_FUNC_ALWAYS; d.back_compare_function = MALI_FUNC_ALWAYS;
 		d.front_write_mask = 0xFF; d.back_write_mask = 0xFF; d.front_value_mask = 0xFF; d.back_value_mask = 0xFF;
@@ -1680,7 +1708,7 @@ typedef struct {
 		memcpy(P + 0x1000, cs->bin, cs->size);
 		if (cs->cdata_size) memcpy(P + 0x800, cs->cdata, cs->cdata_size);
 		sm_shader_desc(P + 0x200, cs, MALI_SHADER_STAGE_COMPUTE, PV + 0x1000, cs->preload, cs->work_regs);
-		pan_pack(P + 0x300, LOCAL_STORAGE, tl) { tl.wls_instances = MALI_LOCAL_STORAGE_NO_WORKGROUP_MEM; }
+		sm_pack_tls(P + 0x300, cs->flags >> 16);
 		for (uint32_t k = 0; k < 16; k++)
 			pan_pack(P + 0xA00 + 32 * k, SAMPLER, sc) { sc.minify_nearest = true; sc.magnify_nearest = true; sc.normalized_coordinates = false;
 				sc.wrap_mode_s = sc.wrap_mode_t = sc.wrap_mode_r = MALI_WRAP_MODE_CLAMP_TO_EDGE; }

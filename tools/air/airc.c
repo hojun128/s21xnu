@@ -248,6 +248,8 @@ int main(int argc, char **argv)
 		uint32_t stage = all[i].stage, size = bin.size, pw = info.push.count, wr = info.work_reg_count;
 		uint32_t sec = all[i].stage == MESA_SHADER_VERTEX ? info.vs.secondary_offset : 0;
 		uint32_t flags = (all[i].stage == MESA_SHADER_VERTEX && info.vs.secondary_enable) ? 1 : 0;
+		/* bits 16..31: per-thread TLS (register spill) bytes; the runtime must give such shaders a stack */
+		flags |= (info.tls_size > 0xFFFF ? 0xFFFFu : info.tls_size) << 16;
 		uint64_t preload = info.preload;
 		rec_write(name, 1, 64, rf); rec_write(&stage, 4, 1, rf); rec_write(&size, 4, 1, rf); rec_write(&preload, 8, 1, rf);
 		rec_write(&pw, 4, 1, rf); rec_write(&wr, 4, 1, rf); rec_write(&sec, 4, 1, rf); rec_write(&flags, 4, 1, rf);
@@ -261,6 +263,7 @@ int main(int argc, char **argv)
 		static const uint8_t z[16];
 		rec_write(z, 1, (16 - (bin.size & 15)) & 15, rf);
 		if (rsv) { rec_write(all[i].cdata, 1, rsv, rf); rec_write(z, 1, (16 - (rsv & 15)) & 15, rf); }
+		if (info.tls_size) fprintf(stderr, "%-36s TLS %u bytes/thread\n", name, info.tls_size);
 		fprintf(stderr, "%-36s %s %5u bytes preload=%llx push=%u sec=%u nvar=%u%s\n", name,
 		    stage == MESA_SHADER_VERTEX ? "VS" : stage == MESA_SHADER_FRAGMENT ? "FS" : "CS", size,
 		    (unsigned long long)preload, pw, sec, nvar, flags ? " varying-shader" : "");
