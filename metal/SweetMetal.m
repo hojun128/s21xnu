@@ -31,7 +31,8 @@ static io_connect_t sm_conn;
  * otherwise loses them under the thumbnails (run53). */
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
-	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed" };
+	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
+	"poster draw", "draw type", "late " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -41,6 +42,15 @@ static void slog(const char *fmt, ...)
 		if (!strstr(b, sm_rep_keys[i])) continue;
 		size_t n = strlen(b);
 		if (sm_rep_len + n + 2 < sizeof sm_rep) { memcpy(sm_rep + sm_rep_len, b, n); sm_rep_len += n; sm_rep[sm_rep_len++] = '\n'; sm_rep[sm_rep_len] = 0; }
+		/* and into the kernel's keep buffer (all processes), replayed right before a recovery reboot */
+		if (sm_conn) {
+			static int nk; char kb[176];
+			if (nk++ < 160) {
+				const char *pn = getprogname();
+				int L = snprintf(kb, sizeof kb, "K %.5s %s", pn ? pn : "?", strncmp(b, "SweetMTL: ", 10) ? b : b + 10);
+				IOConnectCallMethod(sm_conn, 9, NULL, 0, kb, (size_t)(L < (int)sizeof kb ? L : (int)sizeof kb - 1), NULL, NULL, NULL, NULL);
+			}
+		}
 		break;
 	}
 	if (!sm_conn) {
@@ -2098,11 +2108,7 @@ static void *sm_watchdog(void *arg)
 				sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, (uint32_t)23);
 				if (nlate == 3) {
 					/* replay the collected report last, so it is the newest part of the ring, then end the run */
-					char *save = strdup(sm_rep), *line, *ctx = NULL;
-					sm_rep_len = sizeof sm_rep;
-					for (line = strtok_r(save, "\n", &ctx); line; line = strtok_r(NULL, "\n", &ctx)) slog("R %s", line);
-					free(save);
-					slog("SweetMTL: last thumb taken, rebooting to recovery");
+					slog("SweetMTL: last thumb taken, rebooting to recovery");   /* the kernel replays the kept lines */
 					IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
 				}
 			}

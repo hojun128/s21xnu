@@ -64,7 +64,11 @@ enum {
 	kSMMapFB = 6,
 	kSMRebootRecovery = 7,
 	kSMImportUser = 8,
+	kSMKeep = 9,            /* keep a key diagnostic line in kernel memory, replayed into pmsg right before a recovery reboot */
 };
+
+static char sm_keep_buf[12288];
+static uint32_t sm_keep_len;
 
 static IOLock *sm_lock;                 /* serializes all hardware / context calls */
 static uint64_t sm_total;               /* bytes of BOs alive */
@@ -120,6 +124,23 @@ sm_reboot_recovery(const char *why)
 	char line[96];
 	snprintf(line, sizeof(line), "reboot to recovery (%s)", why);
 	sweet_mali_log_str(line);
+	/* replay the kept lines (all processes) last, so the pmsg ring ends with them */
+	if (sm_keep_len) {
+		char ln[176];
+		uint32_t i = 0;
+		sweet_mali_log_str("KEPT LINES:");
+		while (i < sm_keep_len) {
+			uint32_t n = 0;
+			while (i < sm_keep_len && sm_keep_buf[i] != '\n' && n < sizeof(ln) - 1) {
+				ln[n++] = sm_keep_buf[i++];
+			}
+			ln[n] = 0;
+			i++;
+			if (n) {
+				sweet_mali_log_str(ln);
+			}
+		}
+	}
 	volatile uint32_t *r = sm_pmu != NULL ? sm_pmu : (volatile uint32_t *)ml_io_map(0x15860000U, 0x4000);
 	r[0x808 / 4] = (r[0x808 / 4] & ~0x00FF0000U) | 0x004E0000U;
 	r[0x80c / 4] = 0x12345604U;
@@ -708,6 +729,18 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		IOLockUnlock(sm_lock);
 		sm_reboot_recovery("user client");
 		return kIOReturnSuccess;
+	}
+	case kSMKeep: {
+		if (args->structureInput != NULL && args->structureInputSize != 0) {
+			uint32_t n = args->structureInputSize < 160 ? (uint32_t)args->structureInputSize : 160;
+			if (sm_keep_len + n + 2 < sizeof(sm_keep_buf)) {
+				memcpy(sm_keep_buf + sm_keep_len, args->structureInput, n);
+				sm_keep_len += n;
+				sm_keep_buf[sm_keep_len++] = '\n';
+			}
+		}
+		ret = kIOReturnSuccess;
+		break;
 	}
 	case kSMLog: {
 		char buf[160];
