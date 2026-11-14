@@ -1455,8 +1455,9 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	if (![self sm_inRegion:r level:lvl] || !src) return;
 	uint32_t abh = 0, abw = sm_astc(_pixelFormat, &abh, NULL);
 	if (abw) {
-		static int nl; if (nl++ < 8) slog("SweetMTL: astc upload %lux%lu at %lu,%lu bpr %lu", (unsigned long)r.size.width, (unsigned long)r.size.height,
-		    (unsigned long)r.origin.x, (unsigned long)r.origin.y, (unsigned long)bpr);
+		static int nl; if (nl++ < 8) { uint64_t b0 = 0; memcpy(&b0, src, 8);
+		    slog("SweetMTL: astc upload %lux%lu at %lu,%lu bpr %lu src %016llx store %p", (unsigned long)r.size.width, (unsigned long)r.size.height,
+		    (unsigned long)r.origin.x, (unsigned long)r.origin.y, (unsigned long)bpr, b0, _store.cpu); }
 		NSUInteger bx = r.origin.x / abw, by = r.origin.y / abh, nbx = (r.size.width + abw - 1) / abw, nby = (r.size.height + abh - 1) / abh;
 		for (NSUInteger y = 0; y < nby; y++) memcpy(_store.cpu + (by + y) * _bytesPerRow + bx * 16, (const uint8_t *)src + y * bpr, nbx * 16);
 		return;
@@ -1626,7 +1627,9 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 			r->tex[k].stride = (uint32_t)t.bytesPerRow; r->tex[k].fmt = [t maliFormat];
 			r->tex[k].pf = (uint32_t)t.pixelFormat; r->tex[k].imp = t.bo->imported;
 			r->tex[k].swz = [t maliSwizzle];
-			{ uint32_t bh = 0; bool sr = false; uint32_t bw = sm_astc(t.pixelFormat, &bh, &sr); r->tex[k].astc = bw ? (bw | bh << 8 | (uint32_t)sr << 16) : 0; }
+			{ uint32_t bh = 0; bool sr = false; uint32_t bw = sm_astc(t.pixelFormat, &bh, &sr); r->tex[k].astc = bw ? (bw | bh << 8 | (uint32_t)sr << 16) : 0;
+			  if (bw) { static int nl; if (nl++ < 6) { uint64_t b0 = 0, b1 = 0; if (t.bo->cpu) { memcpy(&b0, t.bo->cpu, 8); memcpy(&b1, t.bo->cpu + 4096, 8); }
+			    slog("SweetMTL: astc draw tex%u pf%lu va %llx cpu %p blk0 %016llx blk256 %016llx", k, (unsigned long)t.pixelFormat, t.bo->gpu, t.bo->cpu, b0, b1); } } }
 			r->ntex = k + 1;
 		}
 		if (_smp[k]) { r->smp[k].nearest = _smp[k].nearest; r->nsmp = k + 1; }
