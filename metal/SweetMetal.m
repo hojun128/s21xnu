@@ -32,7 +32,7 @@ static io_connect_t sm_conn;
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "late ", "hang bisect", "iosurface", "pass " };
+	"poster draw", "draw type", "late ", "hang bisect", "iosurface", "pass ", "layer " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1668,6 +1668,11 @@ typedef struct {
 	static int nl;
 	if (nl++ < 12) slog("SweetMTL: compute %s %s count %lux%lux%lu tg %lux%lux%lu", how, _ps ? _ps.fnName.UTF8String : "?",
 	    (unsigned long)cnt.width, (unsigned long)cnt.height, (unsigned long)cnt.depth, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth);
+	{
+		static int nt;
+		if (nt++ < 6) for (uint32_t k = 0; k < 2; k++) if (_tex[k]) slog("SweetMTL: compute tex%u %lux%lu pf%lu%s", k, (unsigned long)_tex[k].width,
+		    (unsigned long)_tex[k].height, (unsigned long)_tex[k].pixelFormat, _tex[k].iosurface ? " ios" : "");
+	}
 	if (!_ps || !_ps.cs || _nd >= 16) return;
 	sm_dispatch *d = &_d[_nd++];
 	memset(d, 0, sizeof *d);
@@ -2216,10 +2221,38 @@ static bool sm_process_allowed(void)
 	return pn && (!strcmp(pn, "malitest") || (all >= 1 && (!strcmp(pn, "backboardd") || sm_is_poster(pn))) || all == 2);
 }
 
+static IMP sm_orig_nextDrawable, sm_orig_setPF;
+static id sm_nextDrawable(id self, SEL _cmd)
+{
+	id d = ((id (*)(id, SEL))sm_orig_nextDrawable)(self, _cmd);
+	static int nl;
+	if (nl++ < 6) {
+		id t = d ? [d texture] : nil;
+		slog("SweetMTL: layer nextDrawable -> %s tex %s %lux%lu pf%lu", d ? object_getClassName(d) : "nil", t ? object_getClassName(t) : "-",
+		    t ? (unsigned long)[t width] : 0, t ? (unsigned long)[t height] : 0, t ? (unsigned long)[t pixelFormat] : 0);
+	}
+	return d;
+}
+static void sm_setPF(id self, SEL _cmd, NSUInteger pf)
+{
+	slog("SweetMTL: layer setPixelFormat %lu", (unsigned long)pf);
+	((void (*)(id, SEL, NSUInteger))sm_orig_setPF)(self, _cmd, pf);
+}
+static void sm_layer_hooks(void)
+{
+	Class c = NSClassFromString(@"CAMetalLayer");
+	if (!c) return;
+	Method m = class_getInstanceMethod(c, @selector(nextDrawable));
+	if (m) sm_orig_nextDrawable = method_setImplementation(m, (IMP)sm_nextDrawable);
+	m = class_getInstanceMethod(c, @selector(setPixelFormat:));
+	if (m) sm_orig_setPF = method_setImplementation(m, (IMP)sm_setPF);
+}
+
 + (void)load
 {
 	/* refused processes stay silent: their crash reports filled the 128 KiB pmsg log (run47, AegirPoster) */
 	if (!sm_process_allowed()) return;
+	if (sm_is_poster(getprogname())) sm_layer_hooks();
 	sm_fc_hook();
 	if (getprogname() && strcmp(getprogname(), "malitest")) { sm_diag_install(); sm_trace_install(self); }
 	slog("SweetMTL: +load in %s, super=%s", getprogname() ? getprogname() : "?", class_getName(class_getSuperclass(self)));
