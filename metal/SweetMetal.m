@@ -638,6 +638,11 @@ static void sm_pack_blend(void *dst, const sm_drawrec *r)
 }
 
 /* A whole render pass: clear + N draws (one MALLOC_VERTEX job each, shared tiler context) + one FRAGMENT job. */
+static uint32_t sm_pf_info(NSUInteger pf, uint32_t *fmt, uint32_t *swz);
+static uint32_t sm_pf_bpp(NSUInteger pf);
+static NSUInteger sm_target_pf = 80;   /* pixel format of the target sm_pass draws into (set by the caller) */
+/* render-target writeback for 1/2-byte targets: the tile buffer stays RGBA8 (Mesa BFMT R8/RG8/A8) */
+static uint32_t sm_rt_writeback(NSUInteger pf) { return pf == 1 || pf == 10 || pf == 11 ? MALI_COLOR_FORMAT_R8 : pf == 30 ? MALI_COLOR_FORMAT_R8G8 : MALI_COLOR_FORMAT_R8G8B8A8; }
 static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w, uint32_t h, uint32_t stride,
     uint32_t packed, bool bgra, const sm_drawrec *dr, uint32_t ndraw, uint32_t *vstatus, bool preload)
 {
@@ -674,9 +679,9 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		rt.clear.color_0 = rt.clear.color_1 = rt.clear.color_2 = rt.clear.color_3 = packed;
 		rt.write_enable = true; rt.dithering_enable = true;
 		rt.internal_format = MALI_COLOR_BUFFER_INTERNAL_FORMAT_R8G8B8A8;
-		rt.writeback_format = MALI_COLOR_FORMAT_R8G8B8A8;
+		rt.writeback_format = sm_rt_writeback(sm_target_pf);
 		rt.writeback_block_format = MALI_BLOCK_FORMAT_LINEAR; rt.writeback_msaa = MALI_MSAA_SINGLE;
-		rt.swizzle = bgra ? (2 | (1 << 3) | (0 << 6) | (3 << 9)) : (0 | (1 << 3) | (2 << 6) | (3 << 9));
+		rt.swizzle = sm_target_pf == 1 ? (3 | (1 << 3) | (2 << 6) | (0 << 9)) : bgra ? (2 | (1 << 3) | (0 << 6) | (3 << 9)) : (0 | (1 << 3) | (2 << 6) | (3 << 9));
 		rt.rgb.base = target_va; rt.rgb.row_stride = stride;
 	}
 	pan_pack(cpu + OFF_TLS, LOCAL_STORAGE, tl) { tl.wls_instances = MALI_LOCAL_STORAGE_NO_WORKGROUP_MEM; }
@@ -704,6 +709,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 			memcpy(Q + 0x400, ps->bin, ps->size);
 			sm_shader_desc(Q + 0x180, ps, MALI_SHADER_STAGE_FRAGMENT, QV + 0x400, ps->preload, ps->work_regs);
 			uint32_t fmt = (MALI_RGBA8_UNORM << 12) | (bgra ? MALI_RGB_COMPONENT_ORDER_BGRA : MALI_RGB_COMPONENT_ORDER_RGBA);
+			if (sm_pf_bpp(sm_target_pf) != 4) sm_pf_info(sm_target_pf, &fmt, NULL);   /* 1/2-byte target read back as such */
 			pan_pack(Q + 0x260, PLANE, pl) {
 				pl.plane_type = MALI_PLANE_TYPE_GENERIC; pl.clump_format = MALI_CLUMP_FORMAT_RAW32; pl.clump_ordering = MALI_CLUMP_ORDERING_LINEAR;
 				pl.pointer = target_va; pl.row_stride = stride; pl.size = stride * h; pl.slice_stride = stride * h;
@@ -1602,7 +1608,8 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 	sm_commits++;
 	for (SweetMTLRenderEncoder *e in _passes) {
 		if (!have || !e.target) { _status = 5; continue; }
-		if (sm_pf_bpp(e.target.pixelFormat) != 4) {
+		sm_target_pf = e.target.pixelFormat;
+		if (sm_pf_bpp(e.target.pixelFormat) != 4 && sm_rt_writeback(e.target.pixelFormat) == MALI_COLOR_FORMAT_R8G8B8A8) {
 			/* render targets are written as 4-byte RGBA8/BGRA8 only: a 1/2/8-byte target would overflow */
 			static int nl; if (nl++ < 6) slog("SweetMTL: skipped pass into pixel format %lu", (unsigned long)e.target.pixelFormat);
 			continue;
