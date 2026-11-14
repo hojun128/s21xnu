@@ -32,7 +32,7 @@ static io_connect_t sm_conn;
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes" };
+	"poster draw", "draw type", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1360,6 +1360,8 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	_bytesPerRow = (_width * sm_pf_bpp(_pixelFormat) + 63) & ~(NSUInteger)63;  /* Mali linear planes need a 64-byte aligned row stride (run34: 776 faulted) */
 	NSUInteger rows = _height;
 	uint32_t abh = 0, abw = sm_astc(_pixelFormat, &abh, NULL);
+	if (abw) { static int nl; if (nl++ < 8) slog("SweetMTL: astc create %lux%lu pf%lu mips %lu storage %lu usage %lu", (unsigned long)_width, (unsigned long)_height,
+	    (unsigned long)_pixelFormat, (unsigned long)d.mipmapLevelCount, (unsigned long)d.storageMode, (unsigned long)d.usage); }
 	if (abw) {   /* ASTC: rows of 16-byte blocks */
 		_bytesPerRow = (((_width + abw - 1) / abw) * 16 + 63) & ~(NSUInteger)63;
 		rows = (_height + abh - 1) / abh;
@@ -1446,9 +1448,12 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl withBytes:(const void *)src bytesPerRow:(NSUInteger)bpr
 {
+	if (sm_astc(_pixelFormat, NULL, NULL) && lvl == 0 && ![self sm_inRegion:r level:lvl]) { static int nl; if (nl++ < 4) slog("SweetMTL: astc upload rejected %lux%lu", (unsigned long)r.size.width, (unsigned long)r.size.height); }
 	if (![self sm_inRegion:r level:lvl] || !src) return;
 	uint32_t abh = 0, abw = sm_astc(_pixelFormat, &abh, NULL);
 	if (abw) {
+		static int nl; if (nl++ < 8) slog("SweetMTL: astc upload %lux%lu at %lu,%lu bpr %lu", (unsigned long)r.size.width, (unsigned long)r.size.height,
+		    (unsigned long)r.origin.x, (unsigned long)r.origin.y, (unsigned long)bpr);
 		NSUInteger bx = r.origin.x / abw, by = r.origin.y / abh, nbx = (r.size.width + abw - 1) / abw, nby = (r.size.height + abh - 1) / abh;
 		for (NSUInteger y = 0; y < nby; y++) memcpy(_store.cpu + (by + y) * _bytesPerRow + bx * 16, (const uint8_t *)src + y * bpr, nbx * 16);
 		return;
@@ -1778,6 +1783,8 @@ typedef struct {
 - (void)copyFromTexture:(id)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)sz
     toTexture:(id)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO
 {
+	{ static int nl; if (nl++ < 6) slog("SweetMTL: blit copy tex pf%lu -> pf%lu %lux%lu level %lu->%lu", (unsigned long)[src pixelFormat], (unsigned long)[dst pixelFormat],
+	    (unsigned long)sz.width, (unsigned long)sz.height, (unsigned long)sl, (unsigned long)dl); }
 	if (![src isKindOfClass:NSClassFromString(@"SweetMTLTexture")] || ![dst isKindOfClass:NSClassFromString(@"SweetMTLTexture")]) return;
 	if (ss || sl || ds || dl) return;
 	NSUInteger sw = [src width], sh = [src height], dw = [dst width], dh = [dst height];
