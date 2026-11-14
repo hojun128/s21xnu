@@ -32,7 +32,7 @@ static io_connect_t sm_conn;
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "late ", "hang bisect" };
+	"poster draw", "draw type", "late ", "hang bisect", "iosurface", "pass " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1391,7 +1391,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	} else if (!sm_bo_import(&_store, base, (uint64_t)_bytesPerRow * _height)) return nil;
 	_surface = ios; CFRetain(ios);
 	_bo = &_store;
-	static int nl; if (nl++ < 8) slog("SweetMTL: iosurface %u %lux%lu bpr %lu fmt %lu -> gpu %llx", IOSurfaceGetID(ios),
+	static int nl; if (nl++ < (sm_is_poster(getprogname()) ? 16 : 8)) slog("SweetMTL: iosurface %u %lux%lu bpr %lu fmt %lu -> gpu %llx", IOSurfaceGetID(ios),
 	    (unsigned long)_width, (unsigned long)_height, (unsigned long)_bytesPerRow, (unsigned long)_pixelFormat, _store.gpu);
 	return self;
 }
@@ -1862,7 +1862,8 @@ typedef struct {
 				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, n, &vs);
 			}
 			static int npass; if (_lastJobStatus || vs || npass++ < 6 || (sm_is_poster(getprogname()) && npass < 40))
-			slog("SweetMTL: pass %u draws (%s) load=%d clear=%d blend0=%u vertex=%x fragment=%x", e->_ndraw, generic ? "translated" : "fixed", e.load, e.clear, e->_draws[0].blend_on ? (e->_draws[0].rgb_sf << 8 | e->_draws[0].rgb_df) : 0, vs, _lastJobStatus);
+			slog("SweetMTL: pass %u draws into %lux%lu pf%lu%s load=%d clear=%d vertex=%x fragment=%x", e->_ndraw, (unsigned long)e.target.width,
+			    (unsigned long)e.target.height, (unsigned long)e.target.pixelFormat, e.target.iosurface ? " ios" : "", e.load, e.clear, vs, _lastJobStatus);
 			if (generic && _lastJobStatus == 0xFFFFu && sm_is_poster(getprogname())) {
 				/* poster pass hung (timeout, not a fault): replay each draw alone, as recorded and with its ASTC textures
 				 * swapped for the null texture, to tell a shader hang from an ASTC decode hang. Once per process. */
