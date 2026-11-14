@@ -212,7 +212,8 @@ static bool sm_gpu_off;   /* a job timed out (or the kernel fenced the GPU): no 
 static char sm_off_reason[160];   /* why, repeated in every "alive" line so a wrapped pmsg log still shows it */
 static char sm_cur_pass[96];      /* what was being drawn */
 static char sm_fail_log[240];
-static id sm_last_target;         /* last full-screen render target (thumbnails are timed, an idle lock screen draws nothing) */     /* first GPU failures, also repeated in the alive lines */
+static id sm_last_target;
+static bool sm_is_poster(const char *pn);         /* last full-screen render target (thumbnails are timed, an idle lock screen draws nothing) */     /* first GPU failures, also repeated in the alive lines */
 static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 {
 	if (sm_gpu_off) return 0xFFFCu;
@@ -1877,7 +1878,7 @@ static void *sm_watchdog(void *arg)
 	for (int t = 1;; t++) {
 		sleep(10);
 		uint32_t c = sm_commits;
-		if (t % 3 == 0) {
+		if (t % (sm_is_poster(getprogname()) ? 30 : 3) == 0) {
 			slog("SweetMTL: alive %ds commits=%u bo %lluMB/%u vfree %u%s%s", t * 10, c, sm_live_bytes >> 20, sm_live_n, sm_vfree_n,
 			    sm_off_reason[0] ? " OFF: " : "", sm_off_reason);
 			if (sm_fail_log[0]) slog("SweetMTL: fails: %s", sm_fail_log);
@@ -1888,7 +1889,7 @@ static void *sm_watchdog(void *arg)
 			static const long at[3] = { 1000, 1150, 1300 };   /* first one rgb332, the last two rgb565 */
 			struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
 			id tg = sm_last_target;
-			if (nlate < 3 && ts.tv_sec >= at[nlate] && tg) {
+			if (nlate < 3 && ts.tv_sec >= at[nlate] && tg && !sm_is_poster(getprogname())) {
 				nlate++;
 				SweetMTLTexture *tx = tg;
 				slog("SweetMTL: late thumb %d at %lds commits=%u gpuoff=%d", nlate, (long)ts.tv_sec, c, sm_gpu_off);
@@ -1917,6 +1918,11 @@ static void *sm_watchdog(void *arg)
 	uint32_t _smPort;
 }
 
+/* Lock-screen poster extensions (AegirPoster = Astronomy) abort without a Metal device (run47). They get one,
+ * but with the GPU switched off: their shaders are not translated yet and a GPU fault there would spend the
+ * kernel's fault budget that backboardd needs. */
+static bool sm_is_poster(const char *pn) { return pn && strstr(pn, "Poster") != NULL; }
+
 /* Which processes get our Metal device. sweetmetal=2: the render server only (app content is composited by
  * backboardd; SpringBoard's own Metal users such as SiriUICore crashed on shaders we cannot translate, run44);
  * sweetmetal=4: every process. */
@@ -1929,7 +1935,7 @@ static bool sm_process_allowed(void)
 		all = ok && strstr(ba, "sweetmetal=4") ? 2 : ok && strstr(ba, "sweetmetal=2") ? 1 : 0;
 	}
 	const char *pn = getprogname();
-	return pn && (!strcmp(pn, "malitest") || (all >= 1 && !strcmp(pn, "backboardd")) || all == 2);
+	return pn && (!strcmp(pn, "malitest") || (all >= 1 && (!strcmp(pn, "backboardd") || sm_is_poster(pn))) || all == 2);
 }
 
 + (void)load
@@ -1951,6 +1957,7 @@ static bool sm_process_allowed(void)
 		return nil;
 	}
 	slog("SweetMTL: initWithAcceleratorPort:%u in %s", port, pn ? pn : "?");
+	if (sm_is_poster(pn) && !sm_gpu_off) { sm_gpu_off = true; snprintf(sm_off_reason, sizeof sm_off_reason, "poster process: GPU not used"); }
 	self = [super init];
 	slog("SweetMTL: super init -> %p", self);
 	if (self) {
