@@ -2191,7 +2191,7 @@ static void *sm_watchdog(void *arg)
 				if (nlate < 3) { slog("SweetMTL: late mark %d at %lds commits=%u", nlate, (long)ts.tv_sec, c); continue; }   /* one thumbnail only: keep log room for other processes' crash reports */
 				SweetMTLTexture *tx = tg;
 				slog("SweetMTL: late thumb %d at %lds commits=%u gpuoff=%d", nlate, (long)ts.tv_sec, c, sm_gpu_off);
-				sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, (uint32_t)23);
+				sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, (uint32_t)13);   /* rgb332: leaves ring room for the poster snapshot */
 				if (nlate == 3) {
 					/* replay the collected report last, so it is the newest part of the ring, then end the run */
 					slog("SweetMTL: last thumb taken, rebooting to recovery");   /* the kernel replays the kept lines */
