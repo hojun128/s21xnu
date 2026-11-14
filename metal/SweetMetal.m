@@ -32,7 +32,7 @@ static io_connect_t sm_conn;
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "late ", "hang bisect", "iosurface", "pass ", "layer " };
+	"poster draw", "draw type", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1429,6 +1429,14 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (uint8_t *)sm_cpu { return _store.cpu; }
 - (void)getBytes:(void *)dst bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl
 {
+	{
+		static int nl;
+		if (nl++ < 6) {
+			uint32_t c = 0; if (_store.cpu) memcpy(&c, _store.cpu + (_height / 2) * _bytesPerRow + (_width / 2) * 4, 4);
+			slog("SweetMTL: getBytes %lux%lu pf%lu region %lux%lu mid %08x", (unsigned long)_width, (unsigned long)_height, (unsigned long)_pixelFormat,
+			    (unsigned long)r.size.width, (unsigned long)r.size.height, c);
+		}
+	}
 	if (![self sm_inRegion:r level:lvl]) return;
 	for (NSUInteger y = 0; y < r.size.height; y++)
 		memcpy((uint8_t *)dst + y * bpr, _store.cpu + (r.origin.y + y) * _bytesPerRow + r.origin.x * sm_pf_bpp(_pixelFormat), r.size.width * sm_pf_bpp(_pixelFormat));

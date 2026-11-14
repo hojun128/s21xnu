@@ -84,6 +84,7 @@ sm_log(const char *fmt, uint64_t a, uint64_t b, uint64_t c)
 
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 extern "C" vm_offset_t gPhysBase, gPhysSize;     /* osfmk/arm64/arm_vm_init.c: the physmap */
+extern "C" vm_offset_t gVirtBase, static_memory_end;   /* ... and the end of the kernel static region (KVA) */
 
 /* flush_dcache64(phys) goes through phystokv(), which panics for pages outside the physmap (IOSurface/carve-out
  * pages at 0x93fd00000 killed backboardd's kernel in run46): those are skipped */
@@ -91,6 +92,11 @@ static void
 sm_flush_pa(uint64_t pa, unsigned len)
 {
 	if (pa >= gPhysBase && pa + len <= gPhysBase + gPhysSize) {
+		/* pages of the kernel static region (ramdisk/overlay file pages mapped into a client) fault on cache
+		 * maintenance (run68/run78 panics): the CPU never writes them, skip */
+		if (pa - gPhysBase + gVirtBase < static_memory_end) {
+			return;
+		}
 		flush_dcache64(pa, len, TRUE);
 	}
 }
