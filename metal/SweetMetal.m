@@ -1,3 +1,4 @@
+#include <dlfcn.h>
 /*
  * SweetMetal.bundle: Metal driver plugin for the S21 Mali-G78 (phase 1 skeleton).
  * Loaded by Metal.framework through the kernel's IOAcceleratorES service
@@ -136,10 +137,17 @@ static bool sm_bo_import(sm_bo *bo, void *uva, uint64_t len)
 	return true;
 }
 /* transient bytes (setVertexBytes & co): one ring, reused every pass */
+static bool sm_is_poster(const char *pn);
+static size_t sm_avail(void)   /* os_proc_available_memory, looked up at run time (iOS only) */
+{
+	static size_t (*f)(void); static bool tried;
+	if (!tried) { tried = true; f = (size_t (*)(void))dlsym(RTLD_DEFAULT, "os_proc_available_memory"); }
+	return f ? f() : 0;
+}
 static uint64_t sm_ring_put(const void *p, uint64_t len, uint8_t **cpu_out)
 {
 	static sm_bo ring; static bool have; static uint64_t off;
-	if (!have) have = sm_bo_alloc(&ring, 8u << 20);
+	if (!have) have = sm_bo_alloc(&ring, sm_is_poster(getprogname()) ? (1u << 20) : (8u << 20));   /* extensions have a small memory limit */
 	if (!have || len > ring.size) return 0;
 	off = (off + 255) & ~255ULL;
 	if (off + len > ring.size) off = 0;
@@ -849,6 +857,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, HEADER, header) { header.type = MALI_JOB_TYPE_MALLOC_VERTEX; header.index = 1; }
 		uint32_t vst = sm_submit(1, PV);
 		uint32_t vexc = *(volatile uint32_t *)P;
+		if (sm_is_poster(getprogname())) { static int na; if (na++ < 6) slog("SweetMTL: poster draw%u avail %zuMB", i, sm_avail() >> 20); }
 		{ static int nd; if (vst || nd++ < 6 || sm_is_poster(getprogname()) && nd < 40)   /* per-draw lines filled the pmsg ring (run64) */
 		slog("SweetMTL: draw%u vs=%s fs=%s n=%u sec=%d nvar=%u job=%x exc=%x", i, vs->name, fs ? fs->name : "(FS_GREEN)",
 		    r->vcount, sec, nvar, vst, vexc); }
@@ -1601,7 +1610,7 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 		bool bgra = sm_is_bgra(e.target.pixelFormat);
 		if (e->_ndraw) {
 			static sm_bo heap; static bool haveheap;
-			if (!haveheap) haveheap = sm_bo_alloc(&heap, 4u << 20);
+			if (!haveheap) haveheap = sm_bo_alloc(&heap, sm_is_poster(getprogname()) ? (1u << 20) : (4u << 20));
 			if (!haveheap) { _status = 5; continue; }
 			bool generic = true;
 			for (uint32_t i = 0; i < e->_ndraw; i++) if (!e->_draws[i].vs) generic = false;
@@ -1968,7 +1977,7 @@ static bool sm_process_allowed(void)
 		(void)CFBridgingRetain(self);
 		return nil;
 	}
-	slog("SweetMTL: initWithAcceleratorPort:%u in %s", port, pn ? pn : "?");
+	slog("SweetMTL: initWithAcceleratorPort:%u in %s avail %zuMB", port, pn ? pn : "?", sm_avail() >> 20);
 
 	self = [super init];
 	slog("SweetMTL: super init -> %p", self);
