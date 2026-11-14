@@ -33,7 +33,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit " };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1682,6 +1682,8 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 			  if (bw) { static int nl; if (nl++ < 6) { uint64_t b0 = 0, b1 = 0; if (t.bo->cpu) { memcpy(&b0, t.bo->cpu, 8); memcpy(&b1, t.bo->cpu + 4096, 8); }
 			    slog("SweetMTL: astc draw tex%u pf%lu va %llx cpu %p blk0 %016llx blk256 %016llx", k, (unsigned long)t.pixelFormat, t.bo->gpu, t.bo->cpu, b0, b1); } } }
 			r->ntex = k + 1;
+			if (sm_describe > 0) { static int nl; if (nl++ < 60) slog("SweetMTL:  rt%u draw%u %ux%u pf%lu%s fs %.40s", k, _ndraw, r->tex[k].w, r->tex[k].h,
+			    (unsigned long)t.pixelFormat, t.bo->imported ? " imp" : "", _pipeline.fs ? _pipeline.fs->name + (strncmp(_pipeline.fs->name, "com.apple.coreanimation.frag.", 29) ? 0 : 29) : "-"); }
 		}
 		if (_smp[k]) { r->smp[k].nearest = _smp[k].nearest; r->nsmp = k + 1; }
 	}
@@ -1948,6 +1950,8 @@ typedef struct {
 				sm_describe--;
 				slog("SweetMTL: fpass %lux%lu pf%lu n=%u load=%d st=%x", (unsigned long)e.target.width, (unsigned long)e.target.height,
 				    (unsigned long)e.target.pixelFormat, e->_ndraw, e.load, _lastJobStatus);
+				{ static int nt; if (e.target.width != 1125 && e.target.width >= 600 && nt++ == 0)
+					sm_thumb(e.target.bo->cpu, (uint32_t)e.target.width, (uint32_t)e.target.height, (uint32_t)e.target.bytesPerRow, 24); }
 				for (uint32_t i = 0; i < e->_ndraw && i < 40; i++) {
 					const sm_drawrec *o = &e->_draws[i];
 					const char *fn = o->fs ? o->fs->name : "GREEN";
@@ -2490,6 +2494,7 @@ static void sm_layer_hooks(void)
 		if (t) [t replaceRegion:MTLRegionMake2D(0, 0, d.width, d.height) mipmapLevel:0 withBytes:p bytesPerRow:bbpr];
 		static int nl; if (nl++ < 8) slog("SweetMTL: buffer texture nocopy astc %lux%lu pf%lu len %lu -> %s", (unsigned long)d.width, (unsigned long)d.height,
 		    (unsigned long)d.pixelFormat, (unsigned long)len, t ? "ok" : "FAILED");
+		{ static int nt; if (t && nt++ == 0 && d.width >= 1000) sm_thumb(t.bo->cpu, (uint32_t)[t gpuWidth], (uint32_t)[t gpuHeight], (uint32_t)t.bytesPerRow, 25); }
 		if (dl) dl(p, len);
 		return t;
 	}
