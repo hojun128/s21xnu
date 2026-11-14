@@ -873,6 +873,14 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 					tx.surfaces = PV + 0xD00 + 32 * k;
 					tx.minimum_lod = 0; tx.maximum_lod = 0;
 				}
+				if (astc) {
+					static int nd;
+					if (nd++ < 3) {
+						const uint32_t *tw32 = (const uint32_t *)(P + 0xC00 + 32 * k), *pw32 = (const uint32_t *)(P + 0xD00 + 32 * k);
+						slog("SweetMTL: astc desc T %08x %08x %08x %08x %08x %08x %08x %08x", tw32[0], tw32[1], tw32[2], tw32[3], tw32[4], tw32[5], tw32[6], tw32[7]);
+						slog("SweetMTL: astc desc P %08x %08x %08x %08x %08x %08x %08x %08x", pw32[0], pw32[1], pw32[2], pw32[3], pw32[4], pw32[5], pw32[6], pw32[7]);
+					}
+				}
 			}
 			memset(P + 0x280, 0, 6 * 16);
 			pan_pack(P + 0x280 + 3 * 16, RESOURCE, rc) { rc.address = PV + 0xA00; rc.size = 16 * 32; }
