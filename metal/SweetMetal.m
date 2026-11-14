@@ -576,6 +576,8 @@ static void sm_shader_desc(void *dst, const sm_shader *s, uint32_t stage, uint64
 		sp.register_allocation = wr > 32 ? MALI_SHADER_REGISTER_ALLOCATION_64_PER_THREAD : MALI_SHADER_REGISTER_ALLOCATION_32_PER_THREAD;
 		sp.binary = bin_va;
 		sp.preload.r48_r63 = (uint32_t)(preload >> 48);
+		/* experiment (run73): keep helper threads alive in poster fragment shaders, whose derivatives (earth) hung the GPU */
+		if (stage == MALI_SHADER_STAGE_FRAGMENT && sm_is_poster(getprogname())) sp.requires_helper_threads = true;
 	}
 }
 
