@@ -15,6 +15,10 @@ NULL_TEXTURE = 7                            # texture slot the runtime fills wit
 NULL_TEXTURE_3D = 6                         # ... and a 1x1x1 3D one
 PUSH_CDATA_VS, PUSH_CDATA_FS = 224, 232     # u64 GPU VA of this shader's constant-global blob
 PUSH_DUMMY = 240                            # u64 GPU VA of a zeroed 4 KiB scratch page: target of predicated-off memory accesses
+PUSH_CS_TG = 448                            # compute: u32 threads-per-threadgroup x, y, z (function constants 48+ unusable in kernels)
+PUSH_CS_TEXSZ = 464                         # compute: texture i (0..3) size as u32 (width | height << 16)
+CUR_KIND = [None]                           # stage of the function being translated
+PUSH_CS_TEXW = 480                          # compute: written texture i (0, 1): {u64 va, u32 row stride, u32 format (0 RGBA8, 1 BGRA8)}
 
 class Unsupported(Exception): pass
 
@@ -181,6 +185,7 @@ class Fn:
         self.mod, self.f, self.md = mod, f, md
         self.vals = {}
         self.cur_pred = None
+        self.up = parent
         if parent is None:
             self.lines, self.ctr, self.globals = [], [0], {}   # globals: module-level mutable globals -> SSA value
             self.types = Types(str(mod))
@@ -224,6 +229,7 @@ class Fn:
             for ins in blocks[0].instructions:
                 self.ins(ins)
             return self.single_ret
+        if self.base_pred is None and getattr(self, 'up', None) is not None: self.base_pred = 'nir_imm_true(b)'   # inlined multi-block helper at top level
         self.if_convert(blocks, merge_outputs=False)
         if not self.rets: return {}
         final = dict(self.rets[-1][1])
@@ -480,6 +486,16 @@ class Fn:
                 n, sc = scal(ty)
                 self.vals[name] = self.tmp('nir_load_output(b, %d, %d, nir_imm_int(b, 0), .base = %d, .dest_type = nir_type_float | %d, .io_semantics.location = FRAG_RESULT_DATA0 + %d, .io_semantics.num_slots = 1, .io_semantics.fb_fetch_output = 1)'
                                            % (n, BITS[sc], a['idx'], BITS[sc], a['idx']))
+            elif a['kind'] in ('gid', 'lid', 'wgid'):
+                n, sc = scal(ty)
+                lid = self.tmp('nir_load_local_invocation_id(b)'); wg = self.tmp('nir_load_workgroup_id(b)')
+                if a['kind'] == 'gid':
+                    tg = self.tmp('nir_load_push_constant(b, 3, 32, nir_imm_int(b, 0), .base = %d, .range = 12)' % PUSH_CS_TG)
+                    v = self.tmp('nir_iadd(b, nir_imul(b, %s, %s), %s)' % (wg, tg, lid))
+                else:
+                    v = lid if a['kind'] == 'lid' else wg
+                v = self.tmp('nir_channels(b, %s, %d)' % (v, (1 << n) - 1)) if n < 3 else v
+                self.vals[name] = self.tmp('nir_u2uN(b, %s, %d)' % (v, BITS[sc])) if BITS[sc] != 32 else v
             elif a['kind'] == 'point_coord':
                 self.vals[name] = self.tmp('nir_imm_zero(b, 2, 32)')
             elif a['kind'] == 'unused':
@@ -556,7 +572,7 @@ class Fn:
                     if it == 0:
                         p0 = None
                         for e in outside_in: p0 = self.edge[e] if p0 is None else self.tmp('nir_ior(b, %s, %s)' % (p0, self.edge[e]))
-                        hp = p0
+                        hp = p0 if p0 is not None else (self.base_pred or 'nir_imm_true(b)')   # loop header = entry block
                         self.loop_entry = ('first', outside_in)
                     else:
                         hp = latch_pred
@@ -890,9 +906,10 @@ class Fn:
               'air.floor': 'ffloor', 'air.fast_ceil': 'fceil', 'air.fast_sqrt': 'fsqrt', 'air.sqrt': 'fsqrt', 'air.fast_rsqrt': 'frsq',
               'air.fast_fract': 'ffract', 'air.fract': 'ffract', 'air.sign': 'fsign', 'air.fast_log2': 'flog2', 'air.fast_sin': 'fsin',
               'air.fast_cos': 'fcos', 'air.fast_exp': 'fexp2', 'air.exp': 'fexp2', 'air.fast_log': 'flog2', 'air.log': 'flog2',
+              'air.exp2': 'fexp2', 'air.fast_exp2': 'fexp2', 'air.rsqrt': 'frsq', 'air.log2': 'flog2', 'air.sin': 'fsin', 'air.cos': 'fcos',
               'air.dfdx': 'fddx', 'air.dfdy': 'fddy'}
         bi = {'air.fast_fmax': 'fmax', 'air.fmax': 'fmax', 'air.fast_fmin': 'fmin', 'air.fmin': 'fmin', 'air.min.s': 'imin', 'air.min.u': 'umin',
-              'air.powr': 'fpow', 'air.fast_powr': 'fpow', 'air.fast_pow': 'fpow'}
+              'air.powr': 'fpow', 'air.fast_powr': 'fpow', 'air.fast_pow': 'fpow', 'air.pow': 'fpow'}
         if fn in self.funcs:
             if self.depth > 8: raise Unsupported('inline depth')
             callee = self.funcs[fn]
@@ -901,7 +918,8 @@ class Fn:
             for k2, prm in enumerate(params):
                 pname = '%' + (prm.name or str(k2))
                 t2, v2 = ops[k2]
-                if v2.startswith('%') and isinstance(self.vals.get(v2), tuple): sub.vals[pname] = self.vals[v2]
+                if '__air_sampler_state' in v2 or '__air_sampler_state' in t2: sub.vals[pname] = ('smp', INLINE_SAMPLER)
+                elif v2.startswith('%') and isinstance(self.vals.get(v2), tuple): sub.vals[pname] = self.vals[v2]
                 elif v2.startswith('%') or not ('*' in t2): sub.vals[pname] = self.val(t2, v2)
                 else:
                     cp = self.cptr(v2) or self.gaddr(v2)
@@ -942,6 +960,12 @@ class Fn:
         if base == 'air.unpack.unorm4x8':
             r = self.tmp('nir_unpack_unorm_4x8(b, %s)' % V(0))
             return self.tmp('nir_f2fN(b, %s, %d)' % (r, BITS[s])) if BITS[s] != 32 else r
+        if base in ('air.get_width_texture_2d', 'air.get_height_texture_2d') and CUR_KIND[0] == 'kernel':
+            # kernels: size from the push block (a size query became an unencodable TEX_GATHER in compute shaders)
+            th = self.vals[ops[0][1]] if ops[0][1].startswith('%') else ('tex', NULL_TEXTURE)
+            if th[0] != 'tex' or th[1] > 3: raise Unsupported('kernel texture size slot')
+            w = self.tmp('nir_load_push_constant(b, 1, 32, nir_imm_int(b, 0), .base = %d, .range = 4)' % (PUSH_CS_TEXSZ + 4 * th[1]))
+            return self.tmp('nir_iand_imm(b, %s, 0xffff)' % w) if 'width' in base else self.tmp('nir_ushr_imm(b, %s, 16)' % w)
         if base in ('air.get_width_texture_2d', 'air.get_height_texture_2d'):
             th = self.vals[ops[0][1]] if ops[0][1].startswith('%') else ('tex', NULL_TEXTURE)
             te = th[1] if th[0] == 'texdyn' else 'nir_imm_int(b, %d)' % th[1]
@@ -965,6 +989,25 @@ class Fn:
                          % (V(1), tex, BITS[ss], V(2)) if False else
                          'sm_txf(b, %s, %s, %d, %d)' % (V(1), V(2), tex, BITS[ss]))
             return {0: r}
+        if base == 'air.write_texture_2d':
+            # compute-only: store straight to the texture's linear memory (address/pitch/format from the push block)
+            th = self.vals[ops[0][1]]
+            if th[0] != 'tex' or th[1] > 1: raise Unsupported('write_texture_2d slot')
+            o = PUSH_CS_TEXW + 16 * th[1]
+            va = self.tmp('nir_load_push_constant(b, 1, 64, nir_imm_int(b, 0), .base = %d, .range = 8)' % o)
+            pitch = self.tmp('nir_load_push_constant(b, 1, 32, nir_imm_int(b, 0), .base = %d, .range = 4)' % (o + 8))
+            fmt = self.tmp('nir_load_push_constant(b, 1, 32, nir_imm_int(b, 0), .base = %d, .range = 4)' % (o + 12))
+            xy = self.tmp('nir_u2u32(b, %s)' % V(1))
+            col = self.tmp('nir_f2f32(b, %s)' % V(2))
+            sw = self.tmp('nir_vec4(b, nir_channel(b, %s, 2), nir_channel(b, %s, 1), nir_channel(b, %s, 0), nir_channel(b, %s, 3))' % (col, col, col, col))
+            c4 = self.tmp('nir_bcsel(b, nir_ine_imm(b, %s, 0), %s, %s)' % (fmt, sw, col))
+            u = self.tmp('nir_f2u32(b, nir_fadd_imm(b, nir_fmul_imm(b, nir_fsat(b, %s), 255.0), 0.5))' % c4)
+            # manual byte packing: nir_pack_unorm_4x8 becomes MKVEC.v4i8, which the Valhall packer cannot encode
+            px = self.tmp('nir_ior(b, nir_ior(b, nir_channel(b, %s, 0), nir_ishl_imm(b, nir_channel(b, %s, 1), 8)), nir_ior(b, nir_ishl_imm(b, nir_channel(b, %s, 2), 16), nir_ishl_imm(b, nir_channel(b, %s, 3), 24)))' % (u, u, u, u))
+            off = self.tmp('nir_iadd(b, nir_imul(b, nir_channel(b, %s, 1), %s), nir_ishl_imm(b, nir_channel(b, %s, 0), 2))' % (xy, pitch, xy))
+            addr = self.tmp('nir_iadd(b, %s, nir_u2u64(b, %s))' % (va, off))
+            self.lines.append('\tnir_store_global(b, %s, 4, %s, 0x1);' % (self.guard(addr), px))
+            return None
         if base == 'air.sample_texture_3d':
             th = self.vals[ops[0][1]]
             sh = ('smp', INLINE_SAMPLER) if '__air_sampler_state' in ops[1][1] or '__air_sampler_state' in ops[1][0] else self.vals[ops[1][1]]
@@ -1053,6 +1096,9 @@ def entry_md(modtext, fname, slots):
             nm = re.search(r'"air.fragment_input", !"([^"]+)"', t).group(1); args.append({'kind': 'fragment_input', 'slot': slot_of(nm)})
         elif '"air.vertex_id"' in t: args.append({'kind': 'vertex_id'})
         elif '"air.instance_id"' in t: args.append({'kind': 'instance_id'})
+        elif '"air.thread_position_in_grid"' in t: args.append({'kind': 'gid'})
+        elif '"air.thread_position_in_threadgroup"' in t: args.append({'kind': 'lid'})
+        elif '"air.threadgroup_position_in_grid"' in t: args.append({'kind': 'wgid'})
         elif '"air.point_coord"' in t: args.append({'kind': 'point_coord'})
         elif '"air.render_target"' in t:
             args.append({'kind': 'rt_in', 'idx': int(re.search(r'"air.render_target", i32 (\d+)', t).group(1))})
@@ -1072,6 +1118,7 @@ def translate(path, slots):
     if ent not in funcs: raise Unsupported('entry not found')
     fdef = funcs[ent]
     md = entry_md(text, fdef.name, slots)
+    CUR_KIND[0] = md[0]
     F = Fn(mod, fdef, md)
     for f2 in mod.functions:     # static initialisers (air.static_init) run first
         if not f2.is_declaration and re.search(r'section "air.static_init"', str(f2)):
@@ -1082,11 +1129,23 @@ def translate(path, slots):
 if __name__ == '__main__':
     import os
     slots = {}
-    names = sys.argv[2:] or [n[:-3] for n in sorted(os.listdir(sys.argv[1]))]
+    jobs = []        # (bitcode path, published name)
+    for arg in sys.argv[1:]:
+        if arg.endswith('.json'):            # {published name: file in pl_bc}
+            for pub, fn in json.load(open(arg)).items(): jobs.append((os.path.join('pl_bc', fn), pub))
+        elif os.path.isdir(arg):
+            jobs += [(os.path.join(arg, n), None) for n in sorted(os.listdir(arg)) if n.endswith('.bc')]
+        else:
+            jobs.append((arg, None))
+    maxlines = int(os.environ.get('AIR_MAXLINES', '0'))
+    names = [j[0] for j in jobs]
     ok, bad, out = 0, {}, []
-    for n in names:
+    for path, pub in jobs:
+        n = path
         try:
-            kind, fname, body, cdata = translate(os.path.join(sys.argv[1], n + '.bc'), slots)
+            kind, fname, body, cdata = translate(path, slots)
+            if maxlines and body.count('\n') > maxlines: raise Unsupported('too large (%d lines)' % body.count('\n'))
+            if pub: fname = pub
             out.append((kind, fname, body, cdata)); ok += 1
         except Unsupported as e:
             bad[str(e).split(' ')[0] + ' ' + str(e).split(' ')[1] if ' ' in str(e) else str(e)] = bad.get(str(e), 0) + 1
@@ -1099,10 +1158,11 @@ if __name__ == '__main__':
     for k, v in Counter(r for _, r in lst).most_common(25): print('  %3d  %s' % (v, k), file=sys.stderr)
     json.dump(slots, open('varying_slots.json', 'w'), indent=1)
     with open('air_gen.inc', 'w') as f:
+        cid = lambda nm: re.sub(r'[^A-Za-z0-9_]', '_', nm)
         for kind, fname, body, cdata in out:
-            f.write('static void air_build_%s(nir_builder *b)\n{\n%s\n}\n' % (fname, body))
-            f.write('static const unsigned char air_cdata_%s[] = { %s };\n' % (fname, ', '.join(str(x) for x in cdata) or '0'))
+            f.write('static void air_build_%s(nir_builder *b)\n{\n%s\n}\n' % (cid(fname), body))
+            f.write('static const unsigned char air_cdata_%s[] = { %s };\n' % (cid(fname), ', '.join(str(x) for x in cdata) or '0'))
         f.write('static const struct { const char *name; int stage; void (*build)(nir_builder *); const unsigned char *cdata; unsigned cdata_size; } air_shaders[] = {\n')
         for kind, fname, body, cdata in out:
-            f.write('\t{ "%s", %s, air_build_%s, air_cdata_%s, %d },\n' % (fname, {'vertex': 'MESA_SHADER_VERTEX', 'fragment': 'MESA_SHADER_FRAGMENT', 'kernel': 'MESA_SHADER_COMPUTE'}[kind], fname, fname, len(cdata)))
+            f.write('\t{ "%s", %s, air_build_%s, air_cdata_%s, %d },\n' % (fname, {'vertex': 'MESA_SHADER_VERTEX', 'fragment': 'MESA_SHADER_FRAGMENT', 'kernel': 'MESA_SHADER_COMPUTE'}[kind], cid(fname), cid(fname), len(cdata)))
         f.write('};\n')

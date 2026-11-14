@@ -228,9 +228,8 @@ int main(int argc, char **argv)
 
 		nir_builder b = nir_builder_init_simple_shader(all[i].stage, &bifrost_nir_options_v9, "%s", all[i].name);
 		if (all[i].stage == MESA_SHADER_COMPUTE) {
-			b.shader->info.workgroup_size[0] = 64;
-			b.shader->info.workgroup_size[1] = 1;
-			b.shader->info.workgroup_size[2] = 1;
+			/* the threadgroup size comes from each dispatch: a fixed 64x1x1 would let NIR fold local_invocation_id.y to 0 */
+			b.shader->info.workgroup_size_variable = true;
 		}
 		all[i].build(&b);
 		nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));

@@ -1577,25 +1577,127 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (NSUInteger)staticThreadgroupMemoryLength { return 0; }
 @end
 @interface SweetMTLComputeEncoder : SweetMTLObject
+- (void)sm_run;
 @end
+/* One recorded dispatch: everything the job needs, snapshotted because the encoder state changes between dispatches */
+typedef struct {
+	const sm_shader *cs; char name[48];
+	uint32_t wg[3], cnt[3];
+	uint64_t buf[8];
+	struct { uint64_t va; uint32_t w, h, stride, fmt, swz, pf; } tex[4];
+	uint32_t ntex;
+} sm_dispatch;
 @implementation SweetMTLComputeEncoder {
 	SweetMTLComputePipelineState *_ps;
-	uint32_t _ntex, _nbuf;
+	__unsafe_unretained SweetMTLTexture *_tex[4];
+	uint64_t _buf[8];
+	sm_dispatch _d[16]; uint32_t _nd;
+	NSMutableArray *_keep;
 }
+- (instancetype)init { self = [super init]; _keep = [NSMutableArray array]; return self; }
 - (void)endEncoding {}
-- (void)setComputePipelineState:(id)ps { _ps = [ps isKindOfClass:[SweetMTLComputePipelineState class]] ? ps : nil; }
-- (void)setTexture:(id)t atIndex:(NSUInteger)i { if (i + 1 > _ntex) _ntex = (uint32_t)i + 1; }
-- (void)setBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i { if (i + 1 > _nbuf) _nbuf = (uint32_t)i + 1; }
-- (void)setBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i { if (i + 1 > _nbuf) _nbuf = (uint32_t)i + 1; }
+- (void)setComputePipelineState:(id)ps { _ps = [ps isKindOfClass:[SweetMTLComputePipelineState class]] ? ps : nil; if (ps) [_keep addObject:ps]; }
+- (void)setTexture:(id)t atIndex:(NSUInteger)i
+{
+	if (i < 4) { _tex[i] = [t isKindOfClass:[SweetMTLTexture class]] ? t : nil; if (t) [_keep addObject:t]; }
+}
+- (void)setBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
+{
+	if (i < 8) { _buf[i] = b ? [(SweetMTLBuffer *)b gpuAddress] + o : 0; if (b) [_keep addObject:b]; }
+}
+- (void)setBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i { if (i < 8) _buf[i] = sm_ring_put(p, n, NULL); }
 - (void)setSamplerState:(id)s atIndex:(NSUInteger)i {}
-- (void)sm_log:(const char *)how grid:(MTLSize)g tg:(MTLSize)t
+- (void)sm_record:(MTLSize)cnt tg:(MTLSize)t how:(const char *)how
 {
 	static int nl;
-	if (nl++ < 24) slog("SweetMTL: compute %s %s grid %lux%lux%lu tg %lux%lux%lu tex %u buf %u", how, _ps ? _ps.fnName.UTF8String : "?",
-	    (unsigned long)g.width, (unsigned long)g.height, (unsigned long)g.depth, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth, _ntex, _nbuf);
+	if (nl++ < 12) slog("SweetMTL: compute %s %s count %lux%lux%lu tg %lux%lux%lu", how, _ps ? _ps.fnName.UTF8String : "?",
+	    (unsigned long)cnt.width, (unsigned long)cnt.height, (unsigned long)cnt.depth, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth);
+	if (!_ps || !_ps.cs || _nd >= 16) return;
+	sm_dispatch *d = &_d[_nd++];
+	memset(d, 0, sizeof *d);
+	d->cs = _ps.cs; strlcpy(d->name, _ps.fnName.UTF8String, sizeof d->name);
+	d->wg[0] = (uint32_t)t.width; d->wg[1] = (uint32_t)t.height; d->wg[2] = (uint32_t)(t.depth ? t.depth : 1);
+	d->cnt[0] = (uint32_t)cnt.width; d->cnt[1] = (uint32_t)cnt.height; d->cnt[2] = (uint32_t)(cnt.depth ? cnt.depth : 1);
+	memcpy(d->buf, _buf, sizeof d->buf);
+	for (uint32_t k = 0; k < 4; k++) {
+		SweetMTLTexture *tx = _tex[k];
+		if (!tx || !tx.bo) continue;
+		[tx sm_sync];
+		d->tex[k].va = tx.bo->gpu; d->tex[k].w = (uint32_t)tx.width; d->tex[k].h = (uint32_t)tx.height;
+		d->tex[k].stride = (uint32_t)tx.bytesPerRow; d->tex[k].fmt = [tx maliFormat]; d->tex[k].swz = [tx maliSwizzle];
+		d->tex[k].pf = (uint32_t)tx.pixelFormat; d->ntex = k + 1;
+	}
 }
-- (void)dispatchThreadgroups:(MTLSize)g threadsPerThreadgroup:(MTLSize)t { [self sm_log:"groups" grid:g tg:t]; }
-- (void)dispatchThreads:(MTLSize)g threadsPerThreadgroup:(MTLSize)t { [self sm_log:"threads" grid:g tg:t]; }
+- (void)dispatchThreadgroups:(MTLSize)g threadsPerThreadgroup:(MTLSize)t { [self sm_record:g tg:t how:"groups"]; }
+- (void)dispatchThreads:(MTLSize)g threadsPerThreadgroup:(MTLSize)t
+{
+	NSUInteger tw = t.width ? t.width : 1, th = t.height ? t.height : 1, td = t.depth ? t.depth : 1;
+	[self sm_record:MTLSizeMake((g.width + tw - 1) / tw, (g.height + th - 1) / th, (g.depth + td - 1) / td) tg:t how:"threads"];
+}
+/* Valhall COMPUTE_JOB per dispatch (job 0x0, shader 0x200, resources 0x280, TLS 0x300, samplers 0xA00, textures 0xC00,
+ * planes 0xD00, push 0xE00, binary 0x1000). Texture writes go straight to memory (address/pitch/format in the push
+ * block, see air2nir PUSH_CS_*); reads use the texture table. */
+- (void)sm_run
+{
+	static sm_bo cd; static bool have; static sm_bo dummy; static bool hd;
+	if (!have) have = sm_bo_alloc(&cd, 0x10000);
+	if (!hd) hd = sm_bo_alloc(&dummy, 0x10000);
+	if (!have || !hd) return;
+	for (uint32_t n = 0; n < _nd; n++) {
+		const sm_dispatch *d = &_d[n];
+		const sm_shader *cs = d->cs;
+		if (cs->size > 0xE000 || cs->cdata_size > 0x200) continue;
+		uint8_t *P = cd.cpu; uint64_t PV = cd.gpu;
+		memset(P, 0, 0x1000);
+		memcpy(P + 0x1000, cs->bin, cs->size);
+		if (cs->cdata_size) memcpy(P + 0x800, cs->cdata, cs->cdata_size);
+		sm_shader_desc(P + 0x200, cs, MALI_SHADER_STAGE_COMPUTE, PV + 0x1000, cs->preload, cs->work_regs);
+		pan_pack(P + 0x300, LOCAL_STORAGE, tl) { tl.wls_instances = MALI_LOCAL_STORAGE_NO_WORKGROUP_MEM; }
+		for (uint32_t k = 0; k < 16; k++)
+			pan_pack(P + 0xA00 + 32 * k, SAMPLER, sc) { sc.minify_nearest = true; sc.magnify_nearest = true; sc.normalized_coordinates = false;
+				sc.wrap_mode_s = sc.wrap_mode_t = sc.wrap_mode_r = MALI_WRAP_MODE_CLAMP_TO_EDGE; }
+		for (uint32_t k = 0; k < 8; k++) {
+			bool real = k < d->ntex && d->tex[k].va;
+			uint64_t va = real ? d->tex[k].va : dummy.gpu;
+			uint32_t tw = real ? d->tex[k].w : 16, th = real ? d->tex[k].h : 16, ts = real ? d->tex[k].stride : 64;
+			pan_pack(P + 0xD00 + 32 * k, PLANE, pl) {
+				pl.plane_type = MALI_PLANE_TYPE_GENERIC; pl.clump_format = MALI_CLUMP_FORMAT_RAW32; pl.clump_ordering = MALI_CLUMP_ORDERING_LINEAR;
+				pl.pointer = va; pl.row_stride = ts; pl.size = real ? ts * th : 0x10000; pl.slice_stride = ts * th;
+			}
+			pan_pack(P + 0xC00 + 32 * k, TEXTURE, tx) {
+				tx.dimension = MALI_TEXTURE_DIMENSION_2D;
+				tx.format = real ? d->tex[k].fmt : ((MALI_RGBA8_UNORM << 12) | MALI_RGB_COMPONENT_ORDER_RGBA);
+				tx.width = tw; tx.height = th; tx.sample_count = 1;
+				tx.swizzle = real ? d->tex[k].swz : (0 | (1 << 3) | (2 << 6) | (3 << 9));
+				tx.levels = 1; tx.array_size = 1; tx.surfaces = PV + 0xD00 + 32 * k;
+			}
+		}
+		pan_pack(P + 0x280 + 3 * 16, RESOURCE, rc) { rc.address = PV + 0xA00; rc.size = 16 * 32; }
+		pan_pack(P + 0x280 + 4 * 16, RESOURCE, rc) { rc.address = PV + 0xC00; rc.size = 8 * 32; }
+		uint8_t *push = P + 0xE00;
+		for (int k = 0; k < 8; k++) { uint64_t v = d->buf[k] ? d->buf[k] : dummy.gpu; memcpy(push + SMP_BUF + 8 * k, &v, 8); }
+		uint64_t cdv = PV + 0x800, dv = dummy.gpu;
+		memcpy(push + SMP_CDATA_VS, &cdv, 8); memcpy(push + SMP_CDATA_FS, &cdv, 8); memcpy(push + SMP_DUMMY, &dv, 8);
+		memcpy(push + 448, d->wg, 12);
+		for (uint32_t k = 0; k < 4; k++) { uint32_t sz = d->tex[k].w | (d->tex[k].h << 16); memcpy(push + 464 + 4 * k, &sz, 4); }
+		for (uint32_t k = 0; k < 2; k++) {
+			uint64_t va = d->tex[k].va ? d->tex[k].va : dummy.gpu; uint32_t st = d->tex[k].stride, f = sm_is_bgra(d->tex[k].pf) ? 1 : 0;
+			memcpy(push + 480 + 16 * k, &va, 8); memcpy(push + 488 + 16 * k, &st, 4); memcpy(push + 492 + 16 * k, &f, 4);
+		}
+		pan_section_pack(P, COMPUTE_JOB, PAYLOAD, cfg) {
+			cfg.workgroup_size_x = d->wg[0]; cfg.workgroup_size_y = d->wg[1]; cfg.workgroup_size_z = d->wg[2];
+			cfg.workgroup_count_x = d->cnt[0]; cfg.workgroup_count_y = d->cnt[1]; cfg.workgroup_count_z = d->cnt[2];
+			cfg.allow_merging_workgroups = false; cfg.task_increment = 1; cfg.task_axis = MALI_TASK_AXIS_Z;
+			cfg.compute.shader = PV + 0x200; cfg.compute.thread_storage = PV + 0x300;
+			cfg.compute.resources = (PV + 0x280) | 6; cfg.compute.fau = PV + 0xE00;
+			cfg.compute.fau_count = (cs->push_words + 1) / 2 ? (cs->push_words + 1) / 2 : 1;
+		}
+		pan_section_pack(P, COMPUTE_JOB, HEADER, h) { h.type = MALI_JOB_TYPE_COMPUTE; h.index = 1; }
+		uint32_t st = sm_submit(1, PV);
+		static int nl; if (st || nl++ < 6) slog("SweetMTL: compute run %s %ux%u groups of %ux%u -> %x", d->name, d->cnt[0], d->cnt[1], d->wg[0], d->wg[1], st);
+	}
+	_nd = 0;
+}
 @end
 
 @interface SweetMTLBlitEncoder : SweetMTLStubEncoder
@@ -1639,9 +1741,9 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (void)addCompletedHandler:(void (^)(id))h { if (h) [_completed addObject:[h copy]]; }
 - (id)blitCommandEncoder { return [SweetMTLBlitEncoder new]; }
 - (id)blitCommandEncoderWithDescriptor:(id)d { return [SweetMTLBlitEncoder new]; }
-- (id)computeCommandEncoder { return [SweetMTLComputeEncoder new]; }
-- (id)computeCommandEncoderWithDispatchType:(NSUInteger)t { return [SweetMTLComputeEncoder new]; }
-- (id)computeCommandEncoderWithDescriptor:(id)d { return [SweetMTLComputeEncoder new]; }
+- (id)computeCommandEncoder { SweetMTLComputeEncoder *e = [SweetMTLComputeEncoder new]; [_passes addObject:e]; return e; }
+- (id)computeCommandEncoderWithDispatchType:(NSUInteger)t { return [self computeCommandEncoder]; }
+- (id)computeCommandEncoderWithDescriptor:(id)d { return [self computeCommandEncoder]; }
 - (BOOL)retainedReferences { return YES; }
 - (void)enqueue {}
 - (void)waitUntilScheduled {}
@@ -1678,6 +1780,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	_status = 4; /* MTLCommandBufferStatusCompleted */
 	sm_commits++;
 	for (SweetMTLRenderEncoder *e in _passes) {
+		if ([e isKindOfClass:[SweetMTLComputeEncoder class]]) { if (!sm_gpu_off) [(SweetMTLComputeEncoder *)e sm_run]; continue; }
 		if (!have || !e.target) { _status = 5; continue; }
 		sm_target_pf = e.target.pixelFormat;
 		if (sm_pf_bpp(e.target.pixelFormat) != 4 && sm_rt_writeback(e.target.pixelFormat) == MALI_COLOR_FORMAT_R8G8B8A8) {

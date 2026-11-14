@@ -355,6 +355,7 @@ struct SMBo {
 	bool     mapped;
 	bool     ext;   /* external physical range (display fb): outside the physmap, never flush by phystokv */
 	bool     wired; /* imported user memory, prepare()d: complete() on free */
+	bool     ro;    /* imported read-only (file/ramdisk pages, possibly in the kernel static region): never flushed (run68 panic) */
 };
 
 class SweetMaliUserClient : public IOUserClient {
@@ -546,13 +547,13 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			tmo = 5000;
 		}
 		for (uint32_t i = 0; i < SM_MAX_BO; i++) {
-			if (fBo[i].md != NULL && fBo[i].mapped && !fBo[i].ext) {
+			if (fBo[i].md != NULL && fBo[i].mapped && !fBo[i].ext && !fBo[i].ro) {
 				sm_flush_md(fBo[i].md, fBo[i].pages);
 			}
 		}
 		args->scalarOutput[0] = sweet_mali_submit(fCtx, (uint32_t)args->scalarInput[0], args->scalarInput[1], tmo);
 		for (uint32_t i = 0; i < SM_MAX_BO; i++) {
-			if (fBo[i].md != NULL && fBo[i].mapped && !fBo[i].ext) {
+			if (fBo[i].md != NULL && fBo[i].mapped && !fBo[i].ext && !fBo[i].ro) {
 				sm_flush_md(fBo[i].md, fBo[i].pages);
 			}
 		}
@@ -648,6 +649,7 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 				break;
 			}
 		}
+		bool ro = false;
 		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uva, (mach_vm_size_t)len,
 		    kIODirectionInOut, current_task());
 		if (md == NULL) {
@@ -659,6 +661,7 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			 * the GPU only samples it, so wire it for device reads */
 			md->release();
 			md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uva, (mach_vm_size_t)len, kIODirectionOut, current_task());
+			ro = true;
 			if (md == NULL || md->prepare() != kIOReturnSuccess) {
 				if (md != NULL) {
 					md->release();
@@ -695,6 +698,7 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		fBo[slot].mapped = true;
 		fBo[slot].ext = false;
 		fBo[slot].wired = true;
+		fBo[slot].ro = ro;
 		sm_total += len;
 		args->scalarOutput[0] = slot + 1;
 		args->scalarOutputCount = 1;
