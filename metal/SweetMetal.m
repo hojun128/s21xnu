@@ -848,6 +848,9 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 				 * the plane size and the fragment job dies with a bus fault (run32 bisect) */
 				uint32_t tw = real ? r->tex[k].w : 16, th = real ? r->tex[k].h : 16, ts = real ? r->tex[k].stride : 64;
 				uint32_t fmt = real ? r->tex[k].fmt : ((MALI_RGBA8_UNORM << 12) | MALI_RGB_COMPONENT_ORDER_RGBA);
+				/* experiment (run82): poster draws with ASTC textures replaced by the null texture, to tell whether the
+				 * magenta sky is the ASTC error colour */
+				if (real && r->tex[k].astc && sm_is_poster(getprogname())) { real = false; va = havedummy ? dummy.gpu : 0; tw = 16; th = 16; ts = 64; fmt = (MALI_RGBA8_UNORM << 12) | MALI_RGB_COMPONENT_ORDER_RGBA; }
 				uint32_t astc = real ? r->tex[k].astc : 0;
 				pan_pack(P + 0xD00 + 32 * k, PLANE, pl) {
 					if (astc) {
