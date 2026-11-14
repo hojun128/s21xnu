@@ -275,6 +275,7 @@ mali_power(int on)
 
 /* ---- recovery: a faulted job leaves the job manager wedged (every later job reports 0x5b), so soft-reset
  * the GPU and power it back up; the next submit re-programs the address space ---- */
+static int sweet_mali_one_core;   /* boot-arg mali_onecore=1: old single-core affinity */
 static uint32_t mali_faults;     /* after MALI_MAX_FAULTS faults/timeouts the GPU is fenced off until reboot */
 #define MALI_MAX_FAULTS 12
 
@@ -309,7 +310,8 @@ mali_submit_wait(struct mali_ctx *c, uint32_t slot, uint64_t jc_va, uint32_t tim
 	wr(R_MMU_IRQ_CLEAR, 0xFFFFFFFFU);
 	wr(R_JS(slot, 0x40), (uint32_t)jc_va);
 	wr(R_JS(slot, 0x44), (uint32_t)(jc_va >> 32));
-	wr(R_JS(slot, 0x50), mali.shader_present & (~mali.shader_present + 1U));
+	/* all shader cores: one core took > 2 s on a full-screen poster pass with eight textures (run70 timeout) */
+	wr(R_JS(slot, 0x50), sweet_mali_one_core ? (mali.shader_present & (~mali.shader_present + 1U)) : mali.shader_present);
 	wr(R_JS(slot, 0x54), 0);
 	wr(R_JS(slot, 0x58), ((uint32_t)c->as) | (3U << 8) | (1U << 10) | (3U << 12) | (8U << 16));
 	wr(R_JS(slot, 0x60), JS_COMMAND_START);
@@ -453,6 +455,7 @@ sweet_mali_boot(void)
 		return;
 	}
 	mali.shader_present = rd(R_SHADER_PRESENT);
+	PE_parse_boot_argn("mali_onecore", &sweet_mali_one_core, sizeof(sweet_mali_one_core));
 	mali.tiler_present = rd(R_TILER_PRESENT);
 	mali.l2_present = rd(R_L2_PRESENT);
 	mali.as_present = rd(R_AS_PRESENT);

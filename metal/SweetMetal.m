@@ -235,7 +235,7 @@ static bool sm_is_poster(const char *pn);
 static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 {
 	if (sm_gpu_off) return 0xFFFCu;
-	uint64_t in[3] = { slot, jc, 2000 }, out[1] = { 0xdead }; uint32_t oc = 1;
+	uint64_t in[3] = { slot, jc, 4000 }, out[1] = { 0xdead }; uint32_t oc = 1;
 	kern_return_t kr = IOConnectCallMethod(sm_conn, 3, in, 3, NULL, 0, out, &oc, NULL, NULL);
 	uint32_t r = kr ? 0xffff0000u | (uint32_t)kr : (uint32_t)out[0];
 	static int nfail;
