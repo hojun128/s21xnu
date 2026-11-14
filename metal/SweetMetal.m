@@ -1922,7 +1922,7 @@ static void *sm_watchdog(void *arg)
 /* Lock-screen poster extensions (AegirPoster = Astronomy) abort without a Metal device (run47). They get one,
  * but with the GPU switched off: their shaders are not translated yet and a GPU fault there would spend the
  * kernel's fault budget that backboardd needs. */
-static bool sm_is_poster(const char *pn) { return pn && strstr(pn, "Poster") != NULL; }
+static bool sm_is_poster(const char *pn) { return pn && !strcmp(pn, "AegirPoster"); }   /* others (PridePoster: MPS) not yet */
 
 /* Which processes get our Metal device. sweetmetal=2: the render server only (app content is composited by
  * backboardd; SpringBoard's own Metal users such as SiriUICore crashed on shaders we cannot translate, run44);
