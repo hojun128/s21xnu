@@ -1435,6 +1435,9 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 			uint32_t c = 0; if (_store.cpu) memcpy(&c, _store.cpu + (_height / 2) * _bytesPerRow + (_width / 2) * 4, 4);
 			slog("SweetMTL: getBytes %lux%lu pf%lu region %lux%lu mid %08x", (unsigned long)_width, (unsigned long)_height, (unsigned long)_pixelFormat,
 			    (unsigned long)r.size.width, (unsigned long)r.size.height, c);
+			/* the poster's snapshot image: one thumbnail of what the GPU produced (RGBA order, shown channel-swapped) */
+			static bool th;
+			if (!th && sm_is_poster(getprogname()) && _width >= 512 && sm_pf_bpp(_pixelFormat) == 4 && _store.cpu) { th = true; sm_thumb(_store.cpu, (uint32_t)_width, (uint32_t)_height, (uint32_t)_bytesPerRow, 31); }
 		}
 	}
 	if (![self sm_inRegion:r level:lvl]) return;
