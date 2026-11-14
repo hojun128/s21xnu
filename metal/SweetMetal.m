@@ -211,9 +211,9 @@ static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uin
 static bool sm_gpu_off;   /* a job timed out (or the kernel fenced the GPU): no more GPU work this boot */
 static char sm_off_reason[160];   /* why, repeated in every "alive" line so a wrapped pmsg log still shows it */
 static char sm_cur_pass[96];      /* what was being drawn */
-static char sm_fail_log[240];
-static id sm_last_target;
-static bool sm_is_poster(const char *pn);         /* last full-screen render target (thumbnails are timed, an idle lock screen draws nothing) */     /* first GPU failures, also repeated in the alive lines */
+static char sm_fail_log[240];     /* first GPU failures, also repeated in the alive lines */
+static id sm_last_target;         /* last full-screen render target (thumbnails are timed, an idle lock screen draws nothing) */
+static bool sm_is_poster(const char *pn);
 static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 {
 	if (sm_gpu_off) return 0xFFFCu;
@@ -226,7 +226,7 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 		size_t L = strlen(sm_fail_log);
 		snprintf(sm_fail_log + L, sizeof sm_fail_log - L, "%x/s%u@%.36s; ", r, slot, sm_cur_pass);
 	}
-	if (r == 0xFFFFu || r == 0xFFFCu || (r >> 16) == 0xffff) {
+	if (r == 0xFFFFu || r == 0xFFFCu || (r >> 16) == 0xffff || (r && sm_is_poster(getprogname()))) {   /* posters: first fault ends their GPU use */
 		sm_gpu_off = true;
 		snprintf(sm_off_reason, sizeof sm_off_reason, "status %x slot %u in %s", r, slot, sm_cur_pass);
 		slog("SweetMTL: GPU off: %s", sm_off_reason);
@@ -1958,7 +1958,7 @@ static bool sm_process_allowed(void)
 		return nil;
 	}
 	slog("SweetMTL: initWithAcceleratorPort:%u in %s", port, pn ? pn : "?");
-	if (sm_is_poster(pn) && !sm_gpu_off) { sm_gpu_off = true; snprintf(sm_off_reason, sizeof sm_off_reason, "poster process: GPU not used"); }
+
 	self = [super init];
 	slog("SweetMTL: super init -> %p", self);
 	if (self) {
