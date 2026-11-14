@@ -1362,7 +1362,7 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 @property (nonatomic) NSUInteger status;
 @property (nonatomic) uint32_t lastJobStatus;
 @property (nonatomic, weak) id commandQueue;
-@property (nonatomic, strong) NSMutableArray *scheduled, *completed;
+@property (nonatomic, strong) NSMutableArray *scheduled, *completed, *toPresent;
 @end
 
 @interface SweetMTLRenderEncoder : SweetMTLObject
@@ -1736,13 +1736,22 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 			if (_lastJobStatus != 0) _status = 5;
 		}
 	}
+	/* CAMetalLayer drawables queued with presentDrawable: go to the compositor once the GPU work is done
+	 * (an empty presentDrawable: kept AegirPoster's stars off the screen, run63) */
+	for (id<MTLDrawable> d in _toPresent) {
+		static int nl; if (nl++ < 4) slog("SweetMTL: present drawable %s", object_getClassName(d));
+		if ([d respondsToSelector:@selector(present)]) [d present];
+	}
+	[_toPresent removeAllObjects];
 	[self sm_runHandlers];
 }
 - (void)waitUntilCompleted {}
 - (void)commitAndWaitUntilSubmitted { [self commit]; }
 - (void)setProtectionOptions:(uint64_t)o {}
 - (uint64_t)protectionOptions { return 0; }
-- (void)presentDrawable:(id)d {}
+- (void)presentDrawable:(id)d { if (!d) return; if (!_toPresent) _toPresent = [NSMutableArray array]; [_toPresent addObject:d]; }
+- (void)presentDrawable:(id)d atTime:(CFTimeInterval)t { [self presentDrawable:d]; }
+- (void)presentDrawable:(id)d afterMinimumDuration:(CFTimeInterval)t { [self presentDrawable:d]; }
 - (NSError *)error { return nil; }
 @end
 
