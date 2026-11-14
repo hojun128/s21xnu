@@ -67,6 +67,7 @@ enum {
 	kSMKeep = 9,            /* keep a key diagnostic line in kernel memory, replayed into pmsg right before a recovery reboot */
 };
 
+extern "C" void sweet_mali_keep_dump(void);
 static char sm_keep_buf[12288];
 static uint32_t sm_keep_len;
 
@@ -125,6 +126,7 @@ sm_reboot_recovery(const char *why)
 	snprintf(line, sizeof(line), "reboot to recovery (%s)", why);
 	sweet_mali_log_str(line);
 	/* replay the kept lines (all processes) last, so the pmsg ring ends with them */
+	sweet_mali_keep_dump();
 	if (sm_keep_len) {
 		char ln[176];
 		uint32_t i = 0;

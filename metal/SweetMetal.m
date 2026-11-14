@@ -30,7 +30,7 @@ static io_connect_t sm_conn;
 /* Lines worth keeping are also collected here and replayed at the end of a test run: the 128 KiB pmsg ring
  * otherwise loses them under the thumbnails (run53). */
 static char sm_rep[12288]; static size_t sm_rep_len;
-static const char *const sm_rep_keys[] = { " fd", "  t", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
+static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
 	"poster draw", "draw type", "late ", "hang bisect" };
 static void slog(const char *fmt, ...)
@@ -1849,6 +1849,7 @@ typedef struct {
 					for (uint32_t i = 0; i < e->_ndraw; i++) {
 						const sm_drawrec *o = &e->_draws[i];
 						slog("SweetMTL: fd%u %.60s nt=%u ns=%u n=%u bl=%u", i, o->fs ? o->fs->name : "-", o->ntex, o->nsmp, o->vcount, o->blend_on);
+						slog("SweetMTL:  fb %llx %llx %llx %llx %llx %llx push %u", o->fbuf[0], o->fbuf[1], o->fbuf[2], o->fbuf[3], o->fbuf[4], o->fbuf[5], o->fs ? o->fs->push_words : 0);
 						for (uint32_t k = 0; k < o->ntex; k++)
 							if (o->tex[k].va) slog("SweetMTL:  t%u %ux%u pf%u st%u va%llx imp%u", k, o->tex[k].w, o->tex[k].h, o->tex[k].pf, o->tex[k].stride, o->tex[k].va, o->tex[k].imp);
 					}

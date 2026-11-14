@@ -87,6 +87,8 @@ static struct {
 	int         up, powered;
 } mali;
 
+static char mali_keep[3072];
+static uint32_t mali_keep_len;
 static void mali_log(const char *fmt, ...) __printflike(1, 2);
 static void
 mali_log(const char *fmt, ...)
@@ -98,6 +100,34 @@ mali_log(const char *fmt, ...)
 	va_end(ap);
 	printf("sweet_mali: %s\n", line);
 	s21_plog(line);
+	/* job failures/timeouts are also kept for the replay before a recovery reboot (sweet_mali_keep_dump) */
+	if (!strncmp(line, "job ", 4) || !strncmp(line, "fault", 5) || !strncmp(line, "recover", 7)) {
+		size_t n = strlen(line);
+		if (mali_keep_len + n + 2 < sizeof(mali_keep)) {
+			memcpy(mali_keep + mali_keep_len, line, n);
+			mali_keep_len += (uint32_t)n;
+			mali_keep[mali_keep_len++] = '\n';
+		}
+	}
+}
+
+void sweet_mali_keep_dump(void);
+void
+sweet_mali_keep_dump(void)
+{
+	char ln[192];
+	uint32_t i = 0;
+	while (i < mali_keep_len) {
+		uint32_t n = 0;
+		while (i < mali_keep_len && mali_keep[i] != '\n' && n < sizeof(ln) - 4) {
+			ln[n++] = mali_keep[i++];
+		}
+		ln[n] = 0;
+		i++;
+		if (n) {
+			s21_plog(ln);
+		}
+	}
 }
 
 static inline uint32_t
@@ -324,8 +354,8 @@ mali_submit_wait(struct mali_ctx *c, uint32_t slot, uint64_t jc_va, uint32_t tim
 	}
 	if (!(raw & (done | fail))) {
 		uint32_t as = (uint32_t)c->as;
-		mali_log("job timeout slot %u js=%x mmu=%x fault=%x/%x", slot, rd(R_JS(slot, 0x24)), rd(R_MMU_IRQ_RAW),
-		    rd(R_AS(as, 0x1C)), rd(R_AS(as, 0x20)));
+		mali_log("job timeout slot %u js=%x mmu=%x fault=%x addr=%x%08x", slot, rd(R_JS(slot, 0x24)), rd(R_MMU_IRQ_RAW),
+		    rd(R_AS(as, 0x1C)), rd(R_AS(as, 0x24)), rd(R_AS(as, 0x20)));
 		wr(R_JS(slot, 0x60), JS_COMMAND_HARD_STOP);
 		us(20000);
 		wr(R_JOB_IRQ_CLEAR, 0xFFFFFFFFU);
