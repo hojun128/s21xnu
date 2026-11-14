@@ -67,12 +67,25 @@ for _ in range(2):
         uses = len(re.findall(re.escape(g) + r'\b', out))
         stores = len(re.findall(r'\n\s+store [^\n]*' + re.escape(g) + r'\b', out))
         decl = len(re.findall(r'\n' + re.escape(g) + r' = ', out))
-        if uses - decl - stores - len(re.findall(r'![^\n]*' + re.escape(g) + r'\b', out)) == 0: dead.append(g)
+        meta = len(re.findall(r'(?:![^\n]*|@llvm\.compiler\.used[^\n]*?)' + re.escape(g) + r'\b', out))
+        if uses - decl - stores - meta <= 0: dead.append(g)
     for g in dead: out = re.sub(r'\n\s+store [^\n]*' + re.escape(g) + r'\b[^\n]*', '', out)
     out = opt(out, True)
 
 # undefined outputs fold to NaN vectors, which the translator does not parse
 out = re.sub(r'<(\d+) x half> <half 0xH7E00(?:, half 0xH7E00)*>', r'<\1 x half> zeroinitializer', out)
+# undef lanes inside constants / shuffle masks and any()/all() of constant vectors: give the translator plain values
+out = re.sub(r'(<\d+ x i32> <[^>]*?)i32 undef', lambda m: m.group(0).replace('i32 undef', 'i32 0'), out)
+while re.search(r'<[^<>\n]*\b(float|half) undef', out):
+    out = re.sub(r'(<[^<>\n]*\b)(float|half) undef', lambda m: m.group(1) + m.group(2) + ' 0.0' if m.group(2) == 'float' else m.group(1) + 'half 0xH0000', out)
+out = re.sub(r'tail call i1 @air\.(any|all)\.v\di1\(<\d x i1> zeroinitializer\)( #\d+)?', 'and i1 false, false', out)
+m = llvm.parse_assembly(out)
+pm = llvm.create_module_pass_manager()
+for _ in range(2):
+    pm.add_sccp_pass(); pm.add_cfg_simplification_pass(); pm.add_aggressive_dead_code_elimination_pass()
+pm.run(m)
+out = str(m)
+out = re.sub(r'(<\d+ x i32> <[^>]*?)i32 undef', lambda m: m.group(0).replace('i32 undef', 'i32 0'), out)
 m = llvm.parse_assembly(out)
 open(dst, 'wb').write(m.as_bitcode())
 print('%s: %d IR lines' % (dst, out.count('\n')), file=sys.stderr)
