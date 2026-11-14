@@ -849,8 +849,9 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, HEADER, header) { header.type = MALI_JOB_TYPE_MALLOC_VERTEX; header.index = 1; }
 		uint32_t vst = sm_submit(1, PV);
 		uint32_t vexc = *(volatile uint32_t *)P;
+		{ static int nd; if (vst || nd++ < 6 || sm_is_poster(getprogname()) && nd < 40)   /* per-draw lines filled the pmsg ring (run64) */
 		slog("SweetMTL: draw%u vs=%s fs=%s n=%u sec=%d nvar=%u job=%x exc=%x", i, vs->name, fs ? fs->name : "(FS_GREEN)",
-		    r->vcount, sec, nvar, vst, vexc);
+		    r->vcount, sec, nvar, vst, vexc); }
 		{
 			static int nl;
 			if (nl++ < 12) {
@@ -1614,6 +1615,7 @@ static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
 				_lastJobStatus = sm_draw(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
 				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, n, &vs);
 			}
+			static int npass; if (_lastJobStatus || vs || npass++ < 6 || (sm_is_poster(getprogname()) && npass < 40))
 			slog("SweetMTL: pass %u draws (%s) load=%d clear=%d blend0=%u vertex=%x fragment=%x", e->_ndraw, generic ? "translated" : "fixed", e.load, e.clear, e->_draws[0].blend_on ? (e->_draws[0].rgb_sf << 8 | e->_draws[0].rgb_df) : 0, vs, _lastJobStatus);
 			if (generic && _lastJobStatus && _lastJobStatus != 0xFFFCu) {
 				/* fragment fault: describe the pass once, then quarantine the texturing fragment shaders of this pass
