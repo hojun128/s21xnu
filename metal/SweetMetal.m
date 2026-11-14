@@ -2041,8 +2041,10 @@ static bool sm_process_allowed(void)
 - (uint64_t)registryID { return 0x53574545; }
 - (NSString *)vendorName { return @"ARM"; }
 /* render targets are RGBA8/BGRA8 only for now: keep CoreAnimation off the 10-bit extended-range formats */
-- (BOOL)supportsExtendedXR10Formats { return NO; }
-- (BOOL)supportsPublicXR10Formats { return NO; }
+/* poster extensions draw into XR CAMetalLayers and throw "unsupported extended range format" otherwise (run61);
+ * XR formats are stored as 8-bit BGRA here. backboardd keeps NO, as tested. */
+- (BOOL)supportsExtendedXR10Formats { return sm_is_poster(getprogname()); }
+- (BOOL)supportsPublicXR10Formats { return sm_is_poster(getprogname()); }
 - (BOOL)supportsBGR10A2 { return NO; }
 - (BOOL)supportsRGBA10A2Gamma { return NO; }
 - (BOOL)supportsYCBCRPackedFormats12 { return NO; }
