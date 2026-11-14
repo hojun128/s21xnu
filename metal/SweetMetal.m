@@ -2215,6 +2215,22 @@ static void sm_dump_threads(void)
 		slog("SweetMTL: T%u .. %s < %s < %s", i, sm_symof(pcs[3], a, sizeof a), sm_symof(pcs[4], b, sizeof b), sm_symof(pcs[5], c, sizeof c));
 	}
 }
+/* synthetic touch through the kernel (SweetMali selector 10 -> sweet_hid_touch, panel pixels 1080x2400) */
+static kern_return_t sm_touch(int down, int x, int y)
+{
+	uint64_t in[4] = { 0, (uint64_t)down, (uint64_t)x, (uint64_t)y };
+	return IOConnectCallMethod(sm_conn, 10, in, 4, NULL, 0, NULL, NULL, NULL, NULL);
+}
+static void sm_swipe_up(void)
+{
+	/* wake tap, then a home-indicator swipe from the bottom edge to mid screen */
+	kern_return_t k0 = sm_touch(1, 540, 1400); usleep(60000); sm_touch(0, 540, 1400);
+	usleep(700000);
+	kern_return_t k1 = sm_touch(1, 540, 2392);
+	for (int i = 1; i <= 24; i++) { usleep(12000); sm_touch(1, 540, 2392 - i * 60); }
+	usleep(20000); sm_touch(0, 540, 2392 - 24 * 60);
+	slog("SweetMTL: swipe up sent kr=%x/%x", k0, k1);
+}
 static void *sm_watchdog(void *arg)
 {
 	uint32_t last = 0; int dumps = 0;
@@ -2234,7 +2250,11 @@ static void *sm_watchdog(void *arg)
 			id tg = sm_last_target;
 			if (nlate < 3 && ts.tv_sec >= at[nlate] && tg && !sm_is_poster(getprogname())) {
 				nlate++;
-				if (nlate < 3) { slog("SweetMTL: late mark %d at %lds commits=%u", nlate, (long)ts.tv_sec, c); continue; }   /* one thumbnail only: keep log room for other processes' crash reports */
+				if (nlate < 3) {
+					slog("SweetMTL: late mark %d at %lds commits=%u", nlate, (long)ts.tv_sec, c);
+					if (getenv("SM_NOSWIPE") == NULL) sm_swipe_up();   /* unlock: the last thumbnail should show the home screen */
+					continue;
+				}   /* one thumbnail only: keep log room for other processes' crash reports */
 				SweetMTLTexture *tx = tg;
 				slog("SweetMTL: late thumb %d at %lds commits=%u gpuoff=%d", nlate, (long)ts.tv_sec, c, sm_gpu_off);
 				sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, (uint32_t)23);

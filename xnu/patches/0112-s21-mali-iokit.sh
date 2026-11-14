@@ -65,7 +65,9 @@ enum {
 	kSMRebootRecovery = 7,
 	kSMImportUser = 8,
 	kSMKeep = 9,            /* keep a key diagnostic line in kernel memory, replayed into pmsg right before a recovery reboot */
+	kSMTouch = 10,          /* synthetic touch (finger, down, x, y panel px) for automated unlock tests */
 };
+extern "C" void sweet_hid_touch(int finger, int down, int x, int y);
 
 extern "C" void sweet_mali_keep_dump(void);
 static char sm_keep_buf[12288];
@@ -749,6 +751,16 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		}
 		ret = kIOReturnSuccess;
 		break;
+	}
+	case kSMTouch: {
+		if (args->scalarInputCount < 4) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		IOLockUnlock(sm_lock);
+		sweet_hid_touch((int)args->scalarInput[0], (int)args->scalarInput[1],
+		    (int)args->scalarInput[2], (int)args->scalarInput[3]);
+		return kIOReturnSuccess;
 	}
 	case kSMLog: {
 		char buf[160];
