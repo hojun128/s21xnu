@@ -32,7 +32,7 @@ static io_connect_t sm_conn;
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "late " };
+	"poster draw", "draw type", "late ", "hang bisect" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1817,6 +1817,28 @@ typedef struct {
 			}
 			static int npass; if (_lastJobStatus || vs || npass++ < 6 || (sm_is_poster(getprogname()) && npass < 40))
 			slog("SweetMTL: pass %u draws (%s) load=%d clear=%d blend0=%u vertex=%x fragment=%x", e->_ndraw, generic ? "translated" : "fixed", e.load, e.clear, e->_draws[0].blend_on ? (e->_draws[0].rgb_sf << 8 | e->_draws[0].rgb_df) : 0, vs, _lastJobStatus);
+			if (generic && _lastJobStatus == 0xFFFFu && sm_is_poster(getprogname())) {
+				/* poster pass hung (timeout, not a fault): replay each draw alone, as recorded and with its ASTC textures
+				 * swapped for the null texture, to tell a shader hang from an ASTC decode hang. Once per process. */
+				static bool done;
+				if (!done) {
+					done = true; sm_gpu_off = false;
+					for (uint32_t i = 0; i < e->_ndraw && i < 3; i++) {
+						sm_drawrec one = e->_draws[i];
+						uint32_t v1 = 0, v2 = 0;
+						uint32_t f1 = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
+						    (uint32_t)e.target.bytesPerRow, e.packed, bgra, &one, 1, &v1, false);
+						sm_gpu_off = false;
+						bool hasastc = false;
+						for (uint32_t k = 0; k < one.ntex; k++) if (one.tex[k].astc) { one.tex[k].va = 0; hasastc = true; }
+						uint32_t f2 = hasastc ? sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
+						    (uint32_t)e.target.bytesPerRow, e.packed, bgra, &one, 1, &v2, false) : 0xEEEE;
+						sm_gpu_off = false;
+						slog("SweetMTL: hang bisect draw%u %s: as-is %x/%x, no-astc %x/%x", i, one.fs ? one.fs->name : "-", v1, f1, v2, f2);
+					}
+					sm_gpu_off = true;
+				}
+			}
 			if (generic && _lastJobStatus && _lastJobStatus != 0xFFFCu) {
 				/* fragment fault: describe the pass once, then quarantine the texturing fragment shaders of this pass
 				 * (draws without textures never faulted; the GPU was reset by the kernel) */
