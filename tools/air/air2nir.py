@@ -4,7 +4,7 @@ Push-constant ABI (bytes):  0..63  buffer[i] GPU VA (u64)       64..191 attr[L] 
                            216..223 function-constant "defined" mask (bit k)   256..511 function constant k at 256+4k
 Texture i -> pan_res_handle(4, i), sampler i -> pan_res_handle(3, i), constexpr samplers -> sampler 15.
 Varyings: global name -> VAR0+slot."""
-import re, sys, json
+import os, re, sys, json
 sys.setrecursionlimit(100000)
 import llvmlite.binding as llb
 llb.initialize(); llb.initialize_native_target(); llb.initialize_native_asmprinter()
@@ -16,6 +16,7 @@ NULL_TEXTURE_3D = 6                         # ... and a 1x1x1 3D one
 PUSH_CDATA_VS, PUSH_CDATA_FS = 224, 232     # u64 GPU VA of this shader's constant-global blob
 PUSH_DUMMY = 240                            # u64 GPU VA of a zeroed 4 KiB scratch page: target of predicated-off memory accesses
 PUSH_CS_TG = 448                            # compute: u32 threads-per-threadgroup x, y, z (function constants 48+ unusable in kernels)
+PUSH_TXS = 480                              # vertex/fragment (AIR_TXS_PUSH builds): texture i (0..7) size, width | height << 16
 PUSH_CS_TEXSZ = 464                         # compute: texture i (0..3) size as u32 (width | height << 16)
 CUR_KIND = [None]                           # stage of the function being translated
 PUSH_CS_TEXW = 480                          # compute: written texture i (0, 1): {u64 va, u32 row stride, u32 format (0 RGBA8, 1 BGRA8)}
@@ -966,6 +967,12 @@ class Fn:
             if th[0] != 'tex' or th[1] > 3: raise Unsupported('kernel texture size slot')
             w = self.tmp('nir_load_push_constant(b, 1, 32, nir_imm_int(b, 0), .base = %d, .range = 4)' % (PUSH_CS_TEXSZ + 4 * th[1]))
             return self.tmp('nir_iand_imm(b, %s, 0xffff)' % w) if 'width' in base else self.tmp('nir_ushr_imm(b, %s, 16)' % w)
+        if base in ('air.get_width_texture_2d', 'air.get_height_texture_2d') and os.environ.get('AIR_TXS_PUSH'):
+            # size from the push block (480 + 4*slot: width | height << 16): the Valhall size query faulted the GPU (earth, run74)
+            th = self.vals[ops[0][1]] if ops[0][1].startswith('%') else ('tex', NULL_TEXTURE)
+            if th[0] == 'tex' and th[1] < 8:
+                w = self.tmp('nir_load_push_constant(b, 1, 32, nir_imm_int(b, 0), .base = %d, .range = 4)' % (PUSH_TXS + 4 * th[1]))
+                return self.tmp('nir_iand_imm(b, %s, 0xffff)' % w) if 'width' in base else self.tmp('nir_ushr_imm(b, %s, 16)' % w)
         if base in ('air.get_width_texture_2d', 'air.get_height_texture_2d'):
             th = self.vals[ops[0][1]] if ops[0][1].startswith('%') else ('tex', NULL_TEXTURE)
             te = th[1] if th[0] == 'texdyn' else 'nir_imm_int(b, %d)' % th[1]

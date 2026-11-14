@@ -653,6 +653,7 @@ static void sm_pack_blend(void *dst, const sm_drawrec *r)
 static uint32_t sm_pf_info(NSUInteger pf, uint32_t *fmt, uint32_t *swz);
 static uint32_t sm_pf_bpp(NSUInteger pf);
 static uint32_t sm_astc_dim(uint32_t d);
+static uint32_t sm_clump(NSUInteger pf);
 static NSUInteger sm_target_pf = 80;   /* pixel format of the target sm_pass draws into (set by the caller) */
 /* render-target writeback for 1/2-byte targets: the tile buffer stays RGBA8 (Mesa BFMT R8/RG8/A8) */
 static uint32_t sm_rt_writeback(NSUInteger pf) { return pf == 1 || pf == 10 || pf == 11 ? MALI_COLOR_FORMAT_R8 : pf == 30 ? MALI_COLOR_FORMAT_R8G8 : MALI_COLOR_FORMAT_R8G8B8A8; }
@@ -724,7 +725,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 			uint32_t fmt = (MALI_RGBA8_UNORM << 12) | (bgra ? MALI_RGB_COMPONENT_ORDER_BGRA : MALI_RGB_COMPONENT_ORDER_RGBA);
 			if (sm_pf_bpp(sm_target_pf) != 4) sm_pf_info(sm_target_pf, &fmt, NULL);   /* 1/2-byte target read back as such */
 			pan_pack(Q + 0x260, PLANE, pl) {
-				pl.plane_type = MALI_PLANE_TYPE_GENERIC; pl.clump_format = MALI_CLUMP_FORMAT_RAW32; pl.clump_ordering = MALI_CLUMP_ORDERING_LINEAR;
+				pl.plane_type = MALI_PLANE_TYPE_GENERIC; pl.clump_format = sm_clump(sm_target_pf); pl.clump_ordering = MALI_CLUMP_ORDERING_LINEAR;
 				pl.pointer = target_va; pl.row_stride = stride; pl.size = stride * h; pl.slice_stride = stride * h;
 			}
 			pan_pack(Q + 0x240, TEXTURE, tx) {
@@ -788,6 +789,15 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		memcpy(push + SMP_VP, vp, sizeof vp);
 		/* fragment stage: same push block but its own buffer table */
 		memcpy(P + 0xE00, push, SMP_BYTES);
+		if (sm_is_poster(getprogname())) {
+			/* NanoUniverse shaders read texture sizes from push 480 + 4*slot (AIR_TXS_PUSH): the Valhall size query
+			 * page-faulted the GPU (earth shader, run74). Not done for CoreAnimation, whose function constants 56..63 live there. */
+			for (uint32_t k = 0; k < 8; k++) {
+				uint32_t sz = k < r->ntex && r->tex[k].va ? (r->tex[k].w | (r->tex[k].h << 16)) : (16 | (16 << 16));
+				memcpy(push + 480 + 4 * k, &sz, 4);
+			}
+		}
+		memcpy(P + 0xE00, push, SMP_BYTES);
 		/* unbound fragment buffers point at the zeroed dummy page instead of address 0 */
 		for (int k = 0; k < 8; k++) { uint64_t v = r->fbuf[k] ? r->fbuf[k] : (havedummy ? dummy.gpu : 0); memcpy(P + 0xE00 + SMP_BUF + 8 * k, &v, 8); }
 		/* fragment resources: SAMPLER table (3) x16 at 0xA00 (slot 15 = constexpr sampler), TEXTURE table (4) x8 at 0xC00
@@ -817,7 +827,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 						pl.astc._2d.block_width = sm_astc_dim(astc & 0xFF); pl.astc._2d.block_height = sm_astc_dim((astc >> 8) & 0xFF);
 						pl.astc.decode_hdr = false; pl.astc.decode_wide = !((astc >> 16) & 1);
 					} else pl.plane_type = MALI_PLANE_TYPE_GENERIC;
-					if (!astc) pl.clump_format = MALI_CLUMP_FORMAT_RAW32;
+					if (!astc) pl.clump_format = real ? sm_clump(r->tex[k].pf) : MALI_CLUMP_FORMAT_RAW32;
 					pl.clump_ordering = MALI_CLUMP_ORDERING_LINEAR;
 					pl.pointer = va; pl.row_stride = ts;
 					uint32_t prow = astc ? (th + ((astc >> 8) & 0xFF) - 1) / ((astc >> 8) & 0xFF) : th;
@@ -1254,6 +1264,12 @@ static uint32_t sm_pf_info(NSUInteger pf, uint32_t *fmt, uint32_t *swz)
 	return b;
 }
 static uint32_t sm_pf_bpp(NSUInteger pf) { return sm_pf_info(pf, NULL, NULL); }
+/* plane clump format = bytes per texel (RAW32 on a 1-byte R8 texture made the GPU address 4x past its rows) */
+static uint32_t sm_clump(NSUInteger pf)
+{
+	uint32_t b = sm_pf_bpp(pf);
+	return b == 1 ? MALI_CLUMP_FORMAT_RAW8 : b == 2 ? MALI_CLUMP_FORMAT_RAW16 : b == 8 ? MALI_CLUMP_FORMAT_RAW64 : b == 16 ? MALI_CLUMP_FORMAT_RAW128 : MALI_CLUMP_FORMAT_RAW32;
+}
 /* ASTC: MTLPixelFormatASTC_*_sRGB 186..200, _LDR 204..218 (no 191/209). Returns block width (0 = not ASTC). */
 static uint32_t sm_astc(NSUInteger pf, uint32_t *bh, bool *srgb)
 {
@@ -1673,7 +1689,7 @@ typedef struct {
 			uint64_t va = real ? d->tex[k].va : dummy.gpu;
 			uint32_t tw = real ? d->tex[k].w : 16, th = real ? d->tex[k].h : 16, ts = real ? d->tex[k].stride : 64;
 			pan_pack(P + 0xD00 + 32 * k, PLANE, pl) {
-				pl.plane_type = MALI_PLANE_TYPE_GENERIC; pl.clump_format = MALI_CLUMP_FORMAT_RAW32; pl.clump_ordering = MALI_CLUMP_ORDERING_LINEAR;
+				pl.plane_type = MALI_PLANE_TYPE_GENERIC; pl.clump_format = real ? sm_clump(d->tex[k].pf) : MALI_CLUMP_FORMAT_RAW32; pl.clump_ordering = MALI_CLUMP_ORDERING_LINEAR;
 				pl.pointer = va; pl.row_stride = ts; pl.size = real ? ts * th : 0x10000; pl.slice_stride = ts * th;
 			}
 			pan_pack(P + 0xC00 + 32 * k, TEXTURE, tx) {
@@ -2256,7 +2272,7 @@ static bool sm_process_allowed(void)
 		[((SweetMTLFunction *)fobj).constants enumerateKeysAndObjectsUsingBlock:^(NSNumber *k, NSNumber *v, BOOL *stop) {
 			NSUInteger i;
 			if ([k isKindOfClass:[NSNumber class]]) i = k.unsignedIntegerValue;
-			else if ([k isKindOfClass:[NSString class]]) { if (!isvs) return; NSNumber *m = sm_fc_names()[k]; if (!m) return; i = m.unsignedIntegerValue; }
+			else if ([k isKindOfClass:[NSString class]]) { if (!isvs && !sm_is_poster(getprogname())) return; NSNumber *m = sm_fc_names()[k]; if (!m) return; i = m.unsignedIntegerValue; }
 			else return;
 			if (i < 64) { ps->_fc[i] = v.unsignedIntValue; ps->_fcdef |= 1ull << i; }
 		}];
