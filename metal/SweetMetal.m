@@ -2481,6 +2481,18 @@ static void sm_layer_hooks(void)
 /* CoreAnimation hands decoded CGImage bytes (the wallpaper snapshot among them) to the GPU this way (run91) */
 - (id)newTextureWithBytesNoCopy:(void *)p length:(NSUInteger)len descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *, NSUInteger))dl
 {
+	uint32_t abh = 0, abw = sm_astc(d.pixelFormat, &abh, NULL);
+	if (abw) {
+		/* compressed (the wallpaper snapshot is ASTC 4x4, run92): decoded on the CPU like any ASTC upload, then the
+		 * client memory is not needed any more */
+		SweetMTLTexture *t = [self newTextureWithDescriptor:d];
+		NSUInteger bbpr = (d.width + abw - 1) / abw * 16;
+		if (t) [t replaceRegion:MTLRegionMake2D(0, 0, d.width, d.height) mipmapLevel:0 withBytes:p bytesPerRow:bbpr];
+		static int nl; if (nl++ < 8) slog("SweetMTL: buffer texture nocopy astc %lux%lu pf%lu len %lu -> %s", (unsigned long)d.width, (unsigned long)d.height,
+		    (unsigned long)d.pixelFormat, (unsigned long)len, t ? "ok" : "FAILED");
+		if (dl) dl(p, len);
+		return t;
+	}
 	NSUInteger h = d.height ? d.height : 1, bpr = len / h;
 	NSUInteger minb = d.width * sm_pf_bpp(d.pixelFormat);
 	if (bpr < minb || d.mipmapLevelCount > 1 || d.arrayLength > 1) bpr = minb;
