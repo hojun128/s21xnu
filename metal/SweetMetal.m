@@ -1320,6 +1320,7 @@ static uint32_t sm_astc(NSUInteger pf, uint32_t *bh, bool *srgb)
 	if (srgb) *srgb = pf <= 200;
 	return W[i];
 }
+void decode_block(const uint8_t *buf, const int bw, const int bh, uint32_t *outbuf);   /* astc_dec.c */
 static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 6 ? 2 : d == 8 ? 4 : d == 10 ? 6 : 7; }
 
 @interface SweetMTLTexture : SweetMTLObject
@@ -1327,6 +1328,8 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 @property (nonatomic, readonly) sm_bo *bo;
 @property (nonatomic, weak) id device;
 - (void)sm_sync;
+- (NSUInteger)gpuWidth;
+- (NSUInteger)gpuHeight;
 - (uint32_t)maliFormat;
 - (uint32_t)maliSwizzle;
 - (uint32_t)bpp;
@@ -1336,7 +1339,10 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	id _parent;                 /* buffer whose memory this texture aliases (newTextureWithDescriptor:offset:...) */
 	bool _view;                 /* _store borrowed from _parent: never freed here */
 	sm_bo _shadow; bool _hasShadow; const uint8_t *_src; NSUInteger _srcBpr;   /* unaligned pitch: GPU reads a copy */
+	NSUInteger _dec, _gw, _gh;   /* CPU-decoded ASTC: downscale factor and the stored (GPU) size */
 }
+- (NSUInteger)gpuWidth { return _gw ? _gw : _width; }
+- (NSUInteger)gpuHeight { return _gh ? _gh : _height; }
 - (instancetype)initWithBuffer:(id)buf bo:(const sm_bo *)bbo descriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off bytesPerRow:(NSUInteger)bpr
 {
 	self = [super init];
@@ -1375,11 +1381,13 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	if (abw) { static int nl; if (nl++ < 8) slog("SweetMTL: astc create %lux%lu pf%lu mips %lu storage %lu usage %lu", (unsigned long)_width, (unsigned long)_height,
 	    (unsigned long)_pixelFormat, (unsigned long)d.mipmapLevelCount, (unsigned long)d.storageMode, (unsigned long)d.usage); }
 	if (abw) {
-		/* ASTC in Mesa's 16x16-block u-interleaved layout (linear ASTC decoded to the magenta error colour, run80-85):
-		 * _bytesPerRow = one row of tiles = 16 bytes x 16 blocks high x block columns aligned to 16 */
-		NSUInteger bx = ((_width + abw - 1) / abw + 15) & ~(NSUInteger)15, by = ((_height + abh - 1) / abh + 15) & ~(NSUInteger)15;
-		_bytesPerRow = 16 * 16 * bx;
-		rows = by / 16;
+		/* ASTC is decoded on the CPU at upload (the GPU ASTC path gave the magenta error colour in every layout,
+		 * runs 80-86) into BGRA8, downscaled by _dec so the copy stays <= 8 MiB (4096x4096 -> 1024x1024) */
+		_dec = 1;
+		while (((_width + _dec - 1) / _dec) * ((_height + _dec - 1) / _dec) * 4 > (8u << 20)) _dec <<= 1;
+		_gw = (_width + _dec - 1) / _dec; _gh = (_height + _dec - 1) / _dec;
+		_bytesPerRow = (_gw * 4 + 63) & ~(NSUInteger)63;
+		rows = _gh;
 	}
 	if (!sm_bo_alloc(&_store, _bytesPerRow * rows)) {
 		static int nl; if (nl++ < 6) slog("SweetMTL: texture bo alloc failed %lux%lu fmt %lu", (unsigned long)_width, (unsigned long)_height, (unsigned long)_pixelFormat);
@@ -1420,8 +1428,8 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (uint32_t)maliFormat
 {
 	bool srgb = false;
-	if (sm_astc(_pixelFormat, NULL, &srgb))   /* Mesa: sRGB -> ASTC 2D LDR (narrow), linear -> ASTC 2D HDR (wide decode) */
-		return ((srgb ? MALI_ASTC_2D_LDR : MALI_ASTC_2D_HDR) << 12) | (srgb ? (1u << 20) : 0) | MALI_RGB_COMPONENT_ORDER_RGBA;
+	if (sm_astc(_pixelFormat, NULL, &srgb))   /* decoded on the CPU into BGRA8 */
+		return (MALI_RGBA8_UNORM << 12) | MALI_RGB_COMPONENT_ORDER_BGRA;
 	uint32_t f; sm_pf_info(_pixelFormat, &f, NULL); return f;
 }
 - (uint32_t)maliSwizzle { uint32_t w; sm_pf_info(_pixelFormat, NULL, &w); return w; }
@@ -1471,15 +1479,18 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		    slog("SweetMTL: astc upload %lux%lu at %lu,%lu bpr %lu src %016llx store %p", (unsigned long)r.size.width, (unsigned long)r.size.height,
 		    (unsigned long)r.origin.x, (unsigned long)r.origin.y, (unsigned long)bpr, b0, _store.cpu); }
 		NSUInteger bx = r.origin.x / abw, by = r.origin.y / abh, nbx = (r.size.width + abw - 1) / abw, nby = (r.size.height + abh - 1) / abh;
-		static const uint8_t dup[16] = { 0x00, 0x03, 0x0c, 0x0f, 0x30, 0x33, 0x3c, 0x3f, 0xc0, 0xc3, 0xcc, 0xcf, 0xf0, 0xf3, 0xfc, 0xff };
-		static const uint8_t sp4[16] = { 0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15, 0x40, 0x41, 0x44, 0x45, 0x50, 0x51, 0x54, 0x55 };
+		uint32_t px[144];
 		for (NSUInteger y = 0; y < nby; y++) {
-			NSUInteger Y = by + y;
 			const uint8_t *row = (const uint8_t *)src + y * bpr;
-			uint8_t *trow = _store.cpu + (Y >> 4) * _bytesPerRow;
 			for (NSUInteger x = 0; x < nbx; x++) {
-				NSUInteger X = bx + x;
-				memcpy(trow + (X >> 4) * 4096 + (size_t)(dup[Y & 15] ^ sp4[X & 15]) * 16, row + x * 16, 16);
+				NSUInteger X0 = (bx + x) * abw, Y0 = (by + y) * abh;
+				/* only blocks holding a kept (every _dec-th) texel */
+				NSUInteger fx = (X0 + _dec - 1) / _dec * _dec, fy = (Y0 + _dec - 1) / _dec * _dec;
+				if (fx >= X0 + abw || fy >= Y0 + abh) continue;
+				decode_block(row + x * 16, (int)abw, (int)abh, px);
+				for (NSUInteger yy = fy; yy < Y0 + abh && yy < _height; yy += _dec)
+					for (NSUInteger xx = fx; xx < X0 + abw && xx < _width; xx += _dec)
+						memcpy(_store.cpu + (yy / _dec) * _bytesPerRow + (xx / _dec) * 4, &px[(yy - Y0) * abw + (xx - X0)], 4);
 			}
 		}
 		return;
@@ -1645,11 +1656,11 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		}
 		if (t) {
 			[t sm_sync];
-			r->tex[k].va = t.bo->gpu; r->tex[k].w = (uint32_t)t.width; r->tex[k].h = (uint32_t)t.height;
+			r->tex[k].va = t.bo->gpu; r->tex[k].w = (uint32_t)[t gpuWidth]; r->tex[k].h = (uint32_t)[t gpuHeight];
 			r->tex[k].stride = (uint32_t)t.bytesPerRow; r->tex[k].fmt = [t maliFormat];
 			r->tex[k].pf = (uint32_t)t.pixelFormat; r->tex[k].imp = t.bo->imported;
 			r->tex[k].swz = [t maliSwizzle];
-			{ uint32_t bh = 0; bool sr = false; uint32_t bw = sm_astc(t.pixelFormat, &bh, &sr); r->tex[k].astc = bw ? (bw | bh << 8 | (uint32_t)sr << 16) : 0;
+			{ uint32_t bh = 0; bool sr = false; uint32_t bw = sm_astc(t.pixelFormat, &bh, &sr); r->tex[k].astc = 0; (void)sr;   /* ASTC is decoded on the CPU */
 			  if (bw) { static int nl; if (nl++ < 6) { uint64_t b0 = 0, b1 = 0; if (t.bo->cpu) { memcpy(&b0, t.bo->cpu, 8); memcpy(&b1, t.bo->cpu + 4096, 8); }
 			    slog("SweetMTL: astc draw tex%u pf%lu va %llx cpu %p blk0 %016llx blk256 %016llx", k, (unsigned long)t.pixelFormat, t.bo->gpu, t.bo->cpu, b0, b1); } } }
 			r->ntex = k + 1;
