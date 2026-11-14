@@ -1135,7 +1135,7 @@ def translate(path, slots):
 
 if __name__ == '__main__':
     import os
-    slots = {}
+    slots = json.load(open(os.environ['AIR_SLOTS'])) if os.environ.get('AIR_SLOTS') else {}   # keep VS/FS varying bases consistent
     jobs = []        # (bitcode path, published name)
     for arg in sys.argv[1:]:
         if arg.endswith('.json'):            # {published name: file in pl_bc}

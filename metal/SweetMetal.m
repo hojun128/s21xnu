@@ -2478,6 +2478,18 @@ static void sm_layer_hooks(void)
 {
 	return [[SweetMTLBuffer alloc] initWithBytesNoCopy:p length:len deallocator:d];
 }
+/* CoreAnimation hands decoded CGImage bytes (the wallpaper snapshot among them) to the GPU this way (run91) */
+- (id)newTextureWithBytesNoCopy:(void *)p length:(NSUInteger)len descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *, NSUInteger))dl
+{
+	NSUInteger h = d.height ? d.height : 1, bpr = len / h;
+	NSUInteger minb = d.width * sm_pf_bpp(d.pixelFormat);
+	if (bpr < minb || d.mipmapLevelCount > 1 || d.arrayLength > 1) bpr = minb;
+	id b = [[SweetMTLBuffer alloc] initWithBytesNoCopy:p length:len deallocator:dl];
+	id t = b ? [b newTextureWithDescriptor:d offset:0 bytesPerRow:bpr] : nil;
+	static int nl; if (nl++ < 8) slog("SweetMTL: buffer texture nocopy %lux%lu pf%lu len %lu bpr %lu -> %s", (unsigned long)d.width, (unsigned long)d.height,
+	    (unsigned long)d.pixelFormat, (unsigned long)len, (unsigned long)bpr, t ? "ok" : "FAILED");
+	return t;
+}
 - (id)newLibraryWithURL:(NSURL *)url error:(NSError **)err { if (err) *err = nil; return [SweetMTLLibrary new]; }
 - (id)newLibraryWithFile:(NSString *)path error:(NSError **)err { if (err) *err = nil; return [SweetMTLLibrary new]; }
 - (id)newDefaultLibrary { return [SweetMTLLibrary new]; }
