@@ -36,7 +36,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -2822,6 +2822,7 @@ static void sm_layer_hooks(void)
 		/* never let ARC release this half-built object: _MTLDevice -dealloc on an uninitialised device crashed
 		 * inside Metal (run45, SpringBoard). One small leak per refused process. */
 		(void)CFBridgingRetain(self);
+		{ static int nl; if (!nl++) slog("SweetMTL: refused device for %s", pn ? pn : "?"); }   /* one line per refused process */
 		return nil;
 	}
 	slog("SweetMTL: initWithAcceleratorPort:%u in %s avail %zuMB", port, pn ? pn : "?", sm_avail() >> 20);
