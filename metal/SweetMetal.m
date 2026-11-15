@@ -36,7 +36,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload " };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1934,7 +1934,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	{
 		/* run124 experiment: skip the backdrop colour-matrix draws (TimgBvcm*, TimgBdso*): suspected to paint the black
 		 * rectangle over the home screen wallpaper. Boot-arg sweetbvcm=1 keeps them. */
-		static int keep = -1; if (keep < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; keep = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetbvcm=1") ? 1 : 0; }
+		static int keep = -1; if (keep < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; keep = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetbvcm=0") ? 0 : 1; }
 		const char *fn = _pipeline.fs ? _pipeline.fs->name : "";
 		if (!keep && (strstr(fn, "Bvcm") || strstr(fn, "Bdso"))) {
 			static int nl; if (nl++ < 4) slog("SweetMTL: skipped backdrop draw %s (%u vertices)", fn, (unsigned)0);
@@ -2288,8 +2288,34 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 			for (uint32_t i = 0; i < e->_ndraw; i++) if (!e->_draws[i].vs) generic = false;
 			uint32_t vs = 0;
 			if (generic) {
+				/* prefix bisect (run125): for full-screen loaded passes after the unlock, save the target, run the pass, then
+				 * replay draws 0..k from the saved image and sample one pixel inside the black rectangle (600,300) and one in the
+				 * wallpaper (600,1500): the first k that turns the inside pixel black is the culprit */
+				uint8_t *save = NULL; static int nbis2;
+				uint32_t W = (uint32_t)e.target.width, H = (uint32_t)e.target.height, bpr = (uint32_t)e.target.bytesPerRow;
+				if (sm_describe > 0 && e.load && e->_ndraw >= 2 && W == 1125 && H == 2436 && e.target.bo->cpu && nbis2 < 4) {
+					save = malloc((size_t)bpr * H); if (save) memcpy(save, e.target.bo->cpu, (size_t)bpr * H);
+				}
 				_lastJobStatus = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
 				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, e->_draws, e->_ndraw, &vs, e.load);
+				if (save) {
+					nbis2++;
+					const uint8_t *c = e.target.bo->cpu;
+					uint32_t in0, out0, inF, outF; memcpy(&in0, save + 300 * bpr + 600 * 4, 4); memcpy(&out0, save + 1500 * bpr + 600 * 4, 4);
+					memcpy(&inF, c + 300 * bpr + 600 * 4, 4); memcpy(&outF, c + 1500 * bpr + 600 * 4, 4);
+					slog("SweetMTL: bisect2 pass n=%u before in %08x out %08x after in %08x out %08x", e->_ndraw, in0, out0, inF, outF);
+					uint8_t *fin = malloc((size_t)bpr * H); if (fin) memcpy(fin, c, (size_t)bpr * H);
+					for (uint32_t k = 0; k < e->_ndraw && k < 12; k++) {
+						memcpy(e.target.bo->cpu, save, (size_t)bpr * H);
+						uint32_t v2 = 0, f2 = sm_pass(&desc, &heap, e.target.bo->gpu, W, H, bpr, e.packed, bgra, e->_draws, k + 1, &v2, e.load);
+						uint32_t pin, pout; memcpy(&pin, c + 300 * bpr + 600 * 4, 4); memcpy(&pout, c + 1500 * bpr + 600 * 4, 4);
+						const sm_drawrec *o = &e->_draws[k]; const char *fn = o->fs ? o->fs->name : "GREEN"; if (!strncmp(fn, "sweet.frag.a1.", 14)) fn += 14;
+						slog("SweetMTL: bisect2  +d%u %.30s bl%u sf%u df%u tex %ux%u: in %08x out %08x st %x", k, fn, o->blend_on, o->rgb_sf, o->rgb_df,
+						    o->ntex ? o->tex[o->ntex - 1].w : 0, o->ntex ? o->tex[o->ntex - 1].h : 0, pin, pout, f2);
+					}
+					if (fin) { memcpy(e.target.bo->cpu, fin, (size_t)bpr * H); free(fin); }
+					free(save);
+				}
 			} else {
 				/* no translated vertex shader: fixed Mesa shaders (phase 2b) */
 				uint32_t n = 0; for (uint32_t i = 0; i < e->_ndraw; i++) n += e->_draws[i].vcount;
