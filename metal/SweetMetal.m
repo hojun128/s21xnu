@@ -36,7 +36,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -2111,11 +2111,50 @@ typedef struct {
 }
 @end
 
+/* Blits are CPU copies. They are queued in the command buffer and run at commit, in order with the GPU passes:
+ * running them at encode time read render targets before the passes that draw them had run (black copies). */
 @interface SweetMTLBlitEncoder : SweetMTLStubEncoder
+- (void)sm_run;
 @end
-@implementation SweetMTLBlitEncoder
+@implementation SweetMTLBlitEncoder { NSMutableArray *_ops; }
+- (void)sm_add:(dispatch_block_t)op { if (!_ops) _ops = [NSMutableArray array]; [_ops addObject:[op copy]]; }
+- (void)sm_run { NSArray *ops = _ops; _ops = nil; for (dispatch_block_t op in ops) op(); }
 - (void)copyFromTexture:(id)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)sz
     toTexture:(id)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO
+{
+	[self sm_add:^{ [self sm_copyTex:src ss:ss sl:sl so:so sz:sz dst:dst ds:ds dl:dl dO:dO]; }];
+}
+- (void)copyFromBuffer:(id)b sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)sbpr sourceBytesPerImage:(NSUInteger)sbpi sourceSize:(MTLSize)sz
+    toTexture:(id)t destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)o
+{
+	{ static int nl; if (nl++ < 6) slog("SweetMTL: blit buffer->tex %lux%lu pf%lu bpr %lu level %lu", (unsigned long)sz.width, (unsigned long)sz.height,
+	    (unsigned long)[t pixelFormat], (unsigned long)sbpr, (unsigned long)dl); }
+	[self sm_add:^{
+		if (ds || dl || ![b respondsToSelector:@selector(contents)] || ![t respondsToSelector:@selector(replaceRegion:mipmapLevel:withBytes:bytesPerRow:)]) return;
+		if ([b length] < so + sbpr * (sz.height ? sz.height - 1 : 0)) return;
+		[t replaceRegion:MTLRegionMake2D(o.x, o.y, sz.width, sz.height) mipmapLevel:0 withBytes:(const uint8_t *)[b contents] + so bytesPerRow:sbpr];
+	}];
+}
+- (void)copyFromBuffer:(id)b sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)sbpr sourceBytesPerImage:(NSUInteger)sbpi sourceSize:(MTLSize)sz
+    toTexture:(id)t destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)o options:(NSUInteger)opt
+{
+	[self copyFromBuffer:b sourceOffset:so sourceBytesPerRow:sbpr sourceBytesPerImage:sbpi sourceSize:sz toTexture:t destinationSlice:ds destinationLevel:dl destinationOrigin:o];
+}
+- (void)copyFromTexture:(id)t sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)sz
+    toBuffer:(id)b destinationOffset:(NSUInteger)dof destinationBytesPerRow:(NSUInteger)dbpr destinationBytesPerImage:(NSUInteger)dbpi
+{
+	{ static int nl; if (nl++ < 6) slog("SweetMTL: blit tex->buffer %lux%lu pf%lu bpr %lu", (unsigned long)sz.width, (unsigned long)sz.height, (unsigned long)[t pixelFormat], (unsigned long)dbpr); }
+	[self sm_add:^{
+		if (ss || sl || ![b respondsToSelector:@selector(contents)] || [b length] < dof + dbpr * (sz.height ? sz.height - 1 : 0) + sz.width) return;
+		[t getBytes:(uint8_t *)[b contents] + dof bytesPerRow:dbpr fromRegion:MTLRegionMake2D(so.x, so.y, sz.width, sz.height) mipmapLevel:0];
+	}];
+}
+- (void)copyFromTexture:(id)t sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)sz
+    toBuffer:(id)b destinationOffset:(NSUInteger)dof destinationBytesPerRow:(NSUInteger)dbpr destinationBytesPerImage:(NSUInteger)dbpi options:(NSUInteger)opt
+{
+	[self copyFromTexture:t sourceSlice:ss sourceLevel:sl sourceOrigin:so sourceSize:sz toBuffer:b destinationOffset:dof destinationBytesPerRow:dbpr destinationBytesPerImage:dbpi];
+}
+- (void)sm_copyTex:(id)src ss:(NSUInteger)ss sl:(NSUInteger)sl so:(MTLOrigin)so sz:(MTLSize)sz dst:(id)dst ds:(NSUInteger)ds dl:(NSUInteger)dl dO:(MTLOrigin)dO
 {
 	{ static int nl; if (nl++ < 6) slog("SweetMTL: blit copy tex pf%lu -> pf%lu %lux%lu level %lu->%lu", (unsigned long)[src pixelFormat], (unsigned long)[dst pixelFormat],
 	    (unsigned long)sz.width, (unsigned long)sz.height, (unsigned long)sl, (unsigned long)dl); }
@@ -2138,11 +2177,11 @@ typedef struct {
 - (void)generateMipmapsForTexture:(id)t {}
 - (void)fillBuffer:(id)b range:(NSRange)r value:(uint8_t)v
 {
-	if ([b respondsToSelector:@selector(contents)] && [b length] >= NSMaxRange(r)) memset((uint8_t *)[b contents] + r.location, v, r.length);
+	[self sm_add:^{ if ([b respondsToSelector:@selector(contents)] && [b length] >= NSMaxRange(r)) memset((uint8_t *)[b contents] + r.location, v, r.length); }];
 }
 - (void)copyFromBuffer:(id)s sourceOffset:(NSUInteger)so toBuffer:(id)d destinationOffset:(NSUInteger)dof size:(NSUInteger)n
 {
-	if ([s length] >= so + n && [d length] >= dof + n) memmove((uint8_t *)[d contents] + dof, (uint8_t *)[s contents] + so, n);
+	[self sm_add:^{ if ([s length] >= so + n && [d length] >= dof + n) memmove((uint8_t *)[d contents] + dof, (uint8_t *)[s contents] + so, n); }];
 }
 @end
 @interface SweetMTLCommandQueue : SweetMTLObject
@@ -2152,8 +2191,8 @@ typedef struct {
 - (instancetype)init { self = [super init]; _passes = [NSMutableArray array]; _scheduled = [NSMutableArray array]; _completed = [NSMutableArray array]; return self; }
 - (void)addScheduledHandler:(void (^)(id))h { if (h) [_scheduled addObject:[h copy]]; }
 - (void)addCompletedHandler:(void (^)(id))h { if (h) [_completed addObject:[h copy]]; }
-- (id)blitCommandEncoder { return [SweetMTLBlitEncoder new]; }
-- (id)blitCommandEncoderWithDescriptor:(id)d { return [SweetMTLBlitEncoder new]; }
+- (id)blitCommandEncoder { SweetMTLBlitEncoder *e = [SweetMTLBlitEncoder new]; [_passes addObject:e]; return e; }
+- (id)blitCommandEncoderWithDescriptor:(id)d { return [self blitCommandEncoder]; }
 - (id)computeCommandEncoder { SweetMTLComputeEncoder *e = [SweetMTLComputeEncoder new]; [_passes addObject:e]; return e; }
 - (id)computeCommandEncoderWithDispatchType:(NSUInteger)t { return [self computeCommandEncoder]; }
 - (id)computeCommandEncoderWithDescriptor:(id)d { return [self computeCommandEncoder]; }
@@ -2202,8 +2241,9 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 	sm_commits++;
 	uint64_t pf_t0 = sm_ns();
 	if (sm_pf_last) { uint64_t g = (pf_t0 - sm_pf_last) / 1000000; sm_pf_gap[g < 20 ? 0 : g < 40 ? 1 : g < 100 ? 2 : 3]++; }
-	for (SweetMTLRenderEncoder *e in _passes) if (![e isKindOfClass:[SweetMTLComputeEncoder class]]) sm_pf_draws += e->_ndraw;
+	for (SweetMTLRenderEncoder *e in _passes) if ([e isKindOfClass:[SweetMTLRenderEncoder class]] && ![e isKindOfClass:[SweetMTLComputeEncoder class]]) sm_pf_draws += e->_ndraw;
 	for (SweetMTLRenderEncoder *e in _passes) {
+		if ([e isKindOfClass:[SweetMTLBlitEncoder class]]) { [(SweetMTLBlitEncoder *)e sm_run]; continue; }
 		if ([e isKindOfClass:[SweetMTLComputeEncoder class]]) { if (!sm_gpu_off) [(SweetMTLComputeEncoder *)e sm_run]; continue; }
 		if (!have || !e.target) { _status = 5; continue; }
 		sm_target_pf = e.target.pixelFormat;
