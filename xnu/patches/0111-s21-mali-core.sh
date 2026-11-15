@@ -326,12 +326,14 @@ mali_power(int on)
 /* ---- recovery: a faulted job leaves the job manager wedged (every later job reports 0x5b), so soft-reset
  * the GPU and power it back up; the next submit re-programs the address space ---- */
 static int sweet_mali_one_core;   /* boot-arg mali_onecore=1: old single-core affinity */
+static void mali_as_invalidate_all(void);
 static uint32_t mali_faults;     /* after MALI_MAX_FAULTS faults/timeouts the GPU is fenced off until reboot */
 #define MALI_MAX_FAULTS 12
 
 static void
 mali_recover(const char *why)
 {
+	mali_as_invalidate_all();
 	if (++mali_faults >= MALI_MAX_FAULTS) {
 		mali_log("fault %u (%s): GPU fenced off until reboot", mali_faults, why);
 		return;
@@ -542,6 +544,9 @@ sweet_mali_boot(void)
 /* ---- exported API for the IOKit layer (iokit/Kernel/arm/SweetMali.cpp); the caller serializes ---- */
 #define MALI_MAX_CTX 8
 static struct mali_ctx ctxs[MALI_MAX_CTX];
+/* skip re-activating the address space and the LOCK/FLUSH_MEM/UNLOCK sequence before a job when this context's
+ * page tables did not change since its last job (the job's own START_FLUSH cleans+invalidates the GPU L2) */
+static uint32_t mali_pt_gen = 1, ctx_flushed_gen[MALI_MAX_CTX];
 static int ctx_used[MALI_MAX_CTX];
 
 int sweet_mali_up(void);
@@ -555,6 +560,7 @@ void sweet_mali_set_asflush(int on);
 void sweet_mali_log_str(const char *s);
 
 static int use_asflush = 1;
+static int mali_lazy_as = 1;    /* boot-arg sweetlazyas=0: activate + flush the AS before every job as before */
 
 void
 sweet_mali_set_asflush(int on)
@@ -601,9 +607,18 @@ sweet_mali_ctx_create(void)
 	return -1;
 }
 
+static void
+mali_as_invalidate_all(void)
+{
+	for (int i = 0; i < MALI_MAX_CTX; i++) {
+		ctx_flushed_gen[i] = 0;
+	}
+}
+
 void
 sweet_mali_ctx_destroy(int id)
 {
+	ctx_flushed_gen[id >= 0 && id < MALI_MAX_CTX ? id : 0] = 0;
 	if (id < 0 || id >= MALI_MAX_CTX || !ctx_used[id]) {
 		return;
 	}
@@ -617,6 +632,7 @@ sweet_mali_ctx_map(int id, uint64_t va, uint64_t pa)
 	if (id < 0 || id >= MALI_MAX_CTX || !ctx_used[id]) {
 		return -1;
 	}
+	mali_pt_gen++;
 	return ctx_map(&ctxs[id], va, pa);
 }
 
@@ -627,6 +643,7 @@ sweet_mali_ctx_unmap(int id, uint64_t va)
 		return;
 	}
 	(void)ctx_map; /* leaf entry is rewritten to 0 by walking the existing tables */
+	mali_pt_gen++;
 	uint64_t t = ctxs[id].pgd_pa;
 	uint32_t idx[3] = { (uint32_t)((va >> 39) & 0x1FF), (uint32_t)((va >> 30) & 0x1FF), (uint32_t)((va >> 21) & 0x1FF) };
 	for (int l = 0; l < 3; l++) {
@@ -653,9 +670,13 @@ sweet_mali_submit(int id, uint32_t slot, uint64_t jc_va, uint32_t timeout_ms)
 	if (mali_faults >= MALI_MAX_FAULTS) {
 		return 0xFFFCU;
 	}
-	ctx_activate(&ctxs[id]);
-	if (use_asflush) {
-		as_flush((uint32_t)id);
+	{ static int parsed; if (!parsed) { parsed = 1; PE_parse_boot_argn("sweetlazyas", &mali_lazy_as, sizeof(mali_lazy_as)); } }
+	if (!mali_lazy_as || ctx_flushed_gen[id] != mali_pt_gen) {
+		ctx_activate(&ctxs[id]);
+		if (use_asflush) {
+			as_flush((uint32_t)id);
+		}
+		ctx_flushed_gen[id] = mali_pt_gen;
 	}
 	uint32_t r = mali_submit_wait(&ctxs[id], slot, jc_va, timeout_ms);
 	return r;
