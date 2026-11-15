@@ -149,9 +149,29 @@ us(uint32_t n)
 }
 
 /* wait until (reg & mask) == want, in ms; returns elapsed ms or 0xFFFFFFFF on timeout */
+/* spin on a register for up to spin_us without sleeping (a 1 ms delay_for_interval blocks the thread and wakes
+ * late: several ms lost per job, run109); true when (reg & mask) == want */
+static bool
+spin_reg(uint32_t off, uint32_t mask, uint32_t want, uint32_t spin_us)
+{
+	uint64_t end, now = mach_absolute_time();
+	nanoseconds_to_absolutetime((uint64_t)spin_us * 1000ULL, &end);
+	end += now;
+	do {
+		if ((rd(off) & mask) == want) {
+			return true;
+		}
+		now = mach_absolute_time();
+	} while (now < end);
+	return (rd(off) & mask) == want;
+}
+
 static uint32_t
 wait_reg(uint32_t off, uint32_t mask, uint32_t want, uint32_t ms)
 {
+	if (spin_reg(off, mask, want, 500)) {
+		return 0;
+	}
 	for (uint32_t t = 0; t < ms; t++) {
 		if ((rd(off) & mask) == want) {
 			return t;
@@ -345,7 +365,20 @@ mali_submit_wait(struct mali_ctx *c, uint32_t slot, uint64_t jc_va, uint32_t tim
 	wr(R_JS(slot, 0x54), 0);
 	wr(R_JS(slot, 0x58), ((uint32_t)c->as) | (3U << 8) | (1U << 10) | (3U << 12) | (8U << 16));
 	wr(R_JS(slot, 0x60), JS_COMMAND_START);
-	for (t = 0; t < timeout_ms; t++) {
+	{
+		/* spin up to 30 ms first: most jobs finish well within that */
+		uint64_t end, now = mach_absolute_time();
+		nanoseconds_to_absolutetime(30ULL * 1000000ULL, &end);
+		end += now;
+		do {
+			raw = rd(R_JOB_IRQ_RAW);
+			if (raw & (done | fail)) {
+				break;
+			}
+			now = mach_absolute_time();
+		} while (now < end);
+	}
+	for (t = 0; t < timeout_ms && !(raw & (done | fail)); t++) {
 		raw = rd(R_JOB_IRQ_RAW);
 		if (raw & (done | fail)) {
 			break;
