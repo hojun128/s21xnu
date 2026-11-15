@@ -33,6 +33,7 @@ cat > iokit/Kernel/arm/SweetMali.cpp <<'EOF_SWEET_SRC'
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/c++/OSString.h>
 #include <pexpert/pexpert.h>
+#include <kern/clock.h>
 #include <libkern/libkern.h>
 #include <kern/thread_call.h>
 #include <kern/clock.h>
@@ -67,6 +68,8 @@ enum {
 	kSMKeep = 9,            /* keep a key diagnostic line in kernel memory, replayed into pmsg right before a recovery reboot */
 	kSMTouch = 10,          /* synthetic touch (finger, down, x, y panel px) for automated unlock tests */
 	kSMSubmitList = 11,     /* submit, cache-flushing only the BOs holding the listed GPU addresses (and all small BOs) */
+	kSMSubmitRange = 12,    /* submit, cache-flushing listed (va, len, pre/post) ranges only; returns flush/job times */
+	kSMFlushRange = 13,     /* clean+invalidate listed (va, len) ranges now (before a CPU read of GPU-written memory) */
 };
 extern "C" void sweet_hid_touch(int finger, int down, int x, int y);
 static int sm_flush_ro = 1;     /* boot-arg sweetflushro=0 turns the read-only import flush off */
@@ -120,6 +123,29 @@ sm_flush_md(IOMemoryDescriptor *md, uint32_t pages)
 		}
 		if (n > pages - k) {
 			n = pages - k;
+		}
+		for (uint32_t j = 0; j < n; j++) {
+			sm_flush_pa(pa + ((uint64_t)j << 12), (unsigned)page_size);
+		}
+		k += n;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* clean+invalidate pages [p0, p1) of a buffer */
+static void
+sm_flush_md_range(IOMemoryDescriptor *md, uint32_t p0, uint32_t p1)
+{
+	for (uint32_t k = p0; k < p1;) {
+		IOByteCount len = 0;
+		addr64_t pa = md->getPhysicalSegment((IOByteCount)k << 12, &len, kIOMemoryMapperNone);
+		uint32_t n = (uint32_t)((len + 4095) >> 12);
+		if (pa == 0 || n == 0) {
+			k++;
+			continue;
+		}
+		if (n > p1 - k) {
+			n = p1 - k;
 		}
 		for (uint32_t j = 0; j < n; j++) {
 			sm_flush_pa(pa + ((uint64_t)j << 12), (unsigned)page_size);
@@ -663,6 +689,74 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			}
 		}
 		args->scalarOutputCount = 1;
+		ret = kIOReturnSuccess;
+		break;
+	}
+	case kSMSubmitRange:
+	case kSMFlushRange: {
+		/* structure: pairs { va, len | flags } with len in bits 0..39 (0 = to the end of the BO), bit 62 = flush
+		 * before the job, bit 63 = flush after it. kSMFlushRange: flush every range now. Read-only imports only when
+		 * sweetflushro allows, external (display) ranges never. scalarInput[3] bit 0: also every BO of <= 16 pages. */
+		const uint64_t *L = (const uint64_t *)args->structureInput;
+		uint32_t n = (uint32_t)(args->structureInputSize / 16);
+		bool sub = selector == kSMSubmitRange;
+		if ((sub && (ins < 4 || outs < 1 || fCtx < 0)) || (n != 0 && L == NULL)) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		if (n > 256) {
+			n = 256;
+		}
+		uint64_t t0 = mach_absolute_time(), t1 = t0, t2 = t0;
+		for (int pass = 0; pass < (sub ? 2 : 1); pass++) {
+			uint64_t want = sub ? (pass == 0 ? (1ULL << 62) : (1ULL << 63)) : ~0ULL;
+			if (pass == 1) {
+				t1 = mach_absolute_time();
+				args->scalarOutput[0] = sweet_mali_submit(fCtx, (uint32_t)args->scalarInput[0], args->scalarInput[1],
+				    (uint32_t)args->scalarInput[2] > 5000 ? 5000 : (uint32_t)args->scalarInput[2]);
+				t2 = mach_absolute_time();
+			}
+			for (uint32_t i = 0; i < SM_MAX_BO; i++) {
+				SMBo *b = &fBo[i];
+				if (b->md == NULL || !b->mapped || b->ext || (b->ro && (pass == 1 || !sm_flush_ro))) {
+					continue;
+				}
+				uint64_t lo = b->va, hi = b->va + ((uint64_t)b->pages << 12);
+				if (sub && (args->scalarInput[3] & 1) && b->pages <= 16) {
+					sm_flush_md_range(b->md, 0, b->pages);
+					continue;
+				}
+				/* union of the listed ranges inside this BO, as one page span (lists are short) */
+				uint64_t s0 = ~0ULL, s1 = 0;
+				for (uint32_t k = 0; k < n; k++) {
+					uint64_t va = L[2 * k], f = L[2 * k + 1], len = f & 0xFFFFFFFFFFULL;
+					if (!(f & want) || va < lo || va >= hi) {
+						continue;
+					}
+					uint64_t e = len ? va + len : hi;
+					if (e > hi) {
+						e = hi;
+					}
+					if (va < s0) {
+						s0 = va;
+					}
+					if (e > s1) {
+						s1 = e;
+					}
+				}
+				if (s1 > s0) {
+					sm_flush_md_range(b->md, (uint32_t)((s0 - lo) >> 12), (uint32_t)((s1 - lo + 4095) >> 12));
+				}
+			}
+		}
+		if (sub) {
+			uint64_t t3 = mach_absolute_time(), ns;
+			uint32_t oc = outs;
+			if (oc > 1) { absolutetime_to_nanoseconds(t1 - t0, &ns); args->scalarOutput[1] = ns; }
+			if (oc > 2) { absolutetime_to_nanoseconds(t2 - t1, &ns); args->scalarOutput[2] = ns; }
+			if (oc > 3) { absolutetime_to_nanoseconds(t3 - t2, &ns); args->scalarOutput[3] = ns; }
+			args->scalarOutputCount = oc > 4 ? 4 : oc;
+		}
 		ret = kIOReturnSuccess;
 		break;
 	}

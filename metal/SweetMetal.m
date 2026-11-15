@@ -97,23 +97,31 @@ static uint64_t sm_infra[16], sm_always[4]; static uint32_t sm_ninfra, sm_nalway
 /* after the first job of a builder only the descriptor BOs (rewritten per draw) and the written target are listed:
  * between the per-draw vertex jobs of a pass the CPU writes nothing else (ring/shadow writes happen at encode time) */
 static bool sm_jlight;
-static uint64_t sm_jr[480], sm_jw[24]; static uint32_t sm_njr, sm_njw; static bool sm_jover;
+static uint64_t sm_jr[480], sm_jw[24], sm_jrl[480], sm_jwl[24]; static uint32_t sm_njr, sm_njw; static bool sm_jover;
+static uint64_t sm_infra_len[16];     /* bytes to flush from the BO start (0 = the whole BO) */
+static uint64_t sm_desc_va, sm_desc_span = 0;   /* the pass descriptor BO: only the part the current pass wrote */
+static volatile uint64_t sm_pf_pre_ns, sm_pf_job_ns, sm_pf_post_ns;
+static void sm_ring_take(uint64_t *va, uint64_t *len);
 static int sm_listmode = -1;   /* -1 unknown, 0 off (boot-arg sweetflushall or old kernel), 1 on */
 static void sm_infra_add(const sm_bo *b) { if (b && b->gpu && sm_ninfra < 16) sm_infra[sm_ninfra++] = b->gpu; }
 static void sm_always_add(const sm_bo *b) { sm_infra_add(b); if (b && b->gpu && sm_nalways < 4) sm_always[sm_nalways++] = b->gpu; }
-static void sm_jl_add(uint64_t va)
+/* len 0: from va to the end of its BO (buffers: the bound length is not known here) */
+static void sm_jl_addl(uint64_t va, uint64_t len)
 {
 	if (!va) return;
-	for (uint32_t i = 0; i < sm_njr; i++) if (sm_jr[i] == va) return;
-	if (sm_njr < sizeof sm_jr / sizeof *sm_jr) sm_jr[sm_njr++] = va; else sm_jover = true;
+	for (uint32_t i = 0; i < sm_njr; i++) if (sm_jr[i] == va) { if (!len || (sm_jrl[i] && len > sm_jrl[i])) sm_jrl[i] = len; return; }
+	if (sm_njr < sizeof sm_jr / sizeof *sm_jr) { sm_jrl[sm_njr] = len; sm_jr[sm_njr++] = va; } else sm_jover = true;
 }
-static void sm_jl_write(uint64_t va)
+static void sm_jl_writel(uint64_t va, uint64_t len)
 {
 	if (!va) return;
-	for (uint32_t i = 0; i < sm_njw; i++) if (sm_jw[i] == va) return;
-	if (sm_njw < sizeof sm_jw / sizeof *sm_jw) sm_jw[sm_njw++] = va; else sm_jover = true;
+	for (uint32_t i = 0; i < sm_njw; i++) if (sm_jw[i] == va) { if (!len || (sm_jwl[i] && len > sm_jwl[i])) sm_jwl[i] = len; return; }
+	if (sm_njw < sizeof sm_jw / sizeof *sm_jw) { sm_jwl[sm_njw] = len; sm_jw[sm_njw++] = va; } else sm_jover = true;
 }
-static void sm_jl_begin(uint64_t target) { sm_njr = sm_njw = 0; sm_jover = false; sm_jlight = false; sm_jl_write(target); }
+static void sm_jl_add(uint64_t va) { sm_jl_addl(va, 0); }
+static void sm_jl_write(uint64_t va) { sm_jl_writel(va, 0); }
+static void sm_jl_beginl(uint64_t target, uint64_t len) { sm_njr = sm_njw = 0; sm_jover = false; sm_jlight = false; sm_jl_writel(target, len); }
+static void sm_jl_begin(uint64_t target) { sm_jl_beginl(target, 0); }
 static uint64_t sm_next_va = 0x30000000ULL;
 static uint64_t sm_va_take(uint64_t size);
 static uint64_t sm_live_bytes; static uint32_t sm_live_n;
@@ -195,20 +203,31 @@ static size_t sm_avail(void)   /* os_proc_available_memory, looked up at run tim
 static uint64_t sm_ring_put_locked(sm_bo *ringp, bool *havep, uint64_t *offp, const void *p, uint64_t len, uint8_t **cpu_out);
 #include <pthread.h>
 static pthread_mutex_t sm_ring_mx = PTHREAD_MUTEX_INITIALIZER;
+static sm_bo sm_ring_bo; static uint64_t sm_ring_lo = ~0ULL, sm_ring_hi;   /* CPU-written part since the last flush */
+static void sm_ring_take(uint64_t *va, uint64_t *len)
+{
+	pthread_mutex_lock(&sm_ring_mx);
+	if (sm_ring_hi > sm_ring_lo && sm_ring_bo.gpu) { *va = sm_ring_bo.gpu + sm_ring_lo; *len = sm_ring_hi - sm_ring_lo; } else { *va = 0; *len = 0; }
+	sm_ring_lo = ~0ULL; sm_ring_hi = 0;
+	pthread_mutex_unlock(&sm_ring_mx);
+}
 static uint64_t sm_ring_put(const void *p, uint64_t len, uint8_t **cpu_out)
 {
-	static sm_bo ring; static bool have; static uint64_t off;
+#define ring sm_ring_bo
+	static bool have; static uint64_t off;
 	pthread_mutex_lock(&sm_ring_mx);
 	uint64_t va = sm_ring_put_locked(&ring, &have, &off, p, len, cpu_out);
+	if (va) { uint64_t o = va - ring.gpu; if (o < sm_ring_lo) sm_ring_lo = o; if (o + len > sm_ring_hi) sm_ring_hi = o + len; }
 	pthread_mutex_unlock(&sm_ring_mx);
 	return va;
+#undef ring
 }
 static uint64_t sm_ring_put_locked(sm_bo *ringp, bool *havep, uint64_t *offp, const void *p, uint64_t len, uint8_t **cpu_out)
 {
 #define ring (*ringp)
 #define have (*havep)
 #define off (*offp)
-	if (!have) { have = sm_bo_alloc(&ring, sm_is_poster(getprogname()) ? (1u << 20) : (8u << 20)); if (have) sm_infra_add(&ring); }   /* extensions have a small memory limit */
+	if (!have) { have = sm_bo_alloc(&ring, sm_is_poster(getprogname()) ? (1u << 20) : (8u << 20)); }   /* extensions have a small memory limit */
 	if (!have || len > ring.size) return 0;
 	off = (off + 255) & ~255ULL;
 	if (off + len > ring.size) off = 0;
@@ -296,7 +315,31 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 	}
 	uint64_t t0 = sm_ns();
 	kern_return_t kr = 1;
-	if (sm_listmode == 1 && !sm_jover) {
+	static int rangemode = -1;   /* kernel selector 12: byte ranges + pre/post flags + timings */
+	if (rangemode < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; rangemode = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetnorange") ? 0 : 1; }
+	if (sm_listmode == 1 && rangemode == 1 && !sm_jover) {
+		const uint64_t PRE = 1ULL << 62, POST = 1ULL << 63;
+		static uint64_t R[512]; uint32_t n = 0;
+#define ADD(va_, len_, f_) do { if ((va_) && n < 254) { R[2 * n] = (va_); R[2 * n + 1] = ((len_) & 0xFFFFFFFFFFULL) | (f_); n++; } } while (0)
+		if (!sm_jlight) {
+			for (uint32_t i = 0; i < sm_ninfra; i++) if (sm_infra[i] != sm_desc_va) ADD(sm_infra[i], sm_infra_len[i], PRE);
+			uint64_t rv, rl; sm_ring_take(&rv, &rl); ADD(rv, rl, PRE);
+			for (uint32_t i = 0; i < sm_njr; i++) ADD(sm_jr[i], sm_jrl[i], PRE);
+		}
+		for (uint32_t i = 0; i < sm_nalways; i++)
+			ADD(sm_always[i], sm_always[i] == sm_desc_va ? sm_desc_span : 0, PRE | POST);   /* the GPU writes job headers there */
+		for (uint32_t i = 0; i < sm_njw; i++) ADD(sm_jw[i], sm_jwl[i], slot == 1 ? PRE : PRE | POST);
+#undef ADD
+		uint64_t in4[4] = { slot, jc, 4000, 0 }, o4[4] = { 0xdead, 0, 0, 0 }; uint32_t oc4 = 4;
+		kr = IOConnectCallMethod(sm_conn, 12, in4, 4, R, n * 16, o4, &oc4, NULL, NULL);
+		if (kr == (kern_return_t)0xe00002c7) { slog("SweetMTL: range flush unsupported: per-BO lists"); rangemode = 0; kr = 1; }
+		else {
+			out[0] = o4[0];
+			if (!kr) { sm_jlight = true; sm_pf_pre_ns += o4[1]; sm_pf_job_ns += o4[2]; sm_pf_post_ns += o4[3]; }
+			static int nl; if (!kr && nl++ < 3) slog("SweetMTL: range flush job: %u ranges, pre %llu us job %llu us post %llu us", n, o4[1] / 1000, o4[2] / 1000, o4[3] / 1000);
+		}
+	}
+	if (kr == 1 && sm_listmode == 1 && !sm_jover) {
 		/* read part (flushed before the job), then the written part (flushed before and after): the descriptor BOs
 		 * are always in the written part, the GPU writes job headers and DRAW words there (run101: without the
 		 * clean+invalidate after the job, stale CPU lines corrupted descriptors -> faults 0x59 and a timeout) */
@@ -746,7 +789,7 @@ static void sm_pack_tls(void *dst, uint32_t tls)
 	if (tls) { per = 16; while (per < ((tls + 15) & ~15u)) per <<= 1; }
 	if (per && per > have_per) {
 		if (have_per) sm_bo_free(&stack);
-		have_per = sm_bo_alloc(&stack, (uint64_t)per * 2048 * 24) ? per : 0; if (have_per) sm_infra_add(&stack);
+		have_per = sm_bo_alloc(&stack, (uint64_t)per * 2048 * 24) ? per : 0; /* TLS stack: GPU only, never flushed */
 		slog("SweetMTL: TLS stack %u bytes/thread -> %s", per, have_per ? "ok" : "alloc failed");
 	}
 	pan_pack(dst, LOCAL_STORAGE, tl) {
@@ -766,11 +809,12 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
     uint32_t packed, bool bgra, const sm_drawrec *dr, uint32_t ndraw, uint32_t *vstatus, bool preload)
 {
 	if (preload) { const sm_shader *rs = sm_find(@"read_surf_frag"); if (!rs || rs->size > 0x300) preload = false; }
-	sm_jl_begin(target_va);
+	sm_jl_beginl(target_va, (uint64_t)stride * h);
+	sm_desc_span = 0x10000 + (uint64_t)(ndraw ? ndraw : 1) * SM_DRAW_STRIDE;
 	for (uint32_t i = 0; i < ndraw; i++) {
 		const sm_drawrec *r = &dr[i];
 		for (int k = 0; k < 31; k++) { sm_jl_add(r->buf[k]); sm_jl_add(r->fbuf[k]); }
-		for (uint32_t k = 0; k < r->ntex && k < 8; k++) if (!r->tex[k].nofl) sm_jl_add(r->tex[k].va);
+		for (uint32_t k = 0; k < r->ntex && k < 8; k++) if (!r->tex[k].nofl) sm_jl_addl(r->tex[k].va, (uint64_t)r->tex[k].stride * (r->tex[k].h ? r->tex[k].h : 1));
 		sm_jl_add(r->index_va);
 	}
 	snprintf(sm_cur_pass, sizeof sm_cur_pass, "%ux%u n%u %s", w, h, ndraw, ndraw && dr[0].fs ? dr[0].fs->name : "-");
@@ -2071,7 +2115,7 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 		pthread_mutex_lock(&sm_commit_mx);
 	}
 	static sm_bo desc; static bool have;
-	if (!have) { have = sm_bo_alloc(&desc, 0x10000 + 32 * SM_DRAW_STRIDE); if (have) sm_always_add(&desc); }
+	if (!have) { have = sm_bo_alloc(&desc, 0x10000 + 32 * SM_DRAW_STRIDE); if (have) { sm_always_add(&desc); sm_desc_va = desc.gpu; } }
 	_status = 4; /* MTLCommandBufferStatusCompleted */
 	sm_commits++;
 	uint64_t pf_t0 = sm_ns();
@@ -2449,6 +2493,7 @@ static void sm_perf_reset(void)
 {
 	sm_pf_ns = sm_pf_gpu_ns = sm_pf_max_ns = 0; sm_pf_n = sm_pf_jobs = sm_pf_draws = 0;
 	memset((void *)sm_pf_gap, 0, sizeof sm_pf_gap); sm_pf_win = sm_ns();
+	sm_pf_pre_ns = sm_pf_job_ns = sm_pf_post_ns = 0;
 }
 static void sm_perf_report(const char *what, long now)
 {
@@ -2456,6 +2501,7 @@ static void sm_perf_report(const char *what, long now)
 	slog("SweetMTL: perf %s: %.1fs %u commits (%.1f/s) commit avg %.2fms max %.1fms gpu %.2fms/commit %u jobs %.0f draws/commit gaps<20:%u <40:%u <100:%u more:%u",
 	    what, win / 1e9, sm_pf_n, win ? sm_pf_n * 1e9 / win : 0.0, sm_pf_ns / 1e6 / n, sm_pf_max_ns / 1e6, sm_pf_gpu_ns / 1e6 / n, sm_pf_jobs,
 	    (double)sm_pf_draws / n, sm_pf_gap[0], sm_pf_gap[1], sm_pf_gap[2], sm_pf_gap[3]);
+	slog("SweetMTL: perf %s kernel: flush-before %.1fms job %.1fms flush-after %.1fms per commit", what, sm_pf_pre_ns / 1e6 / n, sm_pf_job_ns / 1e6 / n, sm_pf_post_ns / 1e6 / n);
 	(void)now;
 }
 static void sm_swipe_up(void)
