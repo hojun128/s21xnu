@@ -2622,7 +2622,7 @@ static void *sm_watchdog(void *arg)
 				slog("SweetMTL: step %d at %lds commits=%u", st, (long)ts.tv_sec, c);
 				if (st == 0) { sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 16); sm_swipe_up(); }   /* lock screen shot, unlock */
 				else if (st == 1) {
-					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 17);   /* home screen (wallpaper) */ kern_return_t k = sm_tap(174, 571); slog("SweetMTL: step tap Settings kr=%x", k); sm_describe = 4; }
+					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 22);   /* home screen (wallpaper), full rgb565 */ kern_return_t k = sm_tap(174, 571); slog("SweetMTL: step tap Settings kr=%x", k); sm_describe = 4; }
 				else if (st == 2) {
 					/* settings-open shot dropped: four deferred shots overflowed the pmsg ring (run113 lost the lock screen) */
 					/* scroll the Settings list: three flicks up, then two back down, measured on their own */
@@ -2631,7 +2631,7 @@ static void *sm_watchdog(void *arg)
 					usleep(1500000);
 					sm_perf_report("scrolling", ts.tv_sec);
 				} else if (st == 3) {
-					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 19);
+					/* settings-scrolled shot dropped (ring space) */
 					sm_describe = 8;   /* the app-to-home transition faulted in run101/102: list its draws */
 					sm_drag(540, 2392, 540, 1000, 24);   /* home indicator: back to the home screen */
 					slog("SweetMTL: step home swipe");
@@ -2640,8 +2640,7 @@ static void *sm_watchdog(void *arg)
 					kern_return_t k = sm_tap(542, 2238); slog("SweetMTL: step tap Safari kr=%x", k); sm_describe = 6;
 				} else {
 					slog("SweetMTL: late thumb at %lds commits=%u gpuoff=%d", (long)ts.tv_sec, c, sm_gpu_off);
-					sm_thumb_flush();
-					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, (uint32_t)23);
+					sm_thumb_flush();   /* the home shot (22) replaces the final Safari shot: two rgb565 shots overflow the ring */
 					slog("SweetMTL: last thumb taken, rebooting to recovery");   /* the kernel replays the kept lines */
 					IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
 				}
