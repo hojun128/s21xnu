@@ -977,7 +977,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		memcpy(push + SMP_VP, vp, sizeof vp);
 		/* fragment stage: same push block but its own buffer table */
 		memcpy(P + 0xE00, push, SMP_BYTES);
-		if (sm_is_poster(getprogname())) {
+		if (sm_is_poster(getprogname()) || (fs && !strncmp(fs->name, "variable_blur", 13))) {   /* variable_blur: built with AIR_TXS_PUSH, no fcs */
 			/* NanoUniverse shaders read texture sizes from push 480 + 4*slot (AIR_TXS_PUSH): the Valhall size query
 			 * page-faulted the GPU (earth shader, run74). Not done for CoreAnimation, whose function constants 56..63 live there. */
 			for (uint32_t k = 0; k < 8; k++) {

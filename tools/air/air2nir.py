@@ -750,6 +750,7 @@ class Fn:
             elif op in ('fpext', 'fptrunc'): R = self.tmp('nir_f2fN(b, %s, %d)' % (A, db))
             elif op == 'sitofp': R = self.tmp('nir_i2fN(b, %s, %d)' % (A, db))
             elif op == 'uitofp': R = self.tmp('nir_u2fN(b, %s, %d)' % (A, db))
+            elif op in ('fptosi', 'fptoui') and ds == 'i1': R = self.tmp('nir_fneu_imm(b, %s, 0.0)' % A)   # f2u1 crashes the Valhall backend
             elif op == 'fptosi': R = self.tmp('nir_f2iN(b, %s, %d)' % (A, db))
             elif op == 'fptoui': R = self.tmp('nir_f2uN(b, %s, %d)' % (A, db))
             else:
@@ -946,6 +947,7 @@ class Fn:
             dk = fn.split('.')[2]; sk = fn.split('.')[-2]
             A = V(0); db = BITS[s]
             if dk == 'f': return self.tmp(('nir_f2fN' if sk == 'f' else 'nir_i2fN' if sk == 's' else 'nir_u2fN') + '(b, %s, %d)' % (A, db))
+            if dk in ('s', 'u') and db == 1: return self.tmp(('nir_fneu_imm(b, %s, 0.0)' if sk == 'f' else 'nir_ine_imm(b, %s, 0)') % A)
             if dk == 's': return self.tmp(('nir_f2iN' if sk == 'f' else 'nir_i2iN') + '(b, %s, %d)' % (A, db))
             if dk == 'u': return self.tmp(('nir_f2uN' if sk == 'f' else 'nir_u2uN') + '(b, %s, %d)' % (A, db))
         if base == 'air.is_function_constant_defined':
