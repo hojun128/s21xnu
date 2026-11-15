@@ -16,6 +16,8 @@
 #include <stdarg.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
+#include <errno.h>
 
 typedef mach_port_t io_object_t, io_service_t, io_connect_t;
 extern const mach_port_t kIOMasterPortDefault;
@@ -34,7 +36,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -2580,7 +2582,7 @@ static void *sm_watchdog(void *arg)
 				else if (st == 1) {
 					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 17);   /* home screen (wallpaper) */ kern_return_t k = sm_tap(174, 571); slog("SweetMTL: step tap Settings kr=%x", k); sm_describe = 4; }
 				else if (st == 2) {
-					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 18);
+					/* settings-open shot dropped: four deferred shots overflowed the pmsg ring (run113 lost the lock screen) */
 					/* scroll the Settings list: three flicks up, then two back down, measured on their own */
 					sm_perf_reset();
 					for (int f = 0; f < 5; f++) { sm_drag(540, f < 3 ? 1900 : 900, 540, f < 3 ? 900 : 1900, 20); usleep(1200000); }
@@ -2684,6 +2686,20 @@ static void sm_layer_hooks(void)
 		return nil;
 	}
 	slog("SweetMTL: initWithAcceleratorPort:%u in %s avail %zuMB", port, pn ? pn : "?", sm_avail() >> 20);
+	{
+		/* no RTC driver: the calendar starts in 1969 (Astronomy then draws the night side). Set it once from the time
+		 * the Mac wrote into the rootfs; backboardd runs as root. */
+		static bool done; struct timeval now; gettimeofday(&now, NULL);
+		if (!done && now.tv_sec < 1700000000L) {
+			done = true;
+			FILE *f = fopen("/usr/local/etc/sweet_epoch", "r"); long e = 0;
+			if (f) { if (fscanf(f, "%ld", &e) != 1) e = 0; fclose(f); }
+			int r = -2, er = 0;
+			if (e > 1700000000L) { struct timeval tv = { e, 0 }; r = settimeofday(&tv, NULL); er = r ? errno : 0; }
+			gettimeofday(&now, NULL);
+			slog("SweetMTL: clock set to %ld by %s: %d errno %d, now %ld", e, pn ? pn : "?", r, er, (long)now.tv_sec);
+		}
+	}
 
 	self = [super init];
 	slog("SweetMTL: super init -> %p", self);
