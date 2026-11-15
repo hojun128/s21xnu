@@ -34,7 +34,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step " };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -2105,6 +2105,21 @@ typedef struct {
 				for (uint32_t i = 0; i < e->_ndraw; i++) {
 					sm_shader *f = (sm_shader *)e->_draws[i].fs;
 					if (f && !f->bad && e->_draws[i].ntex) { f->bad = 1; slog("SweetMTL: quarantined %s after fragment status %x", f->name, _lastJobStatus); }
+				}
+			}
+			if (generic && (_lastJobStatus || vs) && _lastJobStatus != 0xFFFCu && !sm_is_poster(getprogname())) {
+				/* app-to-home transition faults (0x58/0x59, runs 101-104): replay the pass once as-is and once without
+				 * the load preload, to tell a transient (memory changed under the GPU) from a deterministic fault */
+				static int nrep;
+				if (nrep++ < 2) {
+					uint32_t va1 = 0, va2 = 0;
+					uint32_t fa1 = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
+					    (uint32_t)e.target.bytesPerRow, e.packed, bgra, e->_draws, e->_ndraw, &va1, e.load);
+					uint32_t fa2 = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
+					    (uint32_t)e.target.bytesPerRow, e.packed, bgra, e->_draws, e->_ndraw, &va2, false);
+					slog("SweetMTL: fault replay %ux%u bpr %lu bo %llx+%llx imp %u load %d: first %x/%x, again %x/%x, noload %x/%x", (uint32_t)e.target.width,
+					    (uint32_t)e.target.height, (unsigned long)e.target.bytesPerRow, e.target.bo->gpu, e.target.bo->size, e.target.bo->imported, e.load,
+					    vs, _lastJobStatus, va1, fa1, va2, fa2);
 				}
 			}
 			static int nbis;
