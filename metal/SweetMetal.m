@@ -1931,6 +1931,16 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		r->has_scissor = 1; r->sc_x0 = x0; r->sc_y0 = y0; r->sc_x1 = x1 - 1; r->sc_y1 = y1 - 1;
 	}
 	if (_pipeline.fs && _pipeline.fs->bad) { _skipped++; return NULL; }
+	{
+		/* run124 experiment: skip the backdrop colour-matrix draws (TimgBvcm*, TimgBdso*): suspected to paint the black
+		 * rectangle over the home screen wallpaper. Boot-arg sweetbvcm=1 keeps them. */
+		static int keep = -1; if (keep < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; keep = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetbvcm=1") ? 1 : 0; }
+		const char *fn = _pipeline.fs ? _pipeline.fs->name : "";
+		if (!keep && (strstr(fn, "Bvcm") || strstr(fn, "Bdso"))) {
+			static int nl; if (nl++ < 4) slog("SweetMTL: skipped backdrop draw %s (%u vertices)", fn, (unsigned)0);
+			_skipped++; return NULL;
+		}
+	}
 	r->vs = _pipeline.vs; r->fs = _pipeline.fs; r->wmask = 0xF;
 	memcpy(r->buf, _buf, sizeof _buf);
 	memcpy(r->fbuf, _fbuf, sizeof _fbuf);
