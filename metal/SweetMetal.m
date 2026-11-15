@@ -281,15 +281,18 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 	uint64_t t0 = sm_ns();
 	kern_return_t kr = 1;
 	if (sm_listmode == 1 && !sm_jover) {
+		/* read part (flushed before the job), then the written part (flushed before and after): the descriptor BOs
+		 * are always in the written part, the GPU writes job headers and DRAW words there (run101: without the
+		 * clean+invalidate after the job, stale CPU lines corrupted descriptors -> faults 0x59 and a timeout) */
 		uint64_t L[512]; uint32_t n = 0;
-		if (sm_jlight) for (uint32_t i = 0; i < sm_nalways; i++) L[n++] = sm_always[i];
-		else {
+		if (!sm_jlight) {
 			for (uint32_t i = 0; i < sm_ninfra; i++) L[n++] = sm_infra[i];
-			for (uint32_t i = 0; i < sm_njr && n < 512; i++) L[n++] = sm_jr[i];
+			for (uint32_t i = 0; i < sm_njr && n < 500; i++) L[n++] = sm_jr[i];
 		}
 		in[3] = n;
-		for (uint32_t i = 0; i < sm_njw && n < 512; i++) L[n++] = sm_jw[i];
-		if (slot == 1) in[3] = n;   /* vertex jobs write only the tiler heap/varyings: nothing to invalidate after */
+		for (uint32_t i = 0; i < sm_nalways; i++) L[n++] = sm_always[i];
+		if (slot != 1) for (uint32_t i = 0; i < sm_njw && n < 512; i++) L[n++] = sm_jw[i];   /* vertex jobs do not write the target */
+		else for (uint32_t i = 0; i < sm_njw && n < 512; i++) { L[n] = L[in[3]]; L[in[3]++] = sm_jw[i]; n++; }   /* ... but read it: flush before */
 		kr = IOConnectCallMethod(sm_conn, 11, in, 4, L, n * 8, out, &oc, NULL, NULL);
 		if (!kr) sm_jlight = true;
 		if (kr == (kern_return_t)0xe00002c7 || kr == (kern_return_t)0xe00002c2) {   /* unsupported (old kernel) / bad argument */
