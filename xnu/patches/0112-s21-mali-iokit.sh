@@ -68,6 +68,7 @@ enum {
 	kSMTouch = 10,          /* synthetic touch (finger, down, x, y panel px) for automated unlock tests */
 };
 extern "C" void sweet_hid_touch(int finger, int down, int x, int y);
+static int sm_flush_ro = 1;     /* boot-arg sweetflushro=0 turns the read-only import flush off */
 
 extern "C" void sweet_mali_keep_dump(void);
 static char sm_keep_buf[40960];
@@ -357,6 +358,7 @@ SweetMali::start(IOService *provider)
 			}
 		}
 	}
+	PE_parse_boot_argn("sweetflushro", &sm_flush_ro, sizeof(sm_flush_ro));
 	{
 		int metal = 0;
 		if (PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal)) && metal != 0) {
@@ -577,8 +579,10 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		if (tmo > 5000) {
 			tmo = 5000;
 		}
+		/* read-only imports too: other processes write those IOSurfaces (wallpaper, snapshots) through their CPU
+		 * caches and the GPU read stale, black memory (run97); static-region pages are skipped in sm_flush_pa */
 		for (uint32_t i = 0; i < SM_MAX_BO; i++) {
-			if (fBo[i].md != NULL && fBo[i].mapped && !fBo[i].ext && !fBo[i].ro) {
+			if (fBo[i].md != NULL && fBo[i].mapped && !fBo[i].ext && (!fBo[i].ro || sm_flush_ro)) {
 				sm_flush_md(fBo[i].md, fBo[i].pages);
 			}
 		}
