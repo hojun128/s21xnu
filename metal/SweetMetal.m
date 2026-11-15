@@ -170,7 +170,7 @@ static size_t sm_avail(void)   /* os_proc_available_memory, looked up at run tim
 static uint64_t sm_ring_put(const void *p, uint64_t len, uint8_t **cpu_out)
 {
 	static sm_bo ring; static bool have; static uint64_t off;
-	if (!have) have = sm_bo_alloc(&ring, sm_is_poster(getprogname()) ? (1u << 20) : (8u << 20));   /* extensions have a small memory limit */
+	if (!have) { have = sm_bo_alloc(&ring, sm_is_poster(getprogname()) ? (1u << 20) : (8u << 20)); if (have) sm_infra_add(&ring); }   /* extensions have a small memory limit */
 	if (!have || len > ring.size) return 0;
 	off = (off + 255) & ~255ULL;
 	if (off + len > ring.size) off = 0;
@@ -245,12 +245,60 @@ static char sm_cur_pass[96];      /* what was being drawn */
 static char sm_fail_log[240];     /* first GPU failures, also repeated in the alive lines */
 static id sm_last_target;         /* last full-screen render target (thumbnails are timed, an idle lock screen draws nothing) */
 static bool sm_is_poster(const char *pn);
+/* Cache maintenance list for the next job(s): the kernel (selector 11) flushes only the BOs holding these GPU
+ * addresses (plus every BO of <= 16 pages) instead of all ~120 MB of BOs twice per job (selector 3).
+ * sm_jl_begin() at the start of each job builder, sm_jl_add() for what the job reads, sm_jl_begin(target) marks
+ * the written target; long-lived infrastructure BOs (descriptors, ring, heap, dummies) are always listed. */
+static uint64_t sm_infra[16], sm_always[4]; static uint32_t sm_ninfra, sm_nalways;
+/* after the first job of a builder only the descriptor BOs (rewritten per draw) and the written target are listed:
+ * between the per-draw vertex jobs of a pass the CPU writes nothing else (ring/shadow writes happen at encode time) */
+static bool sm_jlight;
+static uint64_t sm_jr[480], sm_jw[24]; static uint32_t sm_njr, sm_njw; static bool sm_jover;
+static int sm_listmode = -1;   /* -1 unknown, 0 off (boot-arg sweetflushall or old kernel), 1 on */
+static void sm_infra_add(const sm_bo *b) { if (b && b->gpu && sm_ninfra < 16) sm_infra[sm_ninfra++] = b->gpu; }
+static void sm_always_add(const sm_bo *b) { sm_infra_add(b); if (b && b->gpu && sm_nalways < 4) sm_always[sm_nalways++] = b->gpu; }
+static void sm_jl_add(uint64_t va)
+{
+	if (!va) return;
+	for (uint32_t i = 0; i < sm_njr; i++) if (sm_jr[i] == va) return;
+	if (sm_njr < sizeof sm_jr / sizeof *sm_jr) sm_jr[sm_njr++] = va; else sm_jover = true;
+}
+static void sm_jl_write(uint64_t va)
+{
+	if (!va) return;
+	for (uint32_t i = 0; i < sm_njw; i++) if (sm_jw[i] == va) return;
+	if (sm_njw < sizeof sm_jw / sizeof *sm_jw) sm_jw[sm_njw++] = va; else sm_jover = true;
+}
+static void sm_jl_begin(uint64_t target) { sm_njr = sm_njw = 0; sm_jover = false; sm_jlight = false; sm_jl_write(target); }
 static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 {
 	if (sm_gpu_off) return 0xFFFCu;
-	uint64_t in[3] = { slot, jc, 4000 }, out[1] = { 0xdead }; uint32_t oc = 1;
+	uint64_t in[4] = { slot, jc, 4000, 0 }, out[1] = { 0xdead }; uint32_t oc = 1;
+	if (sm_listmode < 0) {
+		char ba[1024] = {0}; size_t bl = sizeof(ba) - 1;
+		sm_listmode = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetflushall") ? 0 : 1;
+	}
 	uint64_t t0 = sm_ns();
-	kern_return_t kr = IOConnectCallMethod(sm_conn, 3, in, 3, NULL, 0, out, &oc, NULL, NULL);
+	kern_return_t kr = 1;
+	if (sm_listmode == 1 && !sm_jover) {
+		uint64_t L[512]; uint32_t n = 0;
+		if (sm_jlight) for (uint32_t i = 0; i < sm_nalways; i++) L[n++] = sm_always[i];
+		else {
+			for (uint32_t i = 0; i < sm_ninfra; i++) L[n++] = sm_infra[i];
+			for (uint32_t i = 0; i < sm_njr && n < 512; i++) L[n++] = sm_jr[i];
+		}
+		in[3] = n;
+		for (uint32_t i = 0; i < sm_njw && n < 512; i++) L[n++] = sm_jw[i];
+		if (slot == 1) in[3] = n;   /* vertex jobs write only the tiler heap/varyings: nothing to invalidate after */
+		kr = IOConnectCallMethod(sm_conn, 11, in, 4, L, n * 8, out, &oc, NULL, NULL);
+		if (!kr) sm_jlight = true;
+		if (kr == kIOReturnUnsupported || kr == kIOReturnBadArgument) {
+			slog("SweetMTL: flush list unsupported (kr %x): flushing everything", kr);
+			sm_listmode = 0; kr = 1;
+		}
+		static int nl; if (!kr && nl++ < 3) slog("SweetMTL: flush list job: %u addresses (%u written)", n, sm_njw);
+	}
+	if (kr == 1) { oc = 1; kr = IOConnectCallMethod(sm_conn, 3, in, 3, NULL, 0, out, &oc, NULL, NULL); }
 	sm_pf_gpu_ns += sm_ns() - t0; sm_pf_jobs++;
 	uint32_t r = kr ? 0xffff0000u | (uint32_t)kr : (uint32_t)out[0];
 	static int nfail;
@@ -270,6 +318,7 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 /* Clear a w x h RGBA8/BGRA8 colour target with one FRAGMENT job (no tiler). Returns the job status. */
 static uint32_t sm_clear(sm_bo *desc, uint64_t target_va, uint32_t w, uint32_t h, uint32_t stride, uint32_t packed, bool bgra)
 {
+	sm_jl_begin(target_va);
 	uint8_t *cpu = desc->cpu;
 	memset(cpu, 0, 0x400);
 	void *fbd = cpu + 0x40;
@@ -336,6 +385,7 @@ static uint32_t sm_clear(sm_bo *desc, uint64_t target_va, uint32_t w, uint32_t h
 static uint32_t sm_draw(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w, uint32_t h, uint32_t stride,
     uint32_t packed, bool bgra, uint32_t vcount, uint32_t *vstatus)
 {
+	sm_jl_begin(target_va);
 	uint8_t *cpu = desc->cpu;
 	uint64_t D = desc->gpu;
 	memset(cpu, 0, 0x1000);
@@ -677,7 +727,7 @@ static void sm_pack_tls(void *dst, uint32_t tls)
 	if (tls) { per = 16; while (per < ((tls + 15) & ~15u)) per <<= 1; }
 	if (per && per > have_per) {
 		if (have_per) sm_bo_free(&stack);
-		have_per = sm_bo_alloc(&stack, (uint64_t)per * 2048 * 24) ? per : 0;
+		have_per = sm_bo_alloc(&stack, (uint64_t)per * 2048 * 24) ? per : 0; if (have_per) sm_infra_add(&stack);
 		slog("SweetMTL: TLS stack %u bytes/thread -> %s", per, have_per ? "ok" : "alloc failed");
 	}
 	pan_pack(dst, LOCAL_STORAGE, tl) {
@@ -697,6 +747,13 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
     uint32_t packed, bool bgra, const sm_drawrec *dr, uint32_t ndraw, uint32_t *vstatus, bool preload)
 {
 	if (preload) { const sm_shader *rs = sm_find(@"read_surf_frag"); if (!rs || rs->size > 0x300) preload = false; }
+	sm_jl_begin(target_va);
+	for (uint32_t i = 0; i < ndraw; i++) {
+		const sm_drawrec *r = &dr[i];
+		for (int k = 0; k < 31; k++) { sm_jl_add(r->buf[k]); sm_jl_add(r->fbuf[k]); }
+		for (uint32_t k = 0; k < r->ntex && k < 8; k++) sm_jl_add(r->tex[k].va);
+		sm_jl_add(r->index_va);
+	}
 	snprintf(sm_cur_pass, sizeof sm_cur_pass, "%ux%u n%u %s", w, h, ndraw, ndraw && dr[0].fs ? dr[0].fs->name : "-");
 	uint8_t *cpu = desc->cpu;
 	uint64_t D = desc->gpu;
@@ -756,7 +813,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		b.internal.fixed_function.conversion.memory_format = (MALI_RGBA8_TB << 12) | MALI_RGB_COMPONENT_ORDER_RGBA;
 	}
 	static sm_bo dummy; static bool havedummy;
-	if (!havedummy) havedummy = sm_bo_alloc(&dummy, 0x10000);
+	if (!havedummy) { havedummy = sm_bo_alloc(&dummy, 0x10000); if (havedummy) sm_infra_add(&dummy); }
 	if (preload) {
 		/* loadAction = load: a pre-frame DCD runs read_surf_frag (texture 0 at the fragment position) over every tile */
 		const sm_shader *ps = sm_find(@"read_surf_frag");
@@ -1815,13 +1872,17 @@ typedef struct {
 - (void)sm_run
 {
 	static sm_bo cd; static bool have; static sm_bo dummy; static bool hd;
-	if (!have) have = sm_bo_alloc(&cd, 0x10000);
-	if (!hd) hd = sm_bo_alloc(&dummy, 0x10000);
+	if (!have) { have = sm_bo_alloc(&cd, 0x10000); if (have) sm_always_add(&cd); }
+	if (!hd) { hd = sm_bo_alloc(&dummy, 0x10000); if (hd) sm_infra_add(&dummy); }
 	if (!have || !hd) return;
 	for (uint32_t n = 0; n < _nd; n++) {
 		const sm_dispatch *d = &_d[n];
 		const sm_shader *cs = d->cs;
 		if (cs->size > 0xE000 || cs->cdata_size > 0x200) continue;
+		/* compute may write any bound buffer or texture: all of them are cleaned+invalidated after the job */
+		sm_jl_begin(0);
+		for (int k = 0; k < (int)(sizeof d->buf / sizeof d->buf[0]); k++) sm_jl_write(d->buf[k]);
+		for (uint32_t k = 0; k < d->ntex && k < 4; k++) sm_jl_write(d->tex[k].va);
 		uint8_t *P = cd.cpu; uint64_t PV = cd.gpu;
 		memset(P, 0, 0x1000);
 		memcpy(P + 0x1000, cs->bin, cs->size);
@@ -1953,7 +2014,7 @@ typedef struct {
 - (void)commit
 {
 	static sm_bo desc; static bool have;
-	if (!have) have = sm_bo_alloc(&desc, 0x10000 + 32 * SM_DRAW_STRIDE);
+	if (!have) { have = sm_bo_alloc(&desc, 0x10000 + 32 * SM_DRAW_STRIDE); if (have) sm_always_add(&desc); }
 	_status = 4; /* MTLCommandBufferStatusCompleted */
 	sm_commits++;
 	uint64_t pf_t0 = sm_ns();
@@ -1971,7 +2032,7 @@ typedef struct {
 		bool bgra = sm_is_bgra(e.target.pixelFormat);
 		if (e->_ndraw) {
 			static sm_bo heap; static bool haveheap;
-			if (!haveheap) haveheap = sm_bo_alloc(&heap, sm_is_poster(getprogname()) ? (1u << 20) : (4u << 20));
+			if (!haveheap) { haveheap = sm_bo_alloc(&heap, sm_is_poster(getprogname()) ? (1u << 20) : (4u << 20)); if (haveheap) sm_infra_add(&heap); }
 			if (!haveheap) { _status = 5; continue; }
 			bool generic = true;
 			for (uint32_t i = 0; i < e->_ndraw; i++) if (!e->_draws[i].vs) generic = false;

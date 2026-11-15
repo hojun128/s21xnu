@@ -66,6 +66,7 @@ enum {
 	kSMImportUser = 8,
 	kSMKeep = 9,            /* keep a key diagnostic line in kernel memory, replayed into pmsg right before a recovery reboot */
 	kSMTouch = 10,          /* synthetic touch (finger, down, x, y panel px) for automated unlock tests */
+	kSMSubmitList = 11,     /* submit, cache-flushing only the BOs holding the listed GPU addresses (and all small BOs) */
 };
 extern "C" void sweet_hid_touch(int finger, int down, int x, int y);
 static int sm_flush_ro = 1;     /* boot-arg sweetflushro=0 turns the read-only import flush off */
@@ -104,16 +105,26 @@ sm_flush_pa(uint64_t pa, unsigned len)
 	}
 }
 
-/* The GPU is not cache coherent: clean+invalidate a buffer's pages by physical address. */
+/* The GPU is not cache coherent: clean+invalidate a buffer's pages by physical address.
+ * One getPhysicalSegment per contiguous segment (not per page); the pages inside are flushed one by one as before. */
 static void
 sm_flush_md(IOMemoryDescriptor *md, uint32_t pages)
 {
-	for (uint32_t k = 0; k < pages; k++) {
+	for (uint32_t k = 0; k < pages;) {
 		IOByteCount len = 0;
 		addr64_t pa = md->getPhysicalSegment((IOByteCount)k << 12, &len, kIOMemoryMapperNone);
-		if (pa != 0) {
-			sm_flush_pa(pa, (unsigned)page_size);
+		uint32_t n = (uint32_t)((len + 4095) >> 12);
+		if (pa == 0 || n == 0) {
+			k++;
+			continue;
 		}
+		if (n > pages - k) {
+			n = pages - k;
+		}
+		for (uint32_t j = 0; j < n; j++) {
+			sm_flush_pa(pa + ((uint64_t)j << 12), (unsigned)page_size);
+		}
+		k += n;
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
@@ -589,6 +600,55 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		args->scalarOutput[0] = sweet_mali_submit(fCtx, (uint32_t)args->scalarInput[0], args->scalarInput[1], tmo);
 		for (uint32_t i = 0; i < SM_MAX_BO; i++) {
 			if (fBo[i].md != NULL && fBo[i].mapped && !fBo[i].ext && !fBo[i].ro) {
+				sm_flush_md(fBo[i].md, fBo[i].pages);
+			}
+		}
+		args->scalarOutputCount = 1;
+		ret = kIOReturnSuccess;
+		break;
+	}
+	case kSMSubmitList: {
+		/* scalars: slot, job chain, timeout ms, nread; structure: GPU addresses, the first nread read by the job
+		 * (flushed before it), the rest also written by it (cleaned+invalidated after it, the CPU reads them).
+		 * BOs of <= 16 pages are always flushed: descriptors, small buffers. */
+		const uint64_t *L = (const uint64_t *)args->structureInput;
+		uint32_t n = (uint32_t)(args->structureInputSize / 8);
+		if (ins < 4 || outs < 1 || fCtx < 0 || (n != 0 && L == NULL)) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		uint32_t tmo = (uint32_t)args->scalarInput[2], nr = (uint32_t)args->scalarInput[3];
+		if (tmo > 5000) {
+			tmo = 5000;
+		}
+		if (n > 512) {
+			n = 512;
+		}
+		if (nr > n) {
+			nr = n;
+		}
+		for (uint32_t i = 0; i < SM_MAX_BO; i++) {
+			if (fBo[i].md == NULL || !fBo[i].mapped || fBo[i].ext || (fBo[i].ro && !sm_flush_ro)) {
+				continue;
+			}
+			bool hit = fBo[i].pages <= 16;
+			for (uint32_t k = 0; k < n && !hit; k++) {
+				hit = L[k] >= fBo[i].va && L[k] < fBo[i].va + ((uint64_t)fBo[i].pages << 12);
+			}
+			if (hit) {
+				sm_flush_md(fBo[i].md, fBo[i].pages);
+			}
+		}
+		args->scalarOutput[0] = sweet_mali_submit(fCtx, (uint32_t)args->scalarInput[0], args->scalarInput[1], tmo);
+		for (uint32_t i = 0; i < SM_MAX_BO; i++) {
+			if (fBo[i].md == NULL || !fBo[i].mapped || fBo[i].ext || fBo[i].ro) {
+				continue;
+			}
+			bool hit = fBo[i].pages <= 16;
+			for (uint32_t k = nr; k < n && !hit; k++) {
+				hit = L[k] >= fBo[i].va && L[k] < fBo[i].va + ((uint64_t)fBo[i].pages << 12);
+			}
+			if (hit) {
 				sm_flush_md(fBo[i].md, fBo[i].pages);
 			}
 		}
