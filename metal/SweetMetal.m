@@ -2064,7 +2064,7 @@ typedef struct {
 					char tb[64] = ""; int tl = 0;
 					for (uint32_t k = o->ntex > 3 ? o->ntex - 3 : 0; k < o->ntex; k++)
 						tl += snprintf(tb + tl, sizeof tb - tl, " %ux%u/%u", o->tex[k].w, o->tex[k].h, o->tex[k].pf);
-					slog("SweetMTL:  fd%u %.48s n%u bl%u%s", i, fn, o->vcount, o->blend_on, tb);
+					slog("SweetMTL:  fd%u %.36s n%u bl%u vb%llx ix%llx%s", i, fn, o->vcount, o->blend_on, o->buf[0], o->index_va, tb);
 				}
 			}
 			if (generic && _lastJobStatus == 0xFFFFu && sm_is_poster(getprogname())) {
@@ -2433,6 +2433,7 @@ static void *sm_watchdog(void *arg)
 					sm_perf_report("scrolling", ts.tv_sec);
 				} else if (st == 3) {
 					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 19);
+					sm_describe = 8;   /* the app-to-home transition faulted in run101/102: list its draws */
 					sm_drag(540, 2392, 540, 1000, 24);   /* home indicator: back to the home screen */
 					slog("SweetMTL: step home swipe");
 				} else if (st == 4) {
