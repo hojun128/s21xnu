@@ -36,7 +36,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1829,6 +1829,8 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 }
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i
 {
+	if (sm_is_poster(getprogname())) { static int nl; if (nl++ < 24) slog("SweetMTL: poster tex set %lu <- %s %lux%lu pf%lu", (unsigned long)i, t ? object_getClassName(t) : "nil",
+	    t ? (unsigned long)[t width] : 0, t ? (unsigned long)[t height] : 0, t ? (unsigned long)[t pixelFormat] : 0); }
 	if (i < 8) { _tex[i] = t; if (t) [_keep addObject:t]; }
 }
 - (void)setFragmentTextures:(id const *)ts withRange:(NSRange)r
