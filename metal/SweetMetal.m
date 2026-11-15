@@ -34,7 +34,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -192,9 +192,22 @@ static size_t sm_avail(void)   /* os_proc_available_memory, looked up at run tim
 	if (!tried) { tried = true; f = (size_t (*)(void))dlsym(RTLD_DEFAULT, "os_proc_available_memory"); }
 	return f ? f() : 0;
 }
+static uint64_t sm_ring_put_locked(sm_bo *ringp, bool *havep, uint64_t *offp, const void *p, uint64_t len, uint8_t **cpu_out);
+#include <pthread.h>
+static pthread_mutex_t sm_ring_mx = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t sm_ring_put(const void *p, uint64_t len, uint8_t **cpu_out)
 {
 	static sm_bo ring; static bool have; static uint64_t off;
+	pthread_mutex_lock(&sm_ring_mx);
+	uint64_t va = sm_ring_put_locked(&ring, &have, &off, p, len, cpu_out);
+	pthread_mutex_unlock(&sm_ring_mx);
+	return va;
+}
+static uint64_t sm_ring_put_locked(sm_bo *ringp, bool *havep, uint64_t *offp, const void *p, uint64_t len, uint8_t **cpu_out)
+{
+#define ring (*ringp)
+#define have (*havep)
+#define off (*offp)
 	if (!have) { have = sm_bo_alloc(&ring, sm_is_poster(getprogname()) ? (1u << 20) : (8u << 20)); if (have) sm_infra_add(&ring); }   /* extensions have a small memory limit */
 	if (!have || len > ring.size) return 0;
 	off = (off + 255) & ~255ULL;
@@ -203,6 +216,9 @@ static uint64_t sm_ring_put(const void *p, uint64_t len, uint8_t **cpu_out)
 	if (cpu_out) *cpu_out = ring.cpu + off;
 	uint64_t va = ring.gpu + off; off += len;
 	return va;
+#undef ring
+#undef have
+#undef off
 }
 
 /* Frame capture for headless debugging: the first passes are written, downscaled 3x, into a preallocated file of the
@@ -2014,8 +2030,16 @@ typedef struct {
 	[_passes addObject:e];
 	return e;
 }
+/* Command buffers share the descriptor BO, tiler heap, flush lists and the GPU: CoreAnimation commits from more
+ * than one thread (display + snapshot renders in the app-to-home transition), which overwrote descriptors under a
+ * running job (transient 0x58/0x59 faults that passed on replay, run105). One commit at a time. */
+static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 - (void)commit
 {
+	if (pthread_mutex_trylock(&sm_commit_mx) != 0) {
+		static int nl; if (nl++ < 4) slog("SweetMTL: commit collision: another thread is committing, waiting");
+		pthread_mutex_lock(&sm_commit_mx);
+	}
 	static sm_bo desc; static bool have;
 	if (!have) { have = sm_bo_alloc(&desc, 0x10000 + 32 * SM_DRAW_STRIDE); if (have) sm_always_add(&desc); }
 	_status = 4; /* MTLCommandBufferStatusCompleted */
@@ -2226,6 +2250,7 @@ typedef struct {
 			if (_lastJobStatus != 0) _status = 5;
 		}
 	}
+	pthread_mutex_unlock(&sm_commit_mx);
 	/* CAMetalLayer drawables queued with presentDrawable: go to the compositor once the GPU work is done
 	 * (an empty presentDrawable: kept AegirPoster's stars off the screen, run63) */
 	for (id<MTLDrawable> d in _toPresent) {
