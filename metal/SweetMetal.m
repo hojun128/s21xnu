@@ -137,7 +137,7 @@ static bool sm_bo_alloc(sm_bo *bo, uint64_t size)
 	mach_vm_address_t ua = 0; mach_vm_size_t us = 0;
 	/* own BOs are mapped write-combined (as Mesa does on non-coherent Mali): CPU writes reach memory without cache
 	 * maintenance, so the kernel skips flushing them (selector 12 flag 2); boot-arg sweetnowc keeps them cached */
-	if (sm_wc < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; sm_wc = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetnowc") ? 0 : 1; }
+	if (sm_wc < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; sm_wc = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetwc=1") ? 1 : 0; }   /* opt-in: WC mapping panicked in pmap (phystokv_range illegal PA, run111) */
 	if (IOConnectMapMemory64(sm_conn, (uint32_t)out[0], mach_task_self(), &ua, &us, sm_wc ? (1 | 0x400) : 1)) return false;   /* kIOMapAnywhere | kIOMapWriteCombineCache */
 	uint64_t vs = size + 0x10000, va = sm_va_take(vs);
 	in[0] = out[0]; in[1] = va; oc = 0;
@@ -1519,6 +1519,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	sm_bo _shadow; bool _hasShadow; const uint8_t *_src; NSUInteger _srcBpr;   /* unaligned pitch: GPU reads a copy */
 	NSUInteger _dec, _gw, _gh;   /* CPU-decoded ASTC: downscale factor and the stored (GPU) size */
 	const uint8_t *_lazy; NSUInteger _lazyLen, _lazyBpr; uint64_t _lazySum; void (^_lazyDl)(void *, NSUInteger);   /* no-copy ASTC: client fills it later */
+	uint8_t _swz[4];            /* descriptor channel swizzle (MTLTextureSwizzle: 0 zero, 1 one, 2 R, 3 G, 4 B, 5 A) */
 	bool _priv, _cpuDirty;      /* MTLStorageModePrivate: only the GPU touches it, so no cache flush unless we wrote it on the CPU */
 }
 /* true when this texture can skip the pre-job cache flush: private and not written by the CPU since the last flush */
@@ -1536,7 +1537,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	/* re-decode when sampled blocks changed (cheap check: 256 blocks spread over the image) */
 	if (!_lazy) return false;
 	uint64_t h = 1469598103934665603ULL; NSUInteger nb = _lazyLen / 16;
-	for (NSUInteger i = 0; i < 256 && nb; i++) { uint64_t v; memcpy(&v, _lazy + (i * (nb / 256 + 1) % nb) * 16, 8); h = (h ^ v) * 1099511628211ULL; }
+	for (NSUInteger i = 0; i < 4096 && nb; i++) { uint64_t v[2]; memcpy(v, _lazy + ((i * (nb / 4096 + 1) + i * 7) % nb) * 16, 16); h = (h ^ v[0] ^ (v[1] * 31)) * 1099511628211ULL; }
 	if (h == _lazySum) return false;
 	_lazySum = h;
 	{ static int nl; if (nl++ < 3) { const uint64_t *q = (const uint64_t *)_lazy; NSUInteger m = (_lazyLen / 32) & ~(NSUInteger)1;
@@ -1580,6 +1581,12 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	self = [super init];
 	_device = dev; _width = d.width; _height = d.height; _pixelFormat = d.pixelFormat;
 	_priv = d.storageMode == MTLStorageModePrivate; _cpuDirty = true;
+	_swz[0] = 2; _swz[1] = 3; _swz[2] = 4; _swz[3] = 5;
+	if ([d respondsToSelector:@selector(swizzle)]) {
+		MTLTextureSwizzleChannels sw = d.swizzle;
+		_swz[0] = (uint8_t)sw.red; _swz[1] = (uint8_t)sw.green; _swz[2] = (uint8_t)sw.blue; _swz[3] = (uint8_t)sw.alpha;
+		if (_swz[0] != 2 || _swz[1] != 3 || _swz[2] != 4 || _swz[3] != 5) { static int nl; if (nl++ < 8) slog("SweetMTL: astc swizzle pf%lu %lux%lu: %u%u%u%u", (unsigned long)_pixelFormat, (unsigned long)_width, (unsigned long)_height, _swz[0], _swz[1], _swz[2], _swz[3]); }
+	}
 	_bytesPerRow = (_width * sm_pf_bpp(_pixelFormat) + 63) & ~(NSUInteger)63;  /* Mali linear planes need a 64-byte aligned row stride (run34: 776 faulted) */
 	NSUInteger rows = _height;
 	uint32_t abh = 0, abw = sm_astc(_pixelFormat, &abh, NULL);
@@ -1685,7 +1692,8 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		    slog("SweetMTL: astc upload %lux%lu at %lu,%lu bpr %lu src %016llx store %p", (unsigned long)r.size.width, (unsigned long)r.size.height,
 		    (unsigned long)r.origin.x, (unsigned long)r.origin.y, (unsigned long)bpr, b0, _store.cpu); }
 		NSUInteger bx = r.origin.x / abw, by = r.origin.y / abh, nbx = (r.size.width + abw - 1) / abw, nby = (r.size.height + abh - 1) / abh;
-		uint32_t px[144];
+		uint32_t px[144]; NSUInteger nerr = 0, ntot = 0, ex = 0, ey = 0;
+		bool ident = (_swz[0] == 2 && _swz[1] == 3 && _swz[2] == 4 && _swz[3] == 5) || !(_swz[0] | _swz[1] | _swz[2] | _swz[3]);
 		for (NSUInteger y = 0; y < nby; y++) {
 			const uint8_t *row = (const uint8_t *)src + y * bpr;
 			for (NSUInteger x = 0; x < nbx; x++) {
@@ -1694,11 +1702,19 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 				NSUInteger fx = (X0 + _dec - 1) / _dec * _dec, fy = (Y0 + _dec - 1) / _dec * _dec;
 				if (fx >= X0 + abw || fy >= Y0 + abh) continue;
 				decode_block(row + x * 16, (int)abw, (int)abh, px);
+				ntot++;
+				if (px[0] == 0xFFFF00FFu && px[abw * abh - 1] == 0xFFFF00FFu) { if (!nerr++) { ex = bx + x; ey = by + y; } }
+				if (!ident) for (uint32_t q = 0; q < abw * abh; q++) {
+					uint32_t v = px[q], ch[6] = { 0, 255, (v >> 16) & 255, (v >> 8) & 255, v & 255, v >> 24 };
+					px[q] = (ch[_swz[3] < 6 ? _swz[3] : 5] << 24) | (ch[_swz[0] < 6 ? _swz[0] : 2] << 16) | (ch[_swz[1] < 6 ? _swz[1] : 3] << 8) | ch[_swz[2] < 6 ? _swz[2] : 4];
+				}
 				for (NSUInteger yy = fy; yy < Y0 + abh && yy < _height; yy += _dec)
 					for (NSUInteger xx = fx; xx < X0 + abw && xx < _width; xx += _dec)
 						memcpy(_store.cpu + (yy / _dec) * _bytesPerRow + (xx / _dec) * 4, &px[(yy - Y0) * abw + (xx - X0)], 4);
 			}
 		}
+		{ static int nl; if (nerr && nl++ < 6) slog("SweetMTL: astc decode %lux%lu pf%lu: %lu/%lu error blocks, first at block %lu,%lu", (unsigned long)_width, (unsigned long)_height,
+		    (unsigned long)_pixelFormat, (unsigned long)nerr, (unsigned long)ntot, (unsigned long)ex, (unsigned long)ey); }
 		return;
 	}
 	for (NSUInteger y = 0; y < r.size.height; y++)

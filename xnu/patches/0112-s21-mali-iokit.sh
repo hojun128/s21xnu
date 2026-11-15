@@ -132,6 +132,25 @@ sm_flush_md(IOMemoryDescriptor *md, uint32_t pages)
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
+extern "C" vm_map_address_t phystokv(uint64_t pa);
+/* DC CIVAC over one page through the physmap, no barrier (flush_dcache64 per page ended each call with a DSB:
+ * thousands of DSBs per frame, run110); same physmap/static-region guards as sm_flush_pa */
+static inline void
+sm_civac_page(uint64_t pa)
+{
+	if (pa < gPhysBase || pa + 4096 > gPhysBase + gPhysSize || pa - gPhysBase + gVirtBase < static_memory_end) {
+		return;
+	}
+	uintptr_t va = (uintptr_t)phystokv(pa);
+	for (uintptr_t o = 0; o < 4096; o += 256) {
+		__asm__ volatile ("dc civac, %0" :: "r"(va + o) : "memory");
+		__asm__ volatile ("dc civac, %0" :: "r"(va + o + 64) : "memory");
+		__asm__ volatile ("dc civac, %0" :: "r"(va + o + 128) : "memory");
+		__asm__ volatile ("dc civac, %0" :: "r"(va + o + 192) : "memory");
+	}
+}
+static int sm_fastflush = 1;    /* boot-arg sweetfastflush=0: per-page flush_dcache64 as before */
+
 /* clean+invalidate pages [p0, p1) of a buffer */
 static void
 sm_flush_md_range(IOMemoryDescriptor *md, uint32_t p0, uint32_t p1)
@@ -148,7 +167,11 @@ sm_flush_md_range(IOMemoryDescriptor *md, uint32_t p0, uint32_t p1)
 			n = p1 - k;
 		}
 		for (uint32_t j = 0; j < n; j++) {
-			sm_flush_pa(pa + ((uint64_t)j << 12), (unsigned)page_size);
+			if (sm_fastflush) {
+				sm_civac_page(pa + ((uint64_t)j << 12));
+			} else {
+				sm_flush_pa(pa + ((uint64_t)j << 12), (unsigned)page_size);
+			}
 		}
 		k += n;
 	}
@@ -396,6 +419,7 @@ SweetMali::start(IOService *provider)
 		}
 	}
 	PE_parse_boot_argn("sweetflushro", &sm_flush_ro, sizeof(sm_flush_ro));
+	PE_parse_boot_argn("sweetfastflush", &sm_fastflush, sizeof(sm_fastflush));
 	{
 		int metal = 0;
 		if (PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal)) && metal != 0) {
