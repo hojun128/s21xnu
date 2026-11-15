@@ -866,6 +866,11 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		}
 	}
 	uint32_t vs_all = 0;
+	/* all vertex jobs of the pass in one chain (each depends on the previous: tiler order), one submit instead of
+	 * one per draw; boot-arg sweetnochain = per-draw submits as before */
+	static int chain = -1;
+	if (chain < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; chain = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetnochain") ? 0 : 1; }
+	uint32_t nchain = 0; uint8_t *prevjob = NULL; uint64_t first_va = 0;
 	for (uint32_t i = 0; i < ndraw; i++) {
 		const sm_drawrec *r = &dr[i];
 		uint32_t base = 0x10000 + i * SM_DRAW_STRIDE;
@@ -1021,9 +1026,18 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, VARYING, cfg) {
 			if (sec) { cfg.thread_storage = D + OFF_TLS; cfg.shader = PV + 0x220; cfg.fau = PV + 0x400; cfg.fau_count = vs_fau; }
 		}
-		pan_section_pack(vj, MALLOC_VERTEX_JOB, HEADER, header) { header.type = MALI_JOB_TYPE_MALLOC_VERTEX; header.index = 1; }
-		uint32_t vst = sm_submit(1, PV);
-		uint32_t vexc = *(volatile uint32_t *)P;
+		uint32_t vst = 0, vexc = 0;
+		if (chain) {
+			pan_section_pack(vj, MALLOC_VERTEX_JOB, HEADER, header) {
+				header.type = MALI_JOB_TYPE_MALLOC_VERTEX; header.index = nchain + 1; header.dependency_2 = nchain;
+			}
+			if (prevjob) { uint64_t nx = PV; memcpy(prevjob + 24, &nx, 8); } else first_va = PV;
+			prevjob = P; nchain++;
+		} else {
+			pan_section_pack(vj, MALLOC_VERTEX_JOB, HEADER, header) { header.type = MALI_JOB_TYPE_MALLOC_VERTEX; header.index = 1; }
+			vst = sm_submit(1, PV);
+			vexc = *(volatile uint32_t *)P;
+		}
 		if (sm_is_poster(getprogname())) { static int na; if (na++ < 6) slog("SweetMTL: poster draw%u avail %zuMB", i, sm_avail() >> 20); }
 		{ static int nd; if (vst || nd++ < 6 || sm_is_poster(getprogname()) && nd < 40)   /* per-draw lines filled the pmsg ring (run64) */
 		slog("SweetMTL: draw%u vs=%s fs=%s n=%u sec=%d nvar=%u job=%x exc=%x", i, vs->name, fs ? fs->name : "(FS_GREEN)",
@@ -1037,6 +1051,11 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 			}
 		}
 		vs_all |= vst;
+	}
+	if (chain && nchain) {
+		uint32_t cst = sm_submit(1, first_va);
+		static int nl; if (cst || nl++ < 3) slog("SweetMTL: vertex chain of %u jobs -> %x", nchain, cst);
+		vs_all |= cst;
 	}
 	if (vstatus) *vstatus = vs_all;
 	pan_section_pack(cpu + OFF_FJOB, FRAGMENT_JOB, PAYLOAD, cfg) {
