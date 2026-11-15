@@ -36,7 +36,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -2249,6 +2249,11 @@ typedef struct {
 	MTLClearColor c = ca.clearColor;
 #define SM8(v) ((uint32_t)((v) <= 0 ? 0 : (v) >= 1 ? 255 : (v) * 255.0 + 0.5))
 	e.packed = SM8(c.red) | (SM8(c.green) << 8) | (SM8(c.blue) << 16) | (SM8(c.alpha) << 24);
+	/* DontCare: the tile buffer starts cleared anyway; use transparent black, not the default clear colour (opaque black):
+	 * CA renders mostly transparent layers with DontCare and they came out as opaque black rectangles (run125) */
+	if (!e.load && !e.clear) e.packed = 0;
+	{ static int nl; if (nl++ < 16 && e.target && [e.target width] >= 600) slog("SweetMTL: pass desc %lux%lu load action %lu clear %08x", (unsigned long)[e.target width],
+	    (unsigned long)[e.target height], (unsigned long)ca.loadAction, SM8(c.red) | (SM8(c.green) << 8) | (SM8(c.blue) << 16) | (SM8(c.alpha) << 24)); }
 	[_passes addObject:e];
 	return e;
 }
