@@ -1348,6 +1348,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 @property (nonatomic, readonly) sm_bo *bo;
 @property (nonatomic, weak) id device;
 - (void)sm_sync;
+- (void)sm_setLazy:(const void *)p length:(NSUInteger)len bytesPerRow:(NSUInteger)bpr deallocator:(void (^)(void *, NSUInteger))dl;
 - (NSUInteger)gpuWidth;
 - (NSUInteger)gpuHeight;
 - (uint32_t)maliFormat;
@@ -1360,6 +1361,22 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	bool _view;                 /* _store borrowed from _parent: never freed here */
 	sm_bo _shadow; bool _hasShadow; const uint8_t *_src; NSUInteger _srcBpr;   /* unaligned pitch: GPU reads a copy */
 	NSUInteger _dec, _gw, _gh;   /* CPU-decoded ASTC: downscale factor and the stored (GPU) size */
+	const uint8_t *_lazy; NSUInteger _lazyLen, _lazyBpr; uint64_t _lazySum; void (^_lazyDl)(void *, NSUInteger);   /* no-copy ASTC: client fills it later */
+}
+- (void)sm_setLazy:(const void *)p length:(NSUInteger)len bytesPerRow:(NSUInteger)bpr deallocator:(void (^)(void *, NSUInteger))dl
+{
+	_lazy = p; _lazyLen = len; _lazyBpr = bpr; _lazyDl = [dl copy]; _lazySum = 1;
+}
+- (bool)sm_lazyRefresh
+{
+	/* re-decode when sampled blocks changed (cheap check: 256 blocks spread over the image) */
+	if (!_lazy) return false;
+	uint64_t h = 1469598103934665603ULL; NSUInteger nb = _lazyLen / 16;
+	for (NSUInteger i = 0; i < 256 && nb; i++) { uint64_t v; memcpy(&v, _lazy + (i * (nb / 256 + 1) % nb) * 16, 8); h = (h ^ v) * 1099511628211ULL; }
+	if (h == _lazySum) return false;
+	_lazySum = h;
+	[self replaceRegion:MTLRegionMake2D(0, 0, _width, _height) mipmapLevel:0 withBytes:_lazy bytesPerRow:_lazyBpr];
+	return true;
 }
 - (NSUInteger)gpuWidth { return _gw ? _gw : _width; }
 - (NSUInteger)gpuHeight { return _gh ? _gh : _height; }
@@ -1387,6 +1404,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 }
 - (void)sm_sync
 {
+	if (_lazy && [self sm_lazyRefresh]) { static int nl; if (nl++ < 6) slog("SweetMTL: astc lazy decode %lux%lu", (unsigned long)_width, (unsigned long)_height); }
 	if (!_hasShadow) return;
 	NSUInteger n = _width * sm_pf_bpp(_pixelFormat) < _srcBpr ? _width * sm_pf_bpp(_pixelFormat) : _srcBpr;
 	for (NSUInteger y = 0; y < _height; y++) memcpy(_shadow.cpu + y * _bytesPerRow, _src + y * _srcBpr, n);
@@ -1440,7 +1458,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	    (unsigned long)_width, (unsigned long)_height, (unsigned long)_bytesPerRow, (unsigned long)_pixelFormat, _store.gpu);
 	return self;
 }
-- (void)dealloc { if (_hasShadow) sm_bo_free(&_shadow); else if (!_view) sm_bo_free(&_store); if (_surface) CFRelease(_surface); }
+- (void)dealloc { if (_hasShadow) sm_bo_free(&_shadow); else if (!_view) sm_bo_free(&_store); if (_surface) CFRelease(_surface); if (_lazyDl) _lazyDl((void *)_lazy, _lazyLen); }
 - (IOSurfaceRef)iosurface { return _surface; }
 - (NSUInteger)iosurfacePlane { return 0; }
 - (MTLStorageMode)storageMode { return MTLStorageModeShared; }
@@ -2502,10 +2520,10 @@ static void sm_layer_hooks(void)
 		 * client memory is not needed any more */
 		SweetMTLTexture *t = [self newTextureWithDescriptor:d];
 		NSUInteger bbpr = (d.width + abw - 1) / abw * 16;
-		if (t) [t replaceRegion:MTLRegionMake2D(0, 0, d.width, d.height) mipmapLevel:0 withBytes:p bytesPerRow:bbpr];
+		if (t) { [t sm_setLazy:p length:len bytesPerRow:bbpr deallocator:dl]; dl = nil; }   /* decoded at draw time: CA fills the memory after this call */
 		static int nl; if (nl++ < 8) slog("SweetMTL: buffer texture nocopy astc %lux%lu pf%lu len %lu -> %s", (unsigned long)d.width, (unsigned long)d.height,
 		    (unsigned long)d.pixelFormat, (unsigned long)len, t ? "ok" : "FAILED");
-		{ static int nt; if (t && nt++ == 0 && d.width >= 1000) sm_thumb(t.bo->cpu, (uint32_t)[t gpuWidth], (uint32_t)[t gpuHeight], (uint32_t)t.bytesPerRow, 25); }
+		if (t && d.width >= 1000 && !sm_dbg_tex[1]) sm_dbg_tex[1] = t;
 		if (dl) dl(p, len);
 		return t;
 	}
