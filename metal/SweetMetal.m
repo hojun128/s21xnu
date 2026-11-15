@@ -1073,6 +1073,9 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		/* forward pixel kill would drop the earlier draws' pixels under a draw that reads them back
 		 * (framebuffer fetch, blending) or may not write them (discard): luma_boost read 0 (run37) */
 		bool fpk = !(r->blend_on || (fs && (fs->flags & (SMF_READS_TILE | SMF_DISCARD))));
+		/* run122: forward pixel kill off everywhere (boot-arg sweetfpk=1 re-enables): CA's colour-matrix/backdrop shaders
+		 * (TimgBvcm*, TimgBdso*) read the destination without being flagged, and FPK dropped the wallpaper under them */
+		{ static int fpkon = -1; if (fpkon < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; fpkon = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetfpk=1") ? 1 : 0; } if (!fpkon) fpk = false; }
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, DRAW, cfg) {
 			cfg.allow_forward_pixel_to_kill = fpk; cfg.allow_forward_pixel_to_be_killed = true;
 			cfg.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY; cfg.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
