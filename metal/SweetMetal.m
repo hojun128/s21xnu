@@ -122,6 +122,7 @@ static void sm_jl_add(uint64_t va) { sm_jl_addl(va, 0); }
 static void sm_jl_write(uint64_t va) { sm_jl_writel(va, 0); }
 static void sm_jl_beginl(uint64_t target, uint64_t len) { sm_njr = sm_njw = 0; sm_jover = false; sm_jlight = false; sm_jl_writel(target, len); }
 static void sm_jl_begin(uint64_t target) { sm_jl_beginl(target, 0); }
+static int sm_wc = -1;
 static uint64_t sm_next_va = 0x30000000ULL;
 static uint64_t sm_va_take(uint64_t size);
 static uint64_t sm_live_bytes; static uint32_t sm_live_n;
@@ -134,7 +135,10 @@ static bool sm_bo_alloc(sm_bo *bo, uint64_t size)
 	uint64_t in[2] = { size }, out[2] = { 0 }; uint32_t oc = 2;
 	if (IOConnectCallMethod(sm_conn, 1, in, 1, NULL, 0, out, &oc, NULL, NULL)) return false;
 	mach_vm_address_t ua = 0; mach_vm_size_t us = 0;
-	if (IOConnectMapMemory64(sm_conn, (uint32_t)out[0], mach_task_self(), &ua, &us, 1)) return false;
+	/* own BOs are mapped write-combined (as Mesa does on non-coherent Mali): CPU writes reach memory without cache
+	 * maintenance, so the kernel skips flushing them (selector 12 flag 2); boot-arg sweetnowc keeps them cached */
+	if (sm_wc < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; sm_wc = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetnowc") ? 0 : 1; }
+	if (IOConnectMapMemory64(sm_conn, (uint32_t)out[0], mach_task_self(), &ua, &us, sm_wc ? (1 | 0x400) : 1)) return false;   /* kIOMapAnywhere | kIOMapWriteCombineCache */
 	uint64_t vs = size + 0x10000, va = sm_va_take(vs);
 	in[0] = out[0]; in[1] = va; oc = 0;
 	if (IOConnectCallMethod(sm_conn, 2, in, 2, NULL, 0, NULL, &oc, NULL, NULL)) return false;
@@ -330,7 +334,7 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 			ADD(sm_always[i], sm_always[i] == sm_desc_va ? sm_desc_span : 0, PRE | POST);   /* the GPU writes job headers there */
 		for (uint32_t i = 0; i < sm_njw; i++) ADD(sm_jw[i], sm_jwl[i], slot == 1 ? PRE : PRE | POST);
 #undef ADD
-		uint64_t in4[4] = { slot, jc, 4000, 0 }, o4[4] = { 0xdead, 0, 0, 0 }; uint32_t oc4 = 4;
+		uint64_t in4[4] = { slot, jc, 4000, sm_wc == 1 ? 2 : 0 }, o4[4] = { 0xdead, 0, 0, 0 }; uint32_t oc4 = 4;
 		kr = IOConnectCallMethod(sm_conn, 12, in4, 4, R, n * 16, o4, &oc4, NULL, NULL);
 		if (kr == (kern_return_t)0xe00002c7) { slog("SweetMTL: range flush unsupported: per-BO lists"); rangemode = 0; kr = 1; }
 		else {

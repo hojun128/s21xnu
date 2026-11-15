@@ -614,6 +614,9 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		if (ret == kIOReturnSuccess) {
 			b->va = va;
 			b->mapped = true;
+			/* the bzero at create went through the kernel's cached mapping: write it back once, so a client that maps
+			 * the BO write-combined (and so never flushes it) cannot have zero lines evicted over GPU data later */
+			sm_flush_md(b->md, b->pages);
 		}
 		break;
 	}
@@ -722,6 +725,9 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 					continue;
 				}
 				uint64_t lo = b->va, hi = b->va + ((uint64_t)b->pages << 12);
+				if (sub && (args->scalarInput[3] & 2) && !b->wired) {
+					continue;   /* the client maps its own BOs write-combined: nothing cached to flush */
+				}
 				if (sub && (args->scalarInput[3] & 1) && b->pages <= 16) {
 					sm_flush_md_range(b->md, 0, b->pages);
 					continue;
