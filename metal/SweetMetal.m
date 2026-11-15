@@ -272,7 +272,7 @@ static void sm_capture(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, u
 static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uint32_t id)
 {
 	if (!c) return;
-	const uint32_t S = (id == 18 || id == 19) ? 18 : 12, w = W / S, h = H / S;   /* 18/19: small progress shots */
+	const uint32_t S = (id >= 16 && id <= 19) ? 18 : 12, w = W / S, h = H / S;   /* 18/19: small progress shots */
 	bool hi = id >= 20;                       /* ids >= 20: RGB565 (2 bytes/pixel, no colour banding) */
 	uint32_t n = w * h * (hi ? 2 : 1); uint8_t *px = malloc(n);
 	for (uint32_t y = 0; y < h; y++)
@@ -2558,8 +2558,9 @@ static void *sm_watchdog(void *arg)
 				SweetMTLTexture *tx = tg;
 				int st = step++;
 				slog("SweetMTL: step %d at %lds commits=%u", st, (long)ts.tv_sec, c);
-				if (st == 0) sm_swipe_up();   /* unlock: the home screen */
-				else if (st == 1) { kern_return_t k = sm_tap(174, 571); slog("SweetMTL: step tap Settings kr=%x", k); sm_describe = 4; }
+				if (st == 0) { sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 16); sm_swipe_up(); }   /* lock screen shot, unlock */
+				else if (st == 1) {
+					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 17);   /* home screen (wallpaper) */ kern_return_t k = sm_tap(174, 571); slog("SweetMTL: step tap Settings kr=%x", k); sm_describe = 4; }
 				else if (st == 2) {
 					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 18);
 					/* scroll the Settings list: three flicks up, then two back down, measured on their own */
