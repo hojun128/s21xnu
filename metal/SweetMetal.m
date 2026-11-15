@@ -2313,7 +2313,12 @@ static void *sm_watchdog(void *arg)
 				nlate++;
 				if (nlate < 3) {
 					slog("SweetMTL: late mark %d at %lds commits=%u", nlate, (long)ts.tv_sec, c);
-					if (getenv("SM_NOSWIPE") == NULL) sm_swipe_up();   /* unlock: the last thumbnail should show the home screen */
+					if (nlate == 1) sm_swipe_up();   /* unlock: the home screen */
+					else {
+						/* then open Settings (home screen row 2, column 1: about x 174, y 571 in panel pixels) */
+						kern_return_t k = sm_touch(1, 174, 571); usleep(90000); sm_touch(0, 174, 571);
+						slog("SweetMTL: tap Settings kr=%x", k);
+					}
 					sm_describe = nlate == 1 ? 8 : 6;
 					continue;
 				}   /* one thumbnail only: keep log room for other processes' crash reports */
