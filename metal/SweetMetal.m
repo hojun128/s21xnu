@@ -36,7 +36,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1524,6 +1524,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (NSUInteger)gpuWidth;
 - (NSUInteger)gpuHeight;
 - (bool)sm_noflush;
+- (bool)sm_isShadowed;
 - (uint32_t)maliFormat;
 - (uint32_t)maliSwizzle;
 - (uint32_t)bpp;
@@ -1538,6 +1539,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	uint8_t _swz[4];            /* descriptor channel swizzle (MTLTextureSwizzle: 0 zero, 1 one, 2 R, 3 G, 4 B, 5 A) */
 	bool _priv, _cpuDirty;      /* MTLStorageModePrivate: only the GPU touches it, so no cache flush unless we wrote it on the CPU */
 }
+- (bool)sm_isShadowed { return _hasShadow; }
 /* true when this texture can skip the pre-job cache flush: private and not written by the CPU since the last flush */
 - (bool)sm_noflush
 {
@@ -1723,6 +1725,11 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl withBytes:(const void *)src bytesPerRow:(NSUInteger)bpr
 {
 	_cpuDirty = true;
+	if (r.size.width >= 300 && src && !sm_astc(_pixelFormat, NULL, NULL)) {
+		uint64_t nz = 0, nn = 0; const uint8_t *c = src;
+		for (NSUInteger y = 0; y < r.size.height; y += r.size.height / 16 + 1) for (NSUInteger x = 0; x < r.size.width * sm_pf_bpp(_pixelFormat); x += 61) { nn++; if (c[y * bpr + x]) nz++; }
+		static int nl; if (nl++ < 12) slog("SweetMTL: upload %lux%lu pf%lu bpr %lu nonzero %llu/%llu", (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)_pixelFormat, (unsigned long)bpr, nz, nn);
+	}
 	if (sm_astc(_pixelFormat, NULL, NULL) && lvl == 0 && ![self sm_inRegion:r level:lvl]) { static int nl; if (nl++ < 4) slog("SweetMTL: astc upload rejected %lux%lu", (unsigned long)r.size.width, (unsigned long)r.size.height); }
 	if (![self sm_inRegion:r level:lvl] || !src) return;
 	uint32_t abh = 0, abw = sm_astc(_pixelFormat, &abh, NULL);
@@ -1952,6 +1959,13 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 			{
 				int slot = r->tex[k].w == 1105 ? 0 : r->tex[k].w == 563 ? 1 : r->tex[k].w == 650 ? 2 : -1;
 				if (slot >= 0 && !sm_dbg_tex[slot]) sm_dbg_tex[slot] = t;
+			}
+			if (sm_describe > 0 && t.bo->cpu && sm_pf_bpp(t.pixelFormat) == 4 && r->tex[k].w >= 300) {
+				/* content summary of the bound texture (CPU view): which layer inputs are black */
+				const uint8_t *c = t.bo->cpu; uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0, nd = 0, nn = 0; uint32_t W = r->tex[k].w, H = r->tex[k].h, bpr = r->tex[k].stride;
+				for (uint32_t y = 0; y < H; y += H / 16 + 1) for (uint32_t x = 0; x < W; x += W / 16 + 1) { const uint8_t *q = c + (uint64_t)y * bpr + x * 4; s0 += q[0]; s1 += q[1]; s2 += q[2]; s3 += q[3]; nn++; if (q[0] < 8 && q[1] < 8 && q[2] < 8) nd++; }
+				static int ns; if (nn && ns++ < 40) slog("SweetMTL:  tstat %ux%u pf%lu%s%s: mean %llu %llu %llu a%llu dark %llu%%", W, H, (unsigned long)t.pixelFormat, t.bo->imported ? " imp" : "",
+				    [t sm_isShadowed] ? " shadow" : "", s0 / nn, s1 / nn, s2 / nn, s3 / nn, nd * 100 / nn);
 			}
 			if (sm_describe > 0) { static int nl; if (nl++ < 60) slog("SweetMTL:  rt%u draw%u %ux%u pf%lu%s fs %.40s", k, _ndraw, r->tex[k].w, r->tex[k].h,
 			    (unsigned long)t.pixelFormat, t.bo->imported ? " imp" : "", _pipeline.fs ? _pipeline.fs->name + (strncmp(_pipeline.fs->name, "com.apple.coreanimation.frag.", 29) ? 0 : 29) : "-"); }
@@ -2660,7 +2674,7 @@ static void *sm_watchdog(void *arg)
 				SweetMTLTexture *tx = tg;
 				int st = step++;
 				slog("SweetMTL: step %d at %lds commits=%u", st, (long)ts.tv_sec, c);
-				if (st == 0) { sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 16); sm_swipe_up(); }   /* lock screen shot, unlock */
+				if (st == 0) { sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 16); sm_swipe_up(); sm_describe = 10; }   /* lock screen shot, unlock */
 				else if (st == 1) {
 					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 22);   /* home screen (wallpaper), full rgb565 */ kern_return_t k = sm_tap(174, 571); slog("SweetMTL: step tap Settings kr=%x", k); sm_describe = 4; }
 				else if (st == 2) {
