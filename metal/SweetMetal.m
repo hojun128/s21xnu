@@ -34,7 +34,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -269,9 +269,13 @@ static void sm_capture(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, u
 
 /* Thumbnail through the log (the rootfs is a RAM overlay, so files do not survive): 1/12 scale, RGB332,
  * base64 in 112-char lines "THn <seq> <data>"; the Mac rebuilds a PNG from the pstore log. */
+static struct { uint8_t *px; uint32_t n, w, h, id; } sm_thdef[4]; static int sm_nthdef;
+static void sm_thumb_emit(const uint8_t *px, uint32_t n, uint32_t w, uint32_t h, uint32_t id, bool hi);
+/* id | 0x100: compute now, print later with sm_thumb_flush() (early shots were pushed out of the pmsg ring, run112) */
 static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uint32_t id)
 {
 	if (!c) return;
+	bool defer = (id & 0x100) != 0; id &= 0xFF;
 	const uint32_t S = (id >= 16 && id <= 19) ? 18 : 12, w = W / S, h = H / S;   /* 18/19: small progress shots */
 	bool hi = id >= 20;                       /* ids >= 20: RGB565 (2 bytes/pixel, no colour banding) */
 	uint32_t n = w * h * (hi ? 2 : 1); uint8_t *px = malloc(n);
@@ -288,6 +292,17 @@ static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uin
 				px[2 * (y * w + x)] = (uint8_t)v; px[2 * (y * w + x) + 1] = (uint8_t)(v >> 8);
 			} else px[y * w + x] = (uint8_t)((r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6));
 		}
+	if (defer && sm_nthdef < 4) { sm_thdef[sm_nthdef].px = px; sm_thdef[sm_nthdef].n = n; sm_thdef[sm_nthdef].w = w; sm_thdef[sm_nthdef].h = h; sm_thdef[sm_nthdef++].id = id; return; }
+	sm_thumb_emit(px, n, w, h, id, hi);
+	free(px);
+}
+static void sm_thumb_flush(void)
+{
+	for (int i = 0; i < sm_nthdef; i++) { sm_thumb_emit(sm_thdef[i].px, sm_thdef[i].n, sm_thdef[i].w, sm_thdef[i].h, sm_thdef[i].id, sm_thdef[i].id >= 20); free(sm_thdef[i].px); }
+	sm_nthdef = 0;
+}
+static void sm_thumb_emit(const uint8_t *px, uint32_t n, uint32_t w, uint32_t h, uint32_t id, bool hi)
+{
 	slog("SweetMTL: THUMB %u %ux%u %s %u bytes", id, w, h, hi ? "rgb565" : "rgb332", n);
 	static const char *B = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 	char line[140]; uint32_t seq = 0;
@@ -300,7 +315,6 @@ static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uin
 		line[L] = 0;
 		slog("%s", line);
 	}
-	free(px);
 }
 
 static bool sm_gpu_off;   /* a job timed out (or the kernel fenced the GPU): no more GPU work this boot */
@@ -1703,7 +1717,11 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 				if (fx >= X0 + abw || fy >= Y0 + abh) continue;
 				decode_block(row + x * 16, (int)abw, (int)abh, px);
 				ntot++;
-				if (px[0] == 0xFFFF00FFu && px[abw * abh - 1] == 0xFFFF00FFu) { if (!nerr++) { ex = bx + x; ey = by + y; } }
+				if (px[0] == 0xFFFF00FFu && px[abw * abh - 1] == 0xFFFF00FFu) {
+					if (!nerr++) { ex = bx + x; ey = by + y; }
+					static int nd; if (nd < 6 && (nerr == 1 || nerr == 50 || nerr == 500)) { nd++; const uint64_t *q = (const uint64_t *)(row + x * 16);
+					  slog("SweetMTL: astc bad block %lu,%lu: %016llx %016llx", (unsigned long)(bx + x), (unsigned long)(by + y), q[0], q[1]); }
+				}
 				if (!ident) for (uint32_t q = 0; q < abw * abh; q++) {
 					uint32_t v = px[q], ch[6] = { 0, 255, (v >> 16) & 255, (v >> 8) & 255, v & 255, v >> 24 };
 					px[q] = (ch[_swz[3] < 6 ? _swz[3] : 5] << 24) | (ch[_swz[0] < 6 ? _swz[0] : 2] << 16) | (ch[_swz[1] < 6 ? _swz[1] : 3] << 8) | ch[_swz[2] < 6 ? _swz[2] : 4];
@@ -2558,18 +2576,18 @@ static void *sm_watchdog(void *arg)
 				SweetMTLTexture *tx = tg;
 				int st = step++;
 				slog("SweetMTL: step %d at %lds commits=%u", st, (long)ts.tv_sec, c);
-				if (st == 0) { sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 16); sm_swipe_up(); }   /* lock screen shot, unlock */
+				if (st == 0) { sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 16); sm_swipe_up(); }   /* lock screen shot, unlock */
 				else if (st == 1) {
-					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 17);   /* home screen (wallpaper) */ kern_return_t k = sm_tap(174, 571); slog("SweetMTL: step tap Settings kr=%x", k); sm_describe = 4; }
+					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 17);   /* home screen (wallpaper) */ kern_return_t k = sm_tap(174, 571); slog("SweetMTL: step tap Settings kr=%x", k); sm_describe = 4; }
 				else if (st == 2) {
-					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 18);
+					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 18);
 					/* scroll the Settings list: three flicks up, then two back down, measured on their own */
 					sm_perf_reset();
 					for (int f = 0; f < 5; f++) { sm_drag(540, f < 3 ? 1900 : 900, 540, f < 3 ? 900 : 1900, 20); usleep(1200000); }
 					usleep(1500000);
 					sm_perf_report("scrolling", ts.tv_sec);
 				} else if (st == 3) {
-					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 19);
+					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 19);
 					sm_describe = 8;   /* the app-to-home transition faulted in run101/102: list its draws */
 					sm_drag(540, 2392, 540, 1000, 24);   /* home indicator: back to the home screen */
 					slog("SweetMTL: step home swipe");
@@ -2578,6 +2596,7 @@ static void *sm_watchdog(void *arg)
 					kern_return_t k = sm_tap(542, 2238); slog("SweetMTL: step tap Safari kr=%x", k); sm_describe = 6;
 				} else {
 					slog("SweetMTL: late thumb at %lds commits=%u gpuoff=%d", (long)ts.tv_sec, c, sm_gpu_off);
+					sm_thumb_flush();
 					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, (uint32_t)23);
 					slog("SweetMTL: last thumb taken, rebooting to recovery");   /* the kernel replays the kept lines */
 					IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
