@@ -34,7 +34,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit " };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -78,6 +78,17 @@ typedef struct { uint64_t handle, gpu; uint8_t *cpu; uint64_t size; uint32_t imp
  * consistently for rendering, sampling and the kernel's copy to the panel */
 static inline bool sm_is_bgra(NSUInteger f) { return f == 80 || f == 81 || (f >= 550 && f <= 555); }
 static volatile uint32_t sm_commits;
+/* performance window counters (reset by the watchdog at each test step): commit wall time, GPU submit time
+ * (includes the kernel's cache flushes and the busy wait), commit-to-commit gaps */
+#include <mach/mach_time.h>
+static volatile uint64_t sm_pf_ns, sm_pf_gpu_ns, sm_pf_max_ns, sm_pf_last, sm_pf_win;
+static volatile uint32_t sm_pf_n, sm_pf_jobs, sm_pf_draws, sm_pf_gap[4];
+static uint64_t sm_ns(void)
+{
+	static mach_timebase_info_data_t tb;
+	if (!tb.denom) mach_timebase_info(&tb);
+	return mach_absolute_time() * tb.numer / tb.denom;
+}
 static uint64_t sm_next_va = 0x30000000ULL;
 static uint64_t sm_va_take(uint64_t size);
 static uint64_t sm_live_bytes; static uint32_t sm_live_n;
@@ -197,7 +208,7 @@ static void sm_capture(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, u
 static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uint32_t id)
 {
 	if (!c) return;
-	const uint32_t S = 12, w = W / S, h = H / S;
+	const uint32_t S = (id == 18 || id == 19) ? 18 : 12, w = W / S, h = H / S;   /* 18/19: small progress shots */
 	bool hi = id >= 20;                       /* ids >= 20: RGB565 (2 bytes/pixel, no colour banding) */
 	uint32_t n = w * h * (hi ? 2 : 1); uint8_t *px = malloc(n);
 	for (uint32_t y = 0; y < h; y++)
@@ -238,7 +249,9 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 {
 	if (sm_gpu_off) return 0xFFFCu;
 	uint64_t in[3] = { slot, jc, 4000 }, out[1] = { 0xdead }; uint32_t oc = 1;
+	uint64_t t0 = sm_ns();
 	kern_return_t kr = IOConnectCallMethod(sm_conn, 3, in, 3, NULL, 0, out, &oc, NULL, NULL);
+	sm_pf_gpu_ns += sm_ns() - t0; sm_pf_jobs++;
 	uint32_t r = kr ? 0xffff0000u | (uint32_t)kr : (uint32_t)out[0];
 	static int nfail;
 	if (r && nfail < 3) {
@@ -1943,6 +1956,9 @@ typedef struct {
 	if (!have) have = sm_bo_alloc(&desc, 0x10000 + 32 * SM_DRAW_STRIDE);
 	_status = 4; /* MTLCommandBufferStatusCompleted */
 	sm_commits++;
+	uint64_t pf_t0 = sm_ns();
+	if (sm_pf_last) { uint64_t g = (pf_t0 - sm_pf_last) / 1000000; sm_pf_gap[g < 20 ? 0 : g < 40 ? 1 : g < 100 ? 2 : 3]++; }
+	for (SweetMTLRenderEncoder *e in _passes) if (![e isKindOfClass:[SweetMTLComputeEncoder class]]) sm_pf_draws += e->_ndraw;
 	for (SweetMTLRenderEncoder *e in _passes) {
 		if ([e isKindOfClass:[SweetMTLComputeEncoder class]]) { if (!sm_gpu_off) [(SweetMTLComputeEncoder *)e sm_run]; continue; }
 		if (!have || !e.target) { _status = 5; continue; }
@@ -2138,6 +2154,7 @@ typedef struct {
 		if ([d respondsToSelector:@selector(present)]) [d present];
 	}
 	[_toPresent removeAllObjects];
+	{ uint64_t t1 = sm_ns(), d = t1 - pf_t0; sm_pf_ns += d; if (d > sm_pf_max_ns) sm_pf_max_ns = d; sm_pf_n++; sm_pf_last = t1; }
 	[self sm_runHandlers];
 }
 - (void)waitUntilCompleted {}
@@ -2282,6 +2299,31 @@ static kern_return_t sm_touch(int down, int x, int y)
 	uint64_t in[4] = { 0, (uint64_t)down, (uint64_t)x, (uint64_t)y };
 	return IOConnectCallMethod(sm_conn, 10, in, 4, NULL, 0, NULL, NULL, NULL, NULL);
 }
+static kern_return_t sm_tap(int x, int y)
+{
+	kern_return_t k = sm_touch(1, x, y); usleep(90000); sm_touch(0, x, y);
+	return k;
+}
+/* finger drag in n steps of ~12 ms */
+static void sm_drag(int x0, int y0, int x1, int y1, int n)
+{
+	sm_touch(1, x0, y0);
+	for (int i = 1; i <= n; i++) { usleep(12000); sm_touch(1, x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n); }
+	usleep(20000); sm_touch(0, x1, y1);
+}
+static void sm_perf_reset(void)
+{
+	sm_pf_ns = sm_pf_gpu_ns = sm_pf_max_ns = 0; sm_pf_n = sm_pf_jobs = sm_pf_draws = 0;
+	memset((void *)sm_pf_gap, 0, sizeof sm_pf_gap); sm_pf_win = sm_ns();
+}
+static void sm_perf_report(const char *what, long now)
+{
+	uint64_t win = sm_pf_win ? sm_ns() - sm_pf_win : 0; uint32_t n = sm_pf_n ? sm_pf_n : 1;
+	slog("SweetMTL: perf %s: %.1fs %u commits (%.1f/s) commit avg %.2fms max %.1fms gpu %.2fms/commit %u jobs %.0f draws/commit gaps<20:%u <40:%u <100:%u more:%u",
+	    what, win / 1e9, sm_pf_n, win ? sm_pf_n * 1e9 / win : 0.0, sm_pf_ns / 1e6 / n, sm_pf_max_ns / 1e6, sm_pf_gpu_ns / 1e6 / n, sm_pf_jobs,
+	    (double)sm_pf_draws / n, sm_pf_gap[0], sm_pf_gap[1], sm_pf_gap[2], sm_pf_gap[3]);
+	(void)now;
+}
 static void sm_swipe_up(void)
 {
 	/* wake tap, then a home-indicator swipe from the bottom edge to mid screen */
@@ -2304,38 +2346,41 @@ static void *sm_watchdog(void *arg)
 			if (sm_fail_log[0]) slog("SweetMTL: fails: %s", sm_fail_log);
 		}
 		{
-			/* timed thumbnails of the last full-screen frame; a normal boot reaches the lock screen after ~15 min */
-			static int nlate;
-			static const long at[3] = { 1000, 1150, 1300 };   /* first one rgb332, the last two rgb565 */
+			/* test script after the lock screen (~15 min into the boot): each step reports the frame statistics of the
+			 * window since the previous step, then acts (touches), small progress shots, a final full thumbnail */
+			static int step;
+			static const long at[] = { 1000, 1080, 1160, 1250, 1330, 1430 };
+			static const char *const what[] = { "boot", "home", "settings-open", "settings-idle", "home2", "safari" };
 			struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
 			id tg = sm_last_target;
-			if (nlate < 3 && ts.tv_sec >= at[nlate] && tg && !sm_is_poster(getprogname())) {
-				nlate++;
-				if (nlate < 3) {
-					slog("SweetMTL: late mark %d at %lds commits=%u", nlate, (long)ts.tv_sec, c);
-					if (nlate == 1) sm_swipe_up();   /* unlock: the home screen */
-					else {
-						/* then open Settings (home screen row 2, column 1: about x 174, y 571 in panel pixels) */
-						kern_return_t k = sm_touch(1, 174, 571); usleep(90000); sm_touch(0, 174, 571);
-						slog("SweetMTL: tap Settings kr=%x", k);
-					}
-					sm_describe = nlate == 1 ? 8 : 6;
-					continue;
-				}   /* one thumbnail only: keep log room for other processes' crash reports */
+			if (step < 6 && ts.tv_sec >= at[step] && tg && !sm_is_poster(getprogname())) {
+				sm_perf_report(what[step], ts.tv_sec);
 				SweetMTLTexture *tx = tg;
-				for (int k = 0; k < 4; k++) {
-					SweetMTLTexture *d = sm_dbg_tex[k];
-					if (!d || !d.bo->cpu) continue;
-					slog("SweetMTL: dbg thumb %d %lux%lu pf%lu", 14 + k, (unsigned long)[d gpuWidth], (unsigned long)[d gpuHeight], (unsigned long)d.pixelFormat);
-					sm_thumb(d.bo->cpu, (uint32_t)[d gpuWidth], (uint32_t)[d gpuHeight], (uint32_t)d.bytesPerRow, (uint32_t)(14 + k));
-				}
-				slog("SweetMTL: late thumb %d at %lds commits=%u gpuoff=%d", nlate, (long)ts.tv_sec, c, sm_gpu_off);
-				sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, (uint32_t)23);
-				if (nlate == 3) {
-					/* replay the collected report last, so it is the newest part of the ring, then end the run */
+				int st = step++;
+				slog("SweetMTL: step %d at %lds commits=%u", st, (long)ts.tv_sec, c);
+				if (st == 0) sm_swipe_up();   /* unlock: the home screen */
+				else if (st == 1) { kern_return_t k = sm_tap(174, 571); slog("SweetMTL: step tap Settings kr=%x", k); sm_describe = 4; }
+				else if (st == 2) {
+					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 18);
+					/* scroll the Settings list: three flicks up, then two back down, measured on their own */
+					sm_perf_reset();
+					for (int f = 0; f < 5; f++) { sm_drag(540, f < 3 ? 1900 : 900, 540, f < 3 ? 900 : 1900, 20); usleep(1200000); }
+					usleep(1500000);
+					sm_perf_report("scrolling", ts.tv_sec);
+				} else if (st == 3) {
+					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 19);
+					sm_drag(540, 2392, 540, 1000, 24);   /* home indicator: back to the home screen */
+					slog("SweetMTL: step home swipe");
+				} else if (st == 4) {
+					/* Safari in the dock (thumbnail run90: x 140/279, y 568/609) */
+					kern_return_t k = sm_tap(542, 2238); slog("SweetMTL: step tap Safari kr=%x", k); sm_describe = 6;
+				} else {
+					slog("SweetMTL: late thumb at %lds commits=%u gpuoff=%d", (long)ts.tv_sec, c, sm_gpu_off);
+					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, (uint32_t)23);
 					slog("SweetMTL: last thumb taken, rebooting to recovery");   /* the kernel replays the kept lines */
 					IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
 				}
+				sm_perf_reset();
 			}
 		}
 		if (c && c == last && dumps < 0) { slog("SweetMTL: STALL at commit %u, threads:", c); sm_dump_threads(); dumps++; }
