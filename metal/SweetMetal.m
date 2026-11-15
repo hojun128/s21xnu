@@ -36,7 +36,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1561,6 +1561,28 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	[self replaceRegion:MTLRegionMake2D(0, 0, _width, _height) mipmapLevel:0 withBytes:_lazy bytesPerRow:_lazyBpr];
 	return true;
 }
+/* texture views share the store (Astronomy's earth bound an sRGB view at slot 0 that arrived as nil, run114) */
+- (instancetype)initViewOf:(SweetMTLTexture *)src pixelFormat:(NSUInteger)pf
+{
+	self = [super init];
+	_device = src->_device; _width = src->_width; _height = src->_height; _pixelFormat = pf; _bytesPerRow = src->_bytesPerRow;
+	_store = src->_hasShadow ? src->_shadow : src->_store; _view = true; _parent = src;
+	_dec = src->_dec; _gw = src->_gw; _gh = src->_gh; _priv = src->_priv; _cpuDirty = true;
+	memcpy(_swz, src->_swz, 4);
+	if (sm_astc(src->_pixelFormat, NULL, NULL) && !sm_astc(pf, NULL, NULL)) _pixelFormat = src->_pixelFormat;   /* decoded store stays BGRA8 */
+	_bo = &_store;
+	static int nl; if (nl++ < 8) slog("SweetMTL: texture view %lux%lu pf%lu -> pf%lu", (unsigned long)_width, (unsigned long)_height, (unsigned long)src->_pixelFormat, (unsigned long)pf);
+	return self;
+}
+- (id)newTextureViewWithPixelFormat:(MTLPixelFormat)pf { return [[SweetMTLTexture alloc] initViewOf:self pixelFormat:pf]; }
+- (id)newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:(MTLTextureType)tt levels:(NSRange)lv slices:(NSRange)sl
+{
+	return [[SweetMTLTexture alloc] initViewOf:self pixelFormat:pf];
+}
+- (id)newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:(MTLTextureType)tt levels:(NSRange)lv slices:(NSRange)sl swizzle:(MTLTextureSwizzleChannels)sw
+{
+	return [[SweetMTLTexture alloc] initViewOf:self pixelFormat:pf];
+}
 - (NSUInteger)gpuWidth { return _gw ? _gw : _width; }
 - (NSUInteger)gpuHeight { return _gh ? _gh : _height; }
 - (instancetype)initWithBuffer:(id)buf bo:(const sm_bo *)bbo descriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off bytesPerRow:(NSUInteger)bpr
@@ -1587,6 +1609,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 }
 - (void)sm_sync
 {
+	if (_view && [_parent isKindOfClass:[SweetMTLTexture class]]) { [(SweetMTLTexture *)_parent sm_sync]; return; }
 	if (_lazy && [self sm_lazyRefresh]) { static int nl; if (nl++ < 6) slog("SweetMTL: astc lazy decode %lux%lu", (unsigned long)_width, (unsigned long)_height); }
 	if (!_hasShadow) return;
 	NSUInteger n = _width * sm_pf_bpp(_pixelFormat) < _srcBpr ? _width * sm_pf_bpp(_pixelFormat) : _srcBpr;
@@ -1807,6 +1830,14 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i
 {
 	if (i < 8) { _tex[i] = t; if (t) [_keep addObject:t]; }
+}
+- (void)setFragmentTextures:(id const *)ts withRange:(NSRange)r
+{
+	for (NSUInteger k = 0; k < r.length; k++) [self setFragmentTexture:ts ? ts[k] : nil atIndex:r.location + k];
+}
+- (void)setFragmentSamplerStates:(id const *)ss withRange:(NSRange)r
+{
+	for (NSUInteger k = 0; k < r.length; k++) [self setFragmentSamplerState:ss ? ss[k] : nil atIndex:r.location + k];
 }
 - (void)setFragmentSamplerState:(id)smp atIndex:(NSUInteger)i
 {
