@@ -36,7 +36,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1755,6 +1755,15 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 					for (NSUInteger xx = fx; xx < X0 + abw && xx < _width; xx += _dec)
 						memcpy(_store.cpu + (yy / _dec) * _bytesPerRow + (xx / _dec) * 4, &px[(yy - Y0) * abw + (xx - X0)], 4);
 			}
+		}
+		{
+			/* decoded content summary: mean colour and share of near-black texels (sampled grid) */
+			uint64_t sr = 0, sg = 0, sb = 0, nd = 0, nn = 0;
+			for (NSUInteger y = 0; y < _gh; y += 8) for (NSUInteger x = 0; x < _gw; x += 8) {
+				const uint8_t *q = _store.cpu + y * _bytesPerRow + x * 4; sb += q[0]; sg += q[1]; sr += q[2]; nn++; if (q[0] < 16 && q[1] < 16 && q[2] < 16) nd++;
+			}
+			static int ns; if (nn && ns++ < 12) slog("SweetMTL: astc stats pf%lu %lux%lu (%lux%lu blocks %ux%u): mean rgb %llu %llu %llu, dark %llu%%", (unsigned long)_pixelFormat,
+			    (unsigned long)_width, (unsigned long)_height, (unsigned long)nbx, (unsigned long)nby, abw, abh, sr / nn, sg / nn, sb / nn, nd * 100 / nn);
 		}
 		{ static int nl; if (nerr && nl++ < 6) slog("SweetMTL: astc decode %lux%lu pf%lu: %lu/%lu error blocks, first at block %lu,%lu", (unsigned long)_width, (unsigned long)_height,
 		    (unsigned long)_pixelFormat, (unsigned long)nerr, (unsigned long)ntot, (unsigned long)ex, (unsigned long)ey); }
