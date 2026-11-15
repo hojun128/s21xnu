@@ -635,7 +635,7 @@ typedef struct {
 	uint64_t fbuf[31];               /* fragment-stage buffers (separate push block) */
 	struct { uint32_t fmt, off, bidx; } attr[16];
 	uint32_t stride[31];
-	struct { uint64_t va; uint32_t w, h, stride, fmt, pf, imp, swz, astc; } tex[8];   /* astc: bw | bh << 8 | srgb << 16 */
+	struct { uint64_t va; uint32_t w, h, stride, fmt, pf, imp, swz, astc, nofl; } tex[8];   /* nofl: GPU-only memory, no cache flush */   /* astc: bw | bh << 8 | srgb << 16 */
 	struct { uint32_t nearest, wrap; } smp[8];
 	uint32_t ntex, nsmp;
 	uint32_t fc[64]; uint64_t fc_defined;
@@ -770,14 +770,14 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	for (uint32_t i = 0; i < ndraw; i++) {
 		const sm_drawrec *r = &dr[i];
 		for (int k = 0; k < 31; k++) { sm_jl_add(r->buf[k]); sm_jl_add(r->fbuf[k]); }
-		for (uint32_t k = 0; k < r->ntex && k < 8; k++) sm_jl_add(r->tex[k].va);
+		for (uint32_t k = 0; k < r->ntex && k < 8; k++) if (!r->tex[k].nofl) sm_jl_add(r->tex[k].va);
 		sm_jl_add(r->index_va);
 	}
 	snprintf(sm_cur_pass, sizeof sm_cur_pass, "%ux%u n%u %s", w, h, ndraw, ndraw && dr[0].fs ? dr[0].fs->name : "-");
 	uint8_t *cpu = desc->cpu;
 	uint64_t D = desc->gpu;
 	memset(cpu, 0, 0x1000);
-	memset(heap->cpu, 0, heap->size);
+	/* the tiler heap is not cleared (Mesa never does): a 4 MiB memset + flush per pass was pure overhead */
 	/* pass-wide state, same layout as the fixed-shader path */
 	pan_pack(cpu + OFF_THEAP, TILER_HEAP, heap_d) {
 		heap_d.size = heap->size; heap_d.base = heap->gpu; heap_d.bottom = heap->gpu; heap_d.top = heap->gpu + heap->size;
@@ -1459,6 +1459,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (void)sm_setLazy:(const void *)p length:(NSUInteger)len bytesPerRow:(NSUInteger)bpr deallocator:(void (^)(void *, NSUInteger))dl;
 - (NSUInteger)gpuWidth;
 - (NSUInteger)gpuHeight;
+- (bool)sm_noflush;
 - (uint32_t)maliFormat;
 - (uint32_t)maliSwizzle;
 - (uint32_t)bpp;
@@ -1470,6 +1471,13 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	sm_bo _shadow; bool _hasShadow; const uint8_t *_src; NSUInteger _srcBpr;   /* unaligned pitch: GPU reads a copy */
 	NSUInteger _dec, _gw, _gh;   /* CPU-decoded ASTC: downscale factor and the stored (GPU) size */
 	const uint8_t *_lazy; NSUInteger _lazyLen, _lazyBpr; uint64_t _lazySum; void (^_lazyDl)(void *, NSUInteger);   /* no-copy ASTC: client fills it later */
+	bool _priv, _cpuDirty;      /* MTLStorageModePrivate: only the GPU touches it, so no cache flush unless we wrote it on the CPU */
+}
+/* true when this texture can skip the pre-job cache flush: private and not written by the CPU since the last flush */
+- (bool)sm_noflush
+{
+	if (!_priv || _cpuDirty || _hasShadow || _lazy || _surface || _view) { _cpuDirty = false; return false; }
+	return true;
 }
 - (void)sm_setLazy:(const void *)p length:(NSUInteger)len bytesPerRow:(NSUInteger)bpr deallocator:(void (^)(void *, NSUInteger))dl
 {
@@ -1523,6 +1531,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 {
 	self = [super init];
 	_device = dev; _width = d.width; _height = d.height; _pixelFormat = d.pixelFormat;
+	_priv = d.storageMode == MTLStorageModePrivate; _cpuDirty = true;
 	_bytesPerRow = (_width * sm_pf_bpp(_pixelFormat) + 63) & ~(NSUInteger)63;  /* Mali linear planes need a 64-byte aligned row stride (run34: 776 faulted) */
 	NSUInteger rows = _height;
 	uint32_t abh = 0, abw = sm_astc(_pixelFormat, &abh, NULL);
@@ -1599,7 +1608,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 {
 	if (sl == 0) [self getBytes:dst bytesPerRow:bpr fromRegion:r mipmapLevel:lvl];
 }
-- (uint8_t *)sm_cpu { return _store.cpu; }
+- (uint8_t *)sm_cpu { _cpuDirty = true; return _store.cpu; }
 - (void)getBytes:(void *)dst bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl
 {
 	{
@@ -1619,6 +1628,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl withBytes:(const void *)src bytesPerRow:(NSUInteger)bpr
 {
+	_cpuDirty = true;
 	if (sm_astc(_pixelFormat, NULL, NULL) && lvl == 0 && ![self sm_inRegion:r level:lvl]) { static int nl; if (nl++ < 4) slog("SweetMTL: astc upload rejected %lux%lu", (unsigned long)r.size.width, (unsigned long)r.size.height); }
 	if (![self sm_inRegion:r level:lvl] || !src) return;
 	uint32_t abh = 0, abw = sm_astc(_pixelFormat, &abh, NULL);
@@ -1808,6 +1818,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 			r->tex[k].stride = (uint32_t)t.bytesPerRow; r->tex[k].fmt = [t maliFormat];
 			r->tex[k].pf = (uint32_t)t.pixelFormat; r->tex[k].imp = t.bo->imported;
 			r->tex[k].swz = [t maliSwizzle];
+			r->tex[k].nofl = [t sm_noflush];
 			{ uint32_t bh = 0; bool sr = false; uint32_t bw = sm_astc(t.pixelFormat, &bh, &sr); r->tex[k].astc = 0; (void)sr;   /* ASTC is decoded on the CPU */
 			  if (bw) { static int nl; if (nl++ < 6) { uint64_t b0 = 0, b1 = 0; if (t.bo->cpu) { memcpy(&b0, t.bo->cpu, 8); memcpy(&b1, t.bo->cpu + 4096, 8); }
 			    slog("SweetMTL: astc draw tex%u pf%lu va %llx cpu %p blk0 %016llx blk256 %016llx", k, (unsigned long)t.pixelFormat, t.bo->gpu, t.bo->cpu, b0, b1); } } }
@@ -2078,7 +2089,7 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 		bool bgra = sm_is_bgra(e.target.pixelFormat);
 		if (e->_ndraw) {
 			static sm_bo heap; static bool haveheap;
-			if (!haveheap) { haveheap = sm_bo_alloc(&heap, sm_is_poster(getprogname()) ? (1u << 20) : (4u << 20)); if (haveheap) sm_infra_add(&heap); }
+			if (!haveheap) { haveheap = sm_bo_alloc(&heap, sm_is_poster(getprogname()) ? (1u << 20) : (4u << 20)); /* never written by the CPU (kernel pages come zeroed): no flush */ }
 			if (!haveheap) { _status = 5; continue; }
 			bool generic = true;
 			for (uint32_t i = 0; i < e->_ndraw; i++) if (!e->_draws[i].vs) generic = false;
