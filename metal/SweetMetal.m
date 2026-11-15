@@ -34,7 +34,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit " };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1375,6 +1375,8 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	for (NSUInteger i = 0; i < 256 && nb; i++) { uint64_t v; memcpy(&v, _lazy + (i * (nb / 256 + 1) % nb) * 16, 8); h = (h ^ v) * 1099511628211ULL; }
 	if (h == _lazySum) return false;
 	_lazySum = h;
+	{ static int nl; if (nl++ < 3) { const uint64_t *q = (const uint64_t *)_lazy; NSUInteger m = (_lazyLen / 32) & ~(NSUInteger)1;
+	  slog("SweetMTL: astc lazy bytes %016llx %016llx %016llx %016llx | mid %016llx %016llx", q[0], q[1], q[2], q[3], q[m], q[m + 1]); } }
 	[self replaceRegion:MTLRegionMake2D(0, 0, _width, _height) mipmapLevel:0 withBytes:_lazy bytesPerRow:_lazyBpr];
 	return true;
 }
@@ -1702,7 +1704,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 			  if (bw) { static int nl; if (nl++ < 6) { uint64_t b0 = 0, b1 = 0; if (t.bo->cpu) { memcpy(&b0, t.bo->cpu, 8); memcpy(&b1, t.bo->cpu + 4096, 8); }
 			    slog("SweetMTL: astc draw tex%u pf%lu va %llx cpu %p blk0 %016llx blk256 %016llx", k, (unsigned long)t.pixelFormat, t.bo->gpu, t.bo->cpu, b0, b1); } } }
 			r->ntex = k + 1;
-			if (sm_describe > 0) {
+			{
 				int slot = r->tex[k].w == 1105 ? 0 : r->tex[k].w == 563 ? 1 : r->tex[k].w == 650 ? 2 : -1;
 				if (slot >= 0 && !sm_dbg_tex[slot]) sm_dbg_tex[slot] = t;
 			}
