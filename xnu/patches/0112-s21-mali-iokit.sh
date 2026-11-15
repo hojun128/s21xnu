@@ -493,6 +493,16 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	IOReturn ret = kIOReturnUnsupported;
 	uint32_t ins = args->scalarInputCount, outs = args->scalarOutputCount;
 
+	/* touches never wait for the GPU lock: a submit holds it for its cache flushes and the job, which stretched the
+	 * unlock swipe into a long press (lock screen gallery opened instead of the home screen, run100) */
+	if (selector == kSMTouch) {
+		if (ins < 4) {
+			return kIOReturnBadArgument;
+		}
+		sweet_hid_touch((int)args->scalarInput[0], (int)args->scalarInput[1],
+		    (int)args->scalarInput[2], (int)args->scalarInput[3]);
+		return kIOReturnSuccess;
+	}
 	IOLockLock(sm_lock);
 	switch (selector) {
 	case kSMGetInfo: {
