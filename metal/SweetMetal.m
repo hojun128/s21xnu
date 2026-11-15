@@ -89,6 +89,31 @@ static uint64_t sm_ns(void)
 	if (!tb.denom) mach_timebase_info(&tb);
 	return mach_absolute_time() * tb.numer / tb.denom;
 }
+/* Cache maintenance list for the next job(s): the kernel (selector 11) flushes only the BOs holding these GPU
+ * addresses (plus every BO of <= 16 pages) instead of all ~120 MB of BOs twice per job (selector 3).
+ * sm_jl_begin() at the start of each job builder, sm_jl_add() for what the job reads, sm_jl_begin(target) marks
+ * the written target; long-lived infrastructure BOs (descriptors, ring, heap, dummies) are always listed. */
+static uint64_t sm_infra[16], sm_always[4]; static uint32_t sm_ninfra, sm_nalways;
+/* after the first job of a builder only the descriptor BOs (rewritten per draw) and the written target are listed:
+ * between the per-draw vertex jobs of a pass the CPU writes nothing else (ring/shadow writes happen at encode time) */
+static bool sm_jlight;
+static uint64_t sm_jr[480], sm_jw[24]; static uint32_t sm_njr, sm_njw; static bool sm_jover;
+static int sm_listmode = -1;   /* -1 unknown, 0 off (boot-arg sweetflushall or old kernel), 1 on */
+static void sm_infra_add(const sm_bo *b) { if (b && b->gpu && sm_ninfra < 16) sm_infra[sm_ninfra++] = b->gpu; }
+static void sm_always_add(const sm_bo *b) { sm_infra_add(b); if (b && b->gpu && sm_nalways < 4) sm_always[sm_nalways++] = b->gpu; }
+static void sm_jl_add(uint64_t va)
+{
+	if (!va) return;
+	for (uint32_t i = 0; i < sm_njr; i++) if (sm_jr[i] == va) return;
+	if (sm_njr < sizeof sm_jr / sizeof *sm_jr) sm_jr[sm_njr++] = va; else sm_jover = true;
+}
+static void sm_jl_write(uint64_t va)
+{
+	if (!va) return;
+	for (uint32_t i = 0; i < sm_njw; i++) if (sm_jw[i] == va) return;
+	if (sm_njw < sizeof sm_jw / sizeof *sm_jw) sm_jw[sm_njw++] = va; else sm_jover = true;
+}
+static void sm_jl_begin(uint64_t target) { sm_njr = sm_njw = 0; sm_jover = false; sm_jlight = false; sm_jl_write(target); }
 static uint64_t sm_next_va = 0x30000000ULL;
 static uint64_t sm_va_take(uint64_t size);
 static uint64_t sm_live_bytes; static uint32_t sm_live_n;
@@ -245,31 +270,6 @@ static char sm_cur_pass[96];      /* what was being drawn */
 static char sm_fail_log[240];     /* first GPU failures, also repeated in the alive lines */
 static id sm_last_target;         /* last full-screen render target (thumbnails are timed, an idle lock screen draws nothing) */
 static bool sm_is_poster(const char *pn);
-/* Cache maintenance list for the next job(s): the kernel (selector 11) flushes only the BOs holding these GPU
- * addresses (plus every BO of <= 16 pages) instead of all ~120 MB of BOs twice per job (selector 3).
- * sm_jl_begin() at the start of each job builder, sm_jl_add() for what the job reads, sm_jl_begin(target) marks
- * the written target; long-lived infrastructure BOs (descriptors, ring, heap, dummies) are always listed. */
-static uint64_t sm_infra[16], sm_always[4]; static uint32_t sm_ninfra, sm_nalways;
-/* after the first job of a builder only the descriptor BOs (rewritten per draw) and the written target are listed:
- * between the per-draw vertex jobs of a pass the CPU writes nothing else (ring/shadow writes happen at encode time) */
-static bool sm_jlight;
-static uint64_t sm_jr[480], sm_jw[24]; static uint32_t sm_njr, sm_njw; static bool sm_jover;
-static int sm_listmode = -1;   /* -1 unknown, 0 off (boot-arg sweetflushall or old kernel), 1 on */
-static void sm_infra_add(const sm_bo *b) { if (b && b->gpu && sm_ninfra < 16) sm_infra[sm_ninfra++] = b->gpu; }
-static void sm_always_add(const sm_bo *b) { sm_infra_add(b); if (b && b->gpu && sm_nalways < 4) sm_always[sm_nalways++] = b->gpu; }
-static void sm_jl_add(uint64_t va)
-{
-	if (!va) return;
-	for (uint32_t i = 0; i < sm_njr; i++) if (sm_jr[i] == va) return;
-	if (sm_njr < sizeof sm_jr / sizeof *sm_jr) sm_jr[sm_njr++] = va; else sm_jover = true;
-}
-static void sm_jl_write(uint64_t va)
-{
-	if (!va) return;
-	for (uint32_t i = 0; i < sm_njw; i++) if (sm_jw[i] == va) return;
-	if (sm_njw < sizeof sm_jw / sizeof *sm_jw) sm_jw[sm_njw++] = va; else sm_jover = true;
-}
-static void sm_jl_begin(uint64_t target) { sm_njr = sm_njw = 0; sm_jover = false; sm_jlight = false; sm_jl_write(target); }
 static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 {
 	if (sm_gpu_off) return 0xFFFCu;
@@ -292,7 +292,7 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 		if (slot == 1) in[3] = n;   /* vertex jobs write only the tiler heap/varyings: nothing to invalidate after */
 		kr = IOConnectCallMethod(sm_conn, 11, in, 4, L, n * 8, out, &oc, NULL, NULL);
 		if (!kr) sm_jlight = true;
-		if (kr == kIOReturnUnsupported || kr == kIOReturnBadArgument) {
+		if (kr == (kern_return_t)0xe00002c7 || kr == (kern_return_t)0xe00002c2) {   /* unsupported (old kernel) / bad argument */
 			slog("SweetMTL: flush list unsupported (kr %x): flushing everything", kr);
 			sm_listmode = 0; kr = 1;
 		}
