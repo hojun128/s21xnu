@@ -2252,7 +2252,7 @@ typedef struct {
 	/* DontCare: the tile buffer starts cleared anyway; use transparent black, not the default clear colour (opaque black):
 	 * CA renders mostly transparent layers with DontCare and they came out as opaque black rectangles (run125) */
 	if (!e.load && !e.clear) e.packed = 0;
-	{ static int nl; if (nl++ < 16 && e.target && [e.target width] >= 600) slog("SweetMTL: pass desc %lux%lu load action %lu clear %08x", (unsigned long)[e.target width],
+	{ static int nl; if (e.target && [e.target width] >= 1000 && [e.target height] >= 1000 && [e.target height] != 2436 && nl++ < 16) slog("SweetMTL: pass desc %lux%lu load action %lu clear %08x", (unsigned long)[e.target width],
 	    (unsigned long)[e.target height], (unsigned long)ca.loadAction, SM8(c.red) | (SM8(c.green) << 8) | (SM8(c.blue) << 16) | (SM8(c.alpha) << 24)); }
 	[_passes addObject:e];
 	return e;
@@ -2298,7 +2298,9 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 				 * wallpaper (600,1500): the first k that turns the inside pixel black is the culprit */
 				uint8_t *save = NULL; static int nbis2;
 				uint32_t W = (uint32_t)e.target.width, H = (uint32_t)e.target.height, bpr = (uint32_t)e.target.bytesPerRow;
-				if (sm_describe > 0 && e.load && e->_ndraw >= 2 && W == 1125 && H == 2436 && e.target.bo->cpu && nbis2 < 4) {
+				bool lay = (W == 1082 && H == 1226) || (W == 1085 && H == 1227);
+				uint32_t ix = lay ? W / 2 : 600, iy = lay ? 300 : 300, ox = lay ? W / 2 : 600, oy = lay ? 1100 : 1500;
+				if (sm_describe > 0 && ((e.load && W == 1125 && H == 2436 && e->_ndraw >= 2) || lay) && e.target.bo->cpu && nbis2 < 6) {
 					save = malloc((size_t)bpr * H); if (save) memcpy(save, e.target.bo->cpu, (size_t)bpr * H);
 				}
 				_lastJobStatus = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
@@ -2306,14 +2308,14 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 				if (save) {
 					nbis2++;
 					const uint8_t *c = e.target.bo->cpu;
-					uint32_t in0, out0, inF, outF; memcpy(&in0, save + 300 * bpr + 600 * 4, 4); memcpy(&out0, save + 1500 * bpr + 600 * 4, 4);
-					memcpy(&inF, c + 300 * bpr + 600 * 4, 4); memcpy(&outF, c + 1500 * bpr + 600 * 4, 4);
-					slog("SweetMTL: bisect2 pass n=%u before in %08x out %08x after in %08x out %08x", e->_ndraw, in0, out0, inF, outF);
+					uint32_t in0, out0, inF, outF; memcpy(&in0, save + iy * bpr + ix * 4, 4); memcpy(&out0, save + oy * bpr + ox * 4, 4);
+					memcpy(&inF, c + iy * bpr + ix * 4, 4); memcpy(&outF, c + oy * bpr + ox * 4, 4);
+					slog("SweetMTL: bisect2 pass %ux%u load %d clear %08x n=%u before in %08x out %08x after in %08x out %08x", W, H, e.load, e.packed, e->_ndraw, in0, out0, inF, outF);
 					uint8_t *fin = malloc((size_t)bpr * H); if (fin) memcpy(fin, c, (size_t)bpr * H);
 					for (uint32_t k = 0; k < e->_ndraw && k < 12; k++) {
 						memcpy(e.target.bo->cpu, save, (size_t)bpr * H);
 						uint32_t v2 = 0, f2 = sm_pass(&desc, &heap, e.target.bo->gpu, W, H, bpr, e.packed, bgra, e->_draws, k + 1, &v2, e.load);
-						uint32_t pin, pout; memcpy(&pin, c + 300 * bpr + 600 * 4, 4); memcpy(&pout, c + 1500 * bpr + 600 * 4, 4);
+						uint32_t pin, pout; memcpy(&pin, c + iy * bpr + ix * 4, 4); memcpy(&pout, c + oy * bpr + ox * 4, 4);
 						const sm_drawrec *o = &e->_draws[k]; const char *fn = o->fs ? o->fs->name : "GREEN"; if (!strncmp(fn, "sweet.frag.a1.", 14)) fn += 14;
 						slog("SweetMTL: bisect2  +d%u %.30s bl%u sf%u df%u tex %ux%u: in %08x out %08x st %x", k, fn, o->blend_on, o->rgb_sf, o->rgb_df,
 						    o->ntex ? o->tex[o->ntex - 1].w : 0, o->ntex ? o->tex[o->ntex - 1].h : 0, pin, pout, f2);
