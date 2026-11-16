@@ -3022,6 +3022,7 @@ static void sm_layer_hooks(void)
 	/* refused processes stay silent: their crash reports filled the 128 KiB pmsg log (run47, AegirPoster) */
 	if (!sm_process_allowed()) { const char *pn = getprogname(); if (pn && (!strcmp(pn, "SpringBoard") || strstr(pn, "Poster") || strstr(pn, "chrono") || strstr(pn, "Widget"))) sm_sb_hooks(); return; }
 	if (sm_is_poster(getprogname())) sm_layer_hooks();
+	if (sm_is_poster(getprogname()) || !strcmp(getprogname(), "PosterBoard")) sm_sb_hooks();   /* who sets the empty 1105x1160 image */
 	sm_fc_hook();
 	if (getprogname() && strcmp(getprogname(), "malitest")) { sm_diag_install(); sm_trace_install(self); }
 	slog("SweetMTL: +load in %s, super=%s", getprogname() ? getprogname() : "?", class_getName(class_getSuperclass(self)));
