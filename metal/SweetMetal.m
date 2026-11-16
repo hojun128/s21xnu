@@ -390,7 +390,7 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 		size_t L = strlen(sm_fail_log);
 		snprintf(sm_fail_log + L, sizeof sm_fail_log - L, "%x/s%u@%.36s; ", r, slot, sm_cur_pass);
 	}
-	if (r == 0xFFFFu || r == 0xFFFCu || (r >> 16) == 0xffff || (r && sm_is_poster(getprogname()))) {   /* posters: first fault ends their GPU use */
+	if (r == 0xFFFFu || r == 0xFFFCu || (r >> 16) == 0xffff || (r && (sm_is_poster(getprogname()) || !strcmp(getprogname(), "PosterBoard")))) {   /* guests: first fault ends their GPU use */
 		sm_gpu_off = true;
 		snprintf(sm_off_reason, sizeof sm_off_reason, "status %x slot %u in %s", r, slot, sm_cur_pass);
 		slog("SweetMTL: GPU off: %s", sm_off_reason);
@@ -2926,7 +2926,8 @@ static bool sm_process_allowed(void)
 		all = ok && strstr(ba, "sweetmetal=4") ? 2 : ok && strstr(ba, "sweetmetal=2") ? 1 : 0;
 	}
 	const char *pn = getprogname();
-	return pn && (!strcmp(pn, "malitest") || (all >= 1 && (!strcmp(pn, "backboardd") || sm_is_poster(pn))) || all == 2);
+	/* PosterBoard: refused, it left the home screen's wallpaper images all zero (opaque black rectangle, runs 128-135) */
+	return pn && (!strcmp(pn, "malitest") || (all >= 1 && (!strcmp(pn, "backboardd") || sm_is_poster(pn) || !strcmp(pn, "PosterBoard"))) || all == 2);
 }
 
 static IMP sm_orig_nextDrawable, sm_orig_setPF;
