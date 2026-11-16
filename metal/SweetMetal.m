@@ -2827,6 +2827,7 @@ static void *sm_watchdog(void *arg)
  * shared-memory pixels were all zero, made by a client process (run131). SpringBoard gets no Metal device, but the
  * bundle is loaded there: log which layers get large image contents and whether those images are empty. */
 static IMP sm_orig_setContents, sm_orig_renderInContext, sm_orig_drawHier, sm_orig_drawInContext, sm_orig_display;
+static const char *sm_cls(id o);
 /* big CPU-drawn layers (backing stores never go through -setContents:) */
 static void sm_sb_drawInContext(id self, SEL _cmd, void *ctx)
 {
