@@ -2781,18 +2781,27 @@ static void *sm_watchdog(void *arg)
 			/* test script after the lock screen (~15 min into the boot): each step reports the frame statistics of the
 			 * window since the previous step, then acts (touches), small progress shots, a final full thumbnail */
 			static int step;
-			static const long at[] = { 1000, 1080, 1160, 1250, 1330, 1430 };
+			/* adaptive start: the lock screen is "ready" once enough frames were drawn and nothing changed for 20 s (was a
+			 * fixed 1000 s from the days of 2 s frames); quick mode (default) ends after the home-screen shot, boot-arg
+			 * sweetlong=1 runs the whole script (Settings, scroll, home, Safari) */
+			static long due; static uint32_t rc; static int stable, longrun = -1;
+			if (longrun < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; longrun = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetlong=1") ? 1 : 0; }
+			if (c == rc) stable++; else { stable = 0; rc = c; }
+			static const long gap[] = { 0, 30, 80, 90, 80, 100 };
 			static const char *const what[] = { "boot", "home", "settings-open", "settings-idle", "home2", "safari" };
 			struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
 			id tg = sm_last_target;
-			if (step < 6 && ts.tv_sec >= at[step] && tg && !sm_is_poster(getprogname())) {
+			bool fire = step == 0 ? ((c >= 45 && stable >= 2) || ts.tv_sec >= 1000) : ts.tv_sec >= due;
+			if (step < 6 && fire && tg && !sm_is_poster(getprogname())) {
 				sm_perf_report(what[step], ts.tv_sec);
 				SweetMTLTexture *tx = tg;
 				int st = step++;
 				slog("SweetMTL: step %d at %lds commits=%u", st, (long)ts.tv_sec, c);
+				if (!longrun && st == 1) { step = 5; due = ts.tv_sec + 5; } else due = ts.tv_sec + (step < 6 ? gap[step] : 0);
 				if (st == 0) { sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 16); sm_swipe_up(); sm_describe = 10; }   /* lock screen shot, unlock */
 				else if (st == 1) {
-					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 22);   /* home screen (wallpaper), full rgb565 */ kern_return_t k = sm_tap(174, 571); slog("SweetMTL: step tap Settings kr=%x", k); sm_describe = 4; }
+					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 22);   /* home screen (wallpaper), full rgb565 */
+					if (longrun) { kern_return_t k = sm_tap(174, 571); slog("SweetMTL: step tap Settings kr=%x", k); sm_describe = 4; } }
 				else if (st == 2) {
 					/* settings-open shot dropped: four deferred shots overflowed the pmsg ring (run113 lost the lock screen) */
 					/* scroll the Settings list: three flicks up, then two back down, measured on their own */
@@ -2876,7 +2885,12 @@ static void sm_sb_setContents(id self, SEL _cmd, id contents)
 		    sm_cls(self), nm ? nm.UTF8String : "-", sm_cls(dl), sm_cls(sup), sm_cls(sdl));
 		if (zero == 1) { static int nb; if (nb++ < 2) { NSArray *st = [NSThread callStackSymbols]; for (NSUInteger i = 1; i < st.count && i < 16; i++) slog("SweetMTL: SB bt %.140s", [st[i] UTF8String]); } }
 	} else {
-		static int nl; if (nl++ < 12) slog("SweetMTL: SB contents (%s) layer %s delegate %s", object_getClassName(contents), sm_cls(self), sm_cls(dl));
+		CGRect b = ((CGRect (*)(id, SEL))objc_msgSend)(self, @selector(bounds));
+		double sc = ((double (*)(id, SEL))objc_msgSend)(self, @selector(contentsScale));
+		if (b.size.width * sc < 600 && b.size.height * sc < 600) return;
+		BOOL op = ((BOOL (*)(id, SEL))objc_msgSend)(self, @selector(isOpaque));
+		static int nl; if (nl++ < 30) slog("SweetMTL: SB contents (%s) %.0fx%.0fpx opaque %d layer %.50s delegate %.50s super %.40s/%.40s", object_getClassName(contents),
+		    b.size.width * sc, b.size.height * sc, op, sm_cls(self), sm_cls(dl), sm_cls(sup), sm_cls(sdl));
 	}
 }
 static void sm_sb_renderInContext(id self, SEL _cmd, void *ctx)
@@ -3020,9 +3034,9 @@ static void sm_layer_hooks(void)
 + (void)load
 {
 	/* refused processes stay silent: their crash reports filled the 128 KiB pmsg log (run47, AegirPoster) */
-	if (!sm_process_allowed()) { const char *pn = getprogname(); if (pn && (!strcmp(pn, "SpringBoard") || strstr(pn, "Poster") || strstr(pn, "chrono") || strstr(pn, "Widget"))) sm_sb_hooks(); return; }
+	if (!sm_process_allowed()) { if (getprogname()) sm_sb_hooks(); return; }   /* every refused process gets the layer diagnostics */
 	if (sm_is_poster(getprogname())) sm_layer_hooks();
-	if (sm_is_poster(getprogname()) || !strcmp(getprogname(), "PosterBoard")) sm_sb_hooks();   /* who sets the empty 1105x1160 image */
+	if (strcmp(getprogname(), "backboardd") && strcmp(getprogname(), "malitest")) sm_sb_hooks();   /* who sets the empty 1105x1160 image */
 	sm_fc_hook();
 	if (getprogname() && strcmp(getprogname(), "malitest")) { sm_diag_install(); sm_trace_install(self); }
 	slog("SweetMTL: +load in %s, super=%s", getprogname() ? getprogname() : "?", class_getName(class_getSuperclass(self)));
