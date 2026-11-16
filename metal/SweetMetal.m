@@ -37,7 +37,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB " };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -2902,6 +2902,43 @@ static void sm_sb_hooks(void)
 	slog("SweetMTL: SB hooks in %s: setContents %d renderInContext %d drawHier %d", getprogname(), sm_orig_setContents != NULL, sm_orig_renderInContext != NULL, sm_orig_drawHier != NULL);
 }
 
+
+/* ------------------------------------------------------------------ heaps
+ * PosterBoard sizes heap textures with -newTextureLayoutWithDescriptor:isHeapOrBufferBacked: and allocates from MTLHeaps
+ * (run136). Heap resources are plain independent allocations here (no aliasing); sizes are honest estimates. */
+static uint64_t sm_tex_bytes(MTLTextureDescriptor *d)
+{
+	uint64_t bpr = ((uint64_t)d.width * sm_pf_bpp(d.pixelFormat) + 63) & ~63ULL, sz = bpr * (d.height ? d.height : 1);
+	uint32_t bh = 0, bw = sm_astc(d.pixelFormat, &bh, NULL);
+	if (bw) sz = (uint64_t)((d.width + bw - 1) / bw) * ((d.height + bh - 1) / bh) * 16;
+	if (d.mipmapLevelCount > 1) sz = sz * 4 / 3;
+	sz *= (d.arrayLength ? d.arrayLength : 1) * (d.depth ? d.depth : 1) * (d.textureType == MTLTextureTypeCube ? 6 : 1);
+	return (sz + 0x3FFF) & ~0x3FFFULL;
+}
+@interface SweetMTLTextureLayout : SweetMTLObject
+@property (nonatomic) NSUInteger size, alignment, watermark;
+@end
+@implementation SweetMTLTextureLayout
+@end
+@interface SweetMTLHeap : SweetMTLObject
+@property (nonatomic) NSUInteger size, usedSize;
+@property (nonatomic) MTLStorageMode storageMode;
+@property (nonatomic) MTLCPUCacheMode cpuCacheMode;
+@property (nonatomic) MTLHazardTrackingMode hazardTrackingMode;
+@property (nonatomic) MTLResourceOptions resourceOptions;
+@property (nonatomic) MTLHeapType type;
+@property (nonatomic, weak) id dev;
+@end
+@implementation SweetMTLHeap
+- (NSUInteger)currentAllocatedSize { return self.size; }
+- (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)a { return self.size > self.usedSize ? self.size - self.usedSize : 0; }
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d { self.usedSize += sm_tex_bytes(d); return [self.dev newTextureWithDescriptor:d]; }
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)off { return [self newTextureWithDescriptor:d]; }
+- (id)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)o { self.usedSize += (len + 0x3FFF) & ~(NSUInteger)0x3FFF; return [self.dev newBufferWithLength:len options:o]; }
+- (id)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)o offset:(NSUInteger)off { return [self newBufferWithLength:len options:o]; }
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)st { return MTLPurgeableStateNonVolatile; }
+@end
+
 @interface SweetMTLDevice : _MTLDevice <MTLDevice, MTLDeviceSPI>
 @end
 
@@ -3121,6 +3158,20 @@ static void sm_layer_hooks(void)
 - (id)newLibraryWithFile:(NSString *)path error:(NSError **)err { if (err) *err = nil; return [SweetMTLLibrary new]; }
 - (id)newDefaultLibrary { return [SweetMTLLibrary new]; }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d { return [[SweetMTLTexture alloc] initWithDevice:self descriptor:d]; }
+- (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBacked:(BOOL)hb
+{
+	SweetMTLTextureLayout *l = [SweetMTLTextureLayout new]; l.size = sm_tex_bytes(d); l.alignment = 0x4000; l.watermark = l.size;
+	return l;
+}
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d { MTLSizeAndAlign r = { sm_tex_bytes(d), 0x4000 }; return r; }
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)len options:(MTLResourceOptions)o { MTLSizeAndAlign r = { (len + 0x3FFF) & ~(NSUInteger)0x3FFF, 0x4000 }; return r; }
+- (id)newHeapWithDescriptor:(MTLHeapDescriptor *)hd
+{
+	SweetMTLHeap *h = [SweetMTLHeap new]; h.size = hd.size; h.storageMode = hd.storageMode; h.cpuCacheMode = hd.cpuCacheMode; h.type = MTLHeapTypeAutomatic; h.dev = self;
+	h.resourceOptions = hd.resourceOptions; h.hazardTrackingMode = hd.hazardTrackingMode;
+	static int nl; if (nl++ < 6) slog("SweetMTL: heap %lu bytes in %s", (unsigned long)hd.size, getprogname());
+	return h;
+}
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)ios plane:(NSUInteger)plane
 {
 	return [[SweetMTLTexture alloc] initWithDevice:self descriptor:d iosurface:ios plane:plane];
