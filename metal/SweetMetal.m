@@ -2768,6 +2768,7 @@ static void sm_remote_stack(int pid, const char *nm, int nthreads)
 			if (vm_read_overwrite(t, (vm_address_t)fp, 16, (vm_address_t)fr, &got) || got != 16) break;
 			pcs[np++] = fr[1] & 0xFFFFFFFFFULL; fp = fr[0];
 		}
+		{ char a0[70]; sm_symof(pcs[0], a0, sizeof a0); if (nthreads > 3 && (strstr(a0, "__workq_kernreturn") || strstr(a0, "start_wqthread"))) continue; }   /* idle workers */
 		for (int k = 0; k < np; k += 2) {
 			char a[70], b[70];
 			slog("SweetMTL: bootdiag %s T%u %d: %s < %s", nm, i, k, sm_symof(pcs[k], a, sizeof a), k + 1 < np ? sm_symof(pcs[k + 1], b, sizeof b) : "-");
@@ -2783,14 +2784,14 @@ static void sm_boot_diag(long sec)
 		if (!strcmp(nm, "SpringBoard")) sb = pids[i];
 		if (!strcmp(nm, "backboardd")) sbd = pids[i];
 		int k = snprintf(line + L, sizeof line - L, " %.14s", nm);
-		if (L + k >= 128) { slog("SweetMTL: %s", line); L = snprintf(line, sizeof line, "bootdiag +"); k = snprintf(line + L, sizeof line - L, " %.14s", nm); }
+		if (L + k >= 128) { L = snprintf(line, sizeof line, "bootdiag +"); k = snprintf(line + L, sizeof line - L, " %.14s", nm); }
 		L += k;
 	}
-	slog("SweetMTL: %s", line);
-	(void)sbd;
-	if (sb) sm_remote_stack(sb, "SpringBoard", 2); else slog("SweetMTL: bootdiag no SpringBoard yet");
+	(void)line; (void)sbd;
+	(void)sb;
 	for (int i = 0; i < n; i++) { char nm[40] = "?"; proc_name(pids[i], nm, sizeof nm);
-		if (!strcmp(nm, "launchd") || !strcmp(nm, "mobileactivationd") || !strcmp(nm, "keybagd") || !strcmp(nm, "runningboardd") || !strcmp(nm, "installd") || !strcmp(nm, "lsd")) sm_remote_stack(pids[i], nm, 1); }
+		if (!strcmp(nm, "lsd")) sm_remote_stack(pids[i], nm, 14);
+		else if (!strcmp(nm, "installd") || !strcmp(nm, "containermanagerd") || !strcmp(nm, "amfid") || !strcmp(nm, "trustd") || !strcmp(nm, "mobile_installation_proxy")) sm_remote_stack(pids[i], nm, 3); }
 }
 static void sm_dump_threads(void)
 {
@@ -2869,8 +2870,8 @@ static void *sm_watchdog(void *arg)
 			if (bd < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; bd = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetbootdiag=1") && !strcmp(getprogname(), "backboardd") ? 1 : 0; }
 			if (bd) {
 				struct timespec bt; clock_gettime(CLOCK_MONOTONIC, &bt);
-				if ((nd == 0 && bt.tv_sec >= 150) || (nd == 1 && bt.tv_sec >= 420)) { nd++; sm_boot_diag(bt.tv_sec); }
-				else if (nd == 2 && bt.tv_sec >= 440) { nd++; slog("SweetMTL: bootdiag done, rebooting to recovery"); IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL); }
+				if ((nd == 0 && bt.tv_sec >= 120) || (nd == 1 && bt.tv_sec >= 260)) { nd++; sm_boot_diag(bt.tv_sec); }
+				else if (nd == 2 && bt.tv_sec >= 280) { nd++; slog("SweetMTL: bootdiag done, rebooting to recovery"); IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL); }
 			}
 		}
 		if (t % (sm_is_poster(getprogname()) ? 30 : 3) == 0) {
