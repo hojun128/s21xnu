@@ -36,7 +36,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1528,6 +1528,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (NSUInteger)gpuHeight;
 - (bool)sm_noflush;
 - (bool)sm_isShadowed;
+- (bool)sm_allZero;
 - (uint32_t)maliFormat;
 - (uint32_t)maliSwizzle;
 - (uint32_t)bpp;
@@ -1540,9 +1541,11 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	NSUInteger _dec, _gw, _gh;   /* CPU-decoded ASTC: downscale factor and the stored (GPU) size */
 	const uint8_t *_lazy; NSUInteger _lazyLen, _lazyBpr; uint64_t _lazySum; void (^_lazyDl)(void *, NSUInteger);   /* no-copy ASTC: client fills it later */
 	uint8_t _swz[4];            /* descriptor channel swizzle (MTLTextureSwizzle: 0 zero, 1 one, 2 R, 3 G, 4 B, 5 A) */
+	bool _allZero;              /* last full CPU upload was entirely zero (no content yet) */
 	bool _priv, _cpuDirty;      /* MTLStorageModePrivate: only the GPU touches it, so no cache flush unless we wrote it on the CPU */
 }
 - (bool)sm_isShadowed { return _hasShadow; }
+- (bool)sm_allZero { return _allZero; }
 /* true when this texture can skip the pre-job cache flush: private and not written by the CPU since the last flush */
 - (bool)sm_noflush
 {
@@ -1728,6 +1731,12 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl withBytes:(const void *)src bytesPerRow:(NSUInteger)bpr
 {
 	_cpuDirty = true;
+	if (src && !sm_astc(_pixelFormat, NULL, NULL) && r.origin.x == 0 && r.origin.y == 0 && r.size.width == _width && r.size.height == _height) {
+		/* whole-image upload: remember whether it carried any content (sampled every 7th byte of every 4th row) */
+		const uint8_t *c = src; bool any = false; NSUInteger rb = r.size.width * sm_pf_bpp(_pixelFormat);
+		for (NSUInteger y = 0; y < r.size.height && !any; y += 4) for (NSUInteger x = 0; x < rb; x += 7) if (c[y * bpr + x]) { any = true; break; }
+		_allZero = !any;
+	} else if (src) _allZero = false;
 	if (r.size.width >= 300 && src && !sm_astc(_pixelFormat, NULL, NULL)) {
 		uint64_t nz = 0, nn = 0; const uint8_t *c = src;
 		for (NSUInteger y = 0; y < r.size.height; y += r.size.height / 16 + 1) for (NSUInteger x = 0; x < r.size.width * sm_pf_bpp(_pixelFormat); x += 61) { nn++; if (c[y * bpr + x]) nz++; }
@@ -1931,6 +1940,17 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		r->has_scissor = 1; r->sc_x0 = x0; r->sc_y0 = y0; r->sc_x1 = x1 - 1; r->sc_y1 = y1 - 1;
 	}
 	if (_pipeline.fs && _pipeline.fs->bad) { _skipped++; return NULL; }
+	if (_pipeline.fs && strstr(_pipeline.fs->name, "Ixrg")) {
+		/* opaque-image draw (alpha ignored) of a texture whose content never arrived (all-zero upload): it would paint a solid
+		 * black rectangle over the home screen wallpaper (run128 bisect). Skip it until the content source is fixed. */
+		for (uint32_t k = 0; k < 8; k++) {
+			SweetMTLTexture *t = _tex[k];
+			if (t && [t isKindOfClass:[SweetMTLTexture class]] && [t sm_allZero]) {
+				static int nl; if (nl++ < 4) slog("SweetMTL: skipped empty opaque image %lux%lu (%s)", (unsigned long)t.width, (unsigned long)t.height, _pipeline.fs->name);
+				_skipped++; return NULL;
+			}
+		}
+	}
 	{
 		/* run124 experiment: skip the backdrop colour-matrix draws (TimgBvcm*, TimgBdso*): suspected to paint the black
 		 * rectangle over the home screen wallpaper. Boot-arg sweetbvcm=1 keeps them. */
