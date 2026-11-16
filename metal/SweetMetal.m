@@ -3163,9 +3163,26 @@ static void sm_layer_hooks(void)
 	static bool dumped;
 	if (!dumped) {
 		/* the texture-layout protocol is private: log its methods with type encodings (selectors split over lines) */
-		dumped = true; unsigned np = 0; Protocol * __unsafe_unretained *pl = objc_copyProtocolList(&np);
+		dumped = true;
+		{
+			/* classes implementing the texture-memory methods (Metal / driver internals): full selectors + type encodings */
+			unsigned nc = 0; Class *cl = objc_copyClassList(&nc); int nout = 0;
+			for (unsigned i = 0; i < nc && nout < 40; i++) {
+				unsigned nm = 0; Method *ml = class_copyMethodList(cl[i], &nm);
+				for (unsigned k = 0; k < nm && nout < 40; k++) {
+					const char *sn = sel_getName(method_getName(ml[k]));
+					if (!strstr(sn, "TextureMemory") && !strstr(sn, "LinearBytes")) continue;
+					nout++; size_t L = strlen(sn);
+					for (size_t o = 0; o < L; o += 100) slog("SweetMTL: proto %s %.100s", class_getName(cl[i]), sn + o);
+					slog("SweetMTL: proto types %.120s", method_getTypeEncoding(ml[k]) ? method_getTypeEncoding(ml[k]) : "-");
+				}
+				free(ml);
+			}
+			free(cl);
+		}
+		unsigned np = 0; Protocol * __unsafe_unretained *pl = objc_copyProtocolList(&np);
 		for (unsigned i = 0; i < np; i++) {
-			const char *pn = protocol_getName(pl[i]); if (!strstr(pn, "TextureLayout")) continue;
+			const char *pn = protocol_getName(pl[i]); if (!strstr(pn, "TextureLayout") && !strstr(pn, "TextureMemory")) continue;
 			for (int req = 0; req < 2; req++) {
 				unsigned nm = 0; struct objc_method_description *md = protocol_copyMethodDescriptionList(pl[i], req, YES, &nm);
 				for (unsigned k = 0; k < nm; k++) {
