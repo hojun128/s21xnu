@@ -95,6 +95,11 @@ def build(seed=None, qemu=False, highmem=False):
         ('dram-base', u64(phys_base)),
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
+        # MobileGestalt builds the UDID from the Wi-Fi/Bluetooth addresses: without these it waits (with a long
+        # timeout, on every query) for a Wi-Fi IONetworkController that never appears, which stalled lsd's database
+        # reseed and SpringBoard for ~15 minutes on every boot. Locally administered stand-ins.
+        ('mac-address-wifi0', bytes([0x02, 0x53, 0x32, 0x31, 0x00, 0x01])),
+        ('mac-address-bluetooth0', bytes([0x02, 0x53, 0x32, 0x31, 0x00, 0x02])),
         ('debug-enabled', u32(1)),
         ('embedded-panic-log-size', u32(PANIC_LOG_SIZE)),
         ('firmware-version', cstr('sweet-shim')),
