@@ -36,7 +36,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt " };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1531,6 +1531,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (bool)sm_noflush;
 - (bool)sm_isShadowed;
 - (bool)sm_allZero;
+- (void)sm_writeback;
 - (uint32_t)maliFormat;
 - (uint32_t)maliSwizzle;
 - (uint32_t)bpp;
@@ -1544,10 +1545,31 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	const uint8_t *_lazy; NSUInteger _lazyLen, _lazyBpr; uint64_t _lazySum; void (^_lazyDl)(void *, NSUInteger);   /* no-copy ASTC: client fills it later */
 	uint8_t _swz[4];            /* descriptor channel swizzle (MTLTextureSwizzle: 0 zero, 1 one, 2 R, 3 G, 4 B, 5 A) */
 	bool _allZero;              /* last full CPU upload was entirely zero (no content yet) */
+	int8_t _wbOK;               /* shadow write-back target writable: -1 unknown, 0 no, 1 yes */
 	bool _priv, _cpuDirty;      /* MTLStorageModePrivate: only the GPU touches it, so no cache flush unless we wrote it on the CPU */
 }
 - (bool)sm_isShadowed { return _hasShadow; }
 - (bool)sm_allZero { return _allZero; }
+/* GPU wrote this texture: copy an aligned shadow back to the memory it stands for (client buffer / IOSurface). Without it
+ * snapshots rendered into 16-byte-pitch shared buffers stayed all zero for their readers (the home screen black
+ * rectangle: an opaque snapshot image that came back empty, run131), and the next sm_sync overwrote the GPU's output. */
+- (void)sm_writeback
+{
+	if (_view && [_parent isKindOfClass:[SweetMTLTexture class]]) { [(SweetMTLTexture *)_parent sm_writeback]; return; }
+	if (!_hasShadow || !_src || !_shadow.cpu) return;
+	NSUInteger rb = _width * sm_pf_bpp(_pixelFormat); if (rb > _srcBpr) rb = _srcBpr;
+	if (_wbOK < 0) {
+		vm_address_t a = (vm_address_t)_src; vm_size_t sz = 0; natural_t depth = 4;
+		vm_region_submap_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+		kern_return_t kr = vm_region_recurse_64(mach_task_self(), &a, &sz, &depth, (vm_region_recurse_info_t)&info, &cnt);
+		uint64_t need = (uint64_t)_srcBpr * (_height ? _height - 1 : 0) + rb;
+		_wbOK = (!kr && a <= (vm_address_t)_src && (info.protection & VM_PROT_WRITE) && (uint64_t)((vm_address_t)_src - a) + need <= sz) ? 1 : 0;
+		static int nl; if (nl++ < 8) slog("SweetMTL: shadow writeback %lux%lu pf%lu src bpr %lu -> %s (prot %x tag %u)", (unsigned long)_width, (unsigned long)_height,
+		    (unsigned long)_pixelFormat, (unsigned long)_srcBpr, _wbOK ? "on" : "off", kr ? 0 : info.protection, kr ? 0 : info.user_tag);
+	}
+	if (_wbOK != 1) return;
+	for (NSUInteger y = 0; y < _height; y++) memcpy((uint8_t *)_src + y * _srcBpr, _shadow.cpu + y * _bytesPerRow, rb);
+}
 /* true when this texture can skip the pre-job cache flush: private and not written by the CPU since the last flush */
 - (bool)sm_noflush
 {
@@ -1608,7 +1630,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		/* Mali linear planes need a 64-byte aligned pitch (run34): sample from an aligned copy, refreshed per draw */
 		NSUInteger abpr = (_width * sm_pf_bpp(_pixelFormat) + 63) & ~(NSUInteger)63;
 		if (!sm_bo_alloc(&_shadow, abpr * (_height ? _height : 1))) return nil;
-		_hasShadow = true; _src = client ? client + off : _store.cpu; _srcBpr = bpr;
+		_hasShadow = true; _src = client ? client + off : _store.cpu; _srcBpr = bpr; _wbOK = -1;
 		_store = _shadow; _bytesPerRow = abpr;
 		[self sm_sync];
 	}
@@ -1671,7 +1693,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		 * copy refreshed before every draw instead of the surface itself */
 		NSUInteger abpr = (_width * sm_pf_bpp(_pixelFormat) + 63) & ~(NSUInteger)63;
 		if (!sm_bo_alloc(&_shadow, abpr * (_height ? _height : 1))) return nil;
-		_hasShadow = true; _src = base; _srcBpr = _bytesPerRow;
+		_hasShadow = true; _src = base; _srcBpr = _bytesPerRow; _wbOK = -1;
 		_store = _shadow; _bytesPerRow = abpr;
 		[self sm_sync];
 	} else if (!sm_bo_import(&_store, base, (uint64_t)_bytesPerRow * _height)) return nil;
@@ -2157,6 +2179,7 @@ typedef struct {
 		uint32_t st = sm_submit(1, PV);
 		static int nl; if (st || nl++ < 6) slog("SweetMTL: compute run %s %ux%u groups of %ux%u -> %x", d->name, d->cnt[0], d->cnt[1], d->wg[0], d->wg[1], st);
 	}
+	if (_nd) for (uint32_t k = 0; k < 4; k++) if (_tex[k]) [_tex[k] sm_writeback];   /* compute may write any bound texture */
 	_nd = 0;
 }
 @end
@@ -2522,11 +2545,13 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 				slog("SweetMTL: target %ux%u fmt %lu nz=%u/16 hash=%08x diag %08x %08x %08x %08x", W, H, (unsigned long)e.target.pixelFormat, nz, hsh, px[0], px[1], px[2], px[3]);
 			}
 			if (_lastJobStatus != 0 || vs != 0) _status = 5;
+			[e.target sm_writeback];
 		} else if (e.clear) {
 			_lastJobStatus = sm_clear(&desc, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
 			    (uint32_t)e.target.bytesPerRow, e.packed, bgra);
 			slog("SweetMTL: clear %lux%lu job status=%x", (unsigned long)e.target.width, (unsigned long)e.target.height, _lastJobStatus);
 			if (_lastJobStatus != 0) _status = 5;
+			[e.target sm_writeback];
 		}
 	}
 	pthread_mutex_unlock(&sm_commit_mx);
