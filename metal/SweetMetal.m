@@ -1,4 +1,5 @@
 #include <dlfcn.h>
+#include <pthread.h>
 #include <objc/message.h>
 /*
  * SweetMetal.bundle: Metal driver plugin for the S21 Mali-G78 (phase 1 skeleton).
@@ -153,23 +154,36 @@ static bool sm_bo_alloc(sm_bo *bo, uint64_t size)
 extern kern_return_t IOConnectUnmapMemory64(io_connect_t, uint32_t, task_port_t, mach_vm_address_t);
 /* live GPU memory (for the alive line) and recycled GPU VA ranges: the kernel never frees page-table pages,
  * so an ever-growing VA cursor slowly exhausts its 1 MiB table pool */
-static struct { uint64_t va, size; } sm_vfree[512]; static uint32_t sm_vfree_n;
+static struct { uint64_t va, size; } sm_vfree[4096]; static uint32_t sm_vfree_n;
+static pthread_mutex_t sm_va_mx = PTHREAD_MUTEX_INITIALIZER;
+/* sorted, coalescing free list of GPU VA ranges, best fit: the old unsorted 512-entry list fragmented, dropped ranges
+ * when full and pushed the cursor up until the kernel's page-table pool ran dry (bo alloc failures, run155/156) */
 static uint64_t sm_va_take(uint64_t size)
 {
-	for (uint32_t i = 0; i < sm_vfree_n; i++) {
-		if (sm_vfree[i].size >= size) {
-			uint64_t va = sm_vfree[i].va;
-			sm_vfree[i].va += size; sm_vfree[i].size -= size;
-			if (!sm_vfree[i].size) sm_vfree[i] = sm_vfree[--sm_vfree_n];
-			return va;
-		}
-	}
-	uint64_t va = sm_next_va; sm_next_va += size;
+	pthread_mutex_lock(&sm_va_mx);
+	int best = -1;
+	for (uint32_t i = 0; i < sm_vfree_n; i++)
+		if (sm_vfree[i].size >= size && (best < 0 || sm_vfree[i].size < sm_vfree[best].size)) { best = (int)i; if (sm_vfree[i].size == size) break; }
+	uint64_t va;
+	if (best >= 0) {
+		va = sm_vfree[best].va; sm_vfree[best].va += size; sm_vfree[best].size -= size;
+		if (!sm_vfree[best].size) { memmove(&sm_vfree[best], &sm_vfree[best + 1], (sm_vfree_n - best - 1) * sizeof sm_vfree[0]); sm_vfree_n--; }
+	} else { va = sm_next_va; sm_next_va += size; }
+	pthread_mutex_unlock(&sm_va_mx);
 	return va;
 }
 static void sm_va_give(uint64_t va, uint64_t size)
 {
-	if (sm_vfree_n < 512) { sm_vfree[sm_vfree_n].va = va; sm_vfree[sm_vfree_n].size = size; sm_vfree_n++; }
+	pthread_mutex_lock(&sm_va_mx);
+	uint32_t i = 0; while (i < sm_vfree_n && sm_vfree[i].va < va) i++;
+	bool prev = i > 0 && sm_vfree[i - 1].va + sm_vfree[i - 1].size == va, next = i < sm_vfree_n && va + size == sm_vfree[i].va;
+	if (prev && next) { sm_vfree[i - 1].size += size + sm_vfree[i].size; memmove(&sm_vfree[i], &sm_vfree[i + 1], (sm_vfree_n - i - 1) * sizeof sm_vfree[0]); sm_vfree_n--; }
+	else if (prev) sm_vfree[i - 1].size += size;
+	else if (next) { sm_vfree[i].va = va; sm_vfree[i].size += size; }
+	else if (sm_vfree_n < sizeof sm_vfree / sizeof sm_vfree[0]) { memmove(&sm_vfree[i + 1], &sm_vfree[i], (sm_vfree_n - i) * sizeof sm_vfree[0]); sm_vfree[i].va = va; sm_vfree[i].size = size; sm_vfree_n++; }
+	/* the top range touching the cursor goes back to the cursor */
+	if (sm_vfree_n && sm_vfree[sm_vfree_n - 1].va + sm_vfree[sm_vfree_n - 1].size == sm_next_va) { sm_next_va = sm_vfree[sm_vfree_n - 1].va; sm_vfree_n--; }
+	pthread_mutex_unlock(&sm_va_mx);
 }
 void sm_va_give_ext(uint64_t va, uint64_t size) { sm_va_give(va, size); }
 static void sm_bo_free(sm_bo *bo)

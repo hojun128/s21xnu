@@ -182,18 +182,34 @@ wait_reg(uint32_t off, uint32_t mask, uint32_t want, uint32_t ms)
 }
 
 /* ---- RAM pool: page tables and GPU buffers come from the unmanaged scratch window ---- */
+/* freed page-table pages (a context's tables go back when it is destroyed: AegirPoster restarts used to leak them
+ * until the 2 MiB pool was empty and every later GPU allocation failed, run155/156) */
+static uint32_t pool_free_idx[1024], pool_nfree;
 static uint64_t
 pool_alloc(void)
 {
-	if (mali.pool_next >= mali.pool_pages) {
+	uint32_t i;
+	if (pool_nfree) {
+		i = pool_free_idx[--pool_nfree];
+	} else if (mali.pool_next < mali.pool_pages) {
+		i = mali.pool_next++;
+	} else {
 		return 0;
 	}
-	uint32_t i = mali.pool_next++;
 	volatile uint32_t *p = (volatile uint32_t *)(mali.pool_va + ((vm_offset_t)i << 12));
 	for (uint32_t k = 0; k < 1024; k++) {
 		p[k] = 0;
 	}
 	return mali.pool_pa + ((uint64_t)i << 12);
+}
+
+static void
+pool_free_pa(uint64_t pa)
+{
+	if (pa < mali.pool_pa || pa >= mali.pool_pa + ((uint64_t)mali.pool_pages << 12) || pool_nfree >= 1024) {
+		return;
+	}
+	pool_free_idx[pool_nfree++] = (uint32_t)((pa - mali.pool_pa) >> 12);
 }
 
 static volatile uint32_t *
@@ -623,7 +639,38 @@ sweet_mali_ctx_destroy(int id)
 		return;
 	}
 	ctx_deactivate(&ctxs[id]);
-	ctx_used[id] = 0;      /* table pages stay in the pool (no free list yet) */
+	/* return the context's page-table pages (levels 0..2 tables and the level-3 leaf tables, not the mapped pages) */
+	{
+		uint64_t pgd = ctxs[id].pgd_pa;
+		volatile uint32_t *t0 = pa2va(pgd);
+		for (uint32_t a = 0; a < 512; a++) {
+			uint64_t e0 = (uint64_t)t0[a * 2] | ((uint64_t)t0[a * 2 + 1] << 32);
+			if ((e0 & 3ULL) != 3ULL) {
+				continue;
+			}
+			uint64_t p1 = e0 & 0x0000FFFFFFFFF000ULL;
+			volatile uint32_t *t1 = pa2va(p1);
+			for (uint32_t b = 0; b < 512; b++) {
+				uint64_t e1 = (uint64_t)t1[b * 2] | ((uint64_t)t1[b * 2 + 1] << 32);
+				if ((e1 & 3ULL) != 3ULL) {
+					continue;
+				}
+				uint64_t p2 = e1 & 0x0000FFFFFFFFF000ULL;
+				volatile uint32_t *t2 = pa2va(p2);
+				for (uint32_t c = 0; c < 512; c++) {
+					uint64_t e2 = (uint64_t)t2[c * 2] | ((uint64_t)t2[c * 2 + 1] << 32);
+					if ((e2 & 3ULL) == 3ULL) {
+						pool_free_pa(e2 & 0x0000FFFFFFFFF000ULL);
+					}
+				}
+				pool_free_pa(p2);
+			}
+			pool_free_pa(p1);
+		}
+		pool_free_pa(pgd);
+		ctxs[id].pgd_pa = 0;
+	}
+	ctx_used[id] = 0;
 }
 
 int
