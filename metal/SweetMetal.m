@@ -2893,7 +2893,7 @@ static void *sm_watchdog(void *arg)
 			{ static uint32_t h1, h2; stable = (c - h2 <= 3) ? 2 : 0; h2 = h1; h1 = c; (void)rc; }
 			{ static const uint32_t mk[] = { 5, 20, 40, 50, 60 }; static int nmk; struct timespec t2; clock_gettime(CLOCK_MONOTONIC, &t2);
 			  while (nmk < 5 && c >= mk[nmk]) { slog("SweetMTL: step mark commits>=%u at %lds (now %u) target %d", mk[nmk], (long)t2.tv_sec, c, sm_last_target != nil); nmk++; } }
-			static const long gap[] = { 0, 30, 80, 90, 80, 100 };
+			static const long gap[] = { 0, 90, 80, 90, 80, 100 };   /* home shot 90 s after the unlock: dock material and widgets load late after a fast boot */
 			static const char *const what[] = { "boot", "home", "settings-open", "settings-idle", "home2", "safari" };
 			struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
 			id tg = sm_last_target;
