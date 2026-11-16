@@ -36,7 +36,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1170,6 +1170,7 @@ static __weak id sm_device;
 }
 @end
 
+static void sm_bt_kept(void);
 @class SweetMTLTexture;
 @interface SweetMTLBuffer : SweetMTLObject
 @property (nonatomic, readonly) NSUInteger length;
@@ -1736,6 +1737,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		const uint8_t *c = src; bool any = false; NSUInteger rb = r.size.width * sm_pf_bpp(_pixelFormat);
 		for (NSUInteger y = 0; y < r.size.height && !any; y += 4) for (NSUInteger x = 0; x < rb; x += 7) if (c[y * bpr + x]) { any = true; break; }
 		_allZero = !any;
+		if (!any && r.size.width >= 1000) { static int nb; if (nb++ < 2) { slog("SweetMTL: empty upload %lux%lu pf%lu bt:", (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)_pixelFormat); sm_bt_kept(); } }
 	} else if (src) _allZero = false;
 	if (r.size.width >= 300 && src && !sm_astc(_pixelFormat, NULL, NULL)) {
 		uint64_t nz = 0, nn = 0; const uint8_t *c = src;
@@ -2585,6 +2587,16 @@ static void sm_sym(const char *tag, void *pc)
 	else
 		slog("SweetMTL: %s %p (%s+0x%lx)", tag, pc, di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?",
 		    (unsigned long)((char *)pc - (char *)di.dli_fbase));
+}
+/* backtrace into the kept lines (prefix "ebt") */
+static void sm_bt_kept(void)
+{
+	void *f[20]; int n = backtrace(f, 20);
+	for (int i = 1; i < n; i++) {
+		Dl_info di; memset(&di, 0, sizeof di); dladdr(f[i], &di);
+		const char *lib = di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?";
+		slog("SweetMTL: ebt %d %.24s %.90s+0x%lx", i, lib, di.dli_sname ? di.dli_sname : "?", (unsigned long)((char *)f[i] - (char *)(di.dli_saddr ? di.dli_saddr : di.dli_fbase)));
+	}
 }
 static void sm_bt(void)
 {
