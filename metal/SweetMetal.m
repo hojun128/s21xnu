@@ -350,7 +350,7 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 		for (uint32_t i = 0; i < sm_nalways; i++)
 			/* descriptors: flushed before the job only (the CPU never reads what the GPU writes there and rewrites whole
 			 * slots after a clean+invalidate); later jobs of a pass only changed the pass header */
-			ADD(sm_always[i], sm_always[i] == sm_desc_va ? (sm_jlight && slot == 0 ? 0x10000 : sm_desc_span) : 0, PRE);
+			ADD(sm_always[i], sm_always[i] == sm_desc_va ? sm_desc_span : 0, PRE | POST);   /* PRE-only lost the dock blur and widget corners (run153) */
 		for (uint32_t i = 0; i < sm_njw; i++) ADD(sm_jw[i], sm_jwl[i], slot == 1 ? PRE : PRE | POST);
 #undef ADD
 		uint64_t in4[4] = { slot, jc, 4000, sm_wc == 1 ? 2 : 0 }, o4[4] = { 0xdead, 0, 0, 0 }; uint32_t oc4 = 4;
