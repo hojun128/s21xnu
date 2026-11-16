@@ -2788,10 +2788,11 @@ static void sm_boot_diag(long sec)
 		L += k;
 	}
 	(void)line; (void)sbd;
-	if (sb) sm_remote_stack(sb, "SpringBoard", 2);
+	(void)sb;
+	int seen = 0;
 	for (int i = 0; i < n; i++) { char nm[40] = "?"; proc_name(pids[i], nm, sizeof nm);
-		if (!strcmp(nm, "lsd")) sm_remote_stack(pids[i], nm, 14);
-		else if (!strcmp(nm, "installd") || !strcmp(nm, "containermanagerd") || !strcmp(nm, "amfid") || !strcmp(nm, "trustd") || !strcmp(nm, "mobile_installation_proxy")) sm_remote_stack(pids[i], nm, 3); }
+		if (!strcmp(nm, "PosterBoard") || !strcmp(nm, "AegirPoster") || !strcmp(nm, "CollectionsPoster")) { sm_remote_stack(pids[i], nm, 14); seen |= 1; } }
+	if (!(seen & 1)) slog("SweetMTL: bootdiag %lds: no PosterBoard/AegirPoster/CollectionsPoster running yet", sec);
 }
 static void sm_dump_threads(void)
 {
@@ -2870,8 +2871,8 @@ static void *sm_watchdog(void *arg)
 			if (bd < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; bd = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetbootdiag=1") && !strcmp(getprogname(), "backboardd") ? 1 : 0; }
 			if (bd) {
 				struct timespec bt; clock_gettime(CLOCK_MONOTONIC, &bt);
-				if ((nd == 0 && bt.tv_sec >= 60) || (nd == 1 && bt.tv_sec >= 150) || (nd == 2 && bt.tv_sec >= 240)) { nd++; sm_boot_diag(bt.tv_sec); }
-				else if (nd == 3 && bt.tv_sec >= 250) { nd++; slog("SweetMTL: bootdiag done, rebooting to recovery"); IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL); }
+				if ((nd == 0 && bt.tv_sec >= 140) || (nd == 1 && bt.tv_sec >= 200) || (nd == 2 && bt.tv_sec >= 260)) { nd++; sm_boot_diag(bt.tv_sec); }
+				else if (nd == 3 && bt.tv_sec >= 270) { nd++; slog("SweetMTL: bootdiag done, rebooting to recovery"); IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL); }
 			}
 		}
 		if (t % (sm_is_poster(getprogname()) ? 30 : 3) == 0) {
