@@ -2906,6 +2906,8 @@ static BOOL sm_sb_drawHier(id self, SEL _cmd, CGRect r, BOOL after)
 }
 static void sm_sb_hooks(void)
 {
+	/* diagnostics only: boot-arg sweetdiag=1 */
+	{ char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; if (sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) != 0 || !strstr(ba, "sweetdiag=1")) return; }
 	Class L = NSClassFromString(@"CALayer"), V = NSClassFromString(@"UIView");
 	Method m;
 	if (L && (m = class_getInstanceMethod(L, @selector(setContents:)))) sm_orig_setContents = method_setImplementation(m, (IMP)sm_sb_setContents);
