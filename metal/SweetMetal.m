@@ -1,4 +1,5 @@
 #include <dlfcn.h>
+#include <objc/message.h>
 /*
  * SweetMetal.bundle: Metal driver plugin for the S21 Mali-G78 (phase 1 skeleton).
  * Loaded by Metal.framework through the kernel's IOAcceleratorES service
@@ -2825,7 +2826,28 @@ static void *sm_watchdog(void *arg)
  * The home screen showed a black rectangle: backboardd received an opaque 1105x1160 image (and a 1271x1823 one) whose
  * shared-memory pixels were all zero, made by a client process (run131). SpringBoard gets no Metal device, but the
  * bundle is loaded there: log which layers get large image contents and whether those images are empty. */
-static IMP sm_orig_setContents, sm_orig_renderInContext, sm_orig_drawHier;
+static IMP sm_orig_setContents, sm_orig_renderInContext, sm_orig_drawHier, sm_orig_drawInContext, sm_orig_display;
+/* big CPU-drawn layers (backing stores never go through -setContents:) */
+static void sm_sb_drawInContext(id self, SEL _cmd, void *ctx)
+{
+	CGRect b = ((CGRect (*)(id, SEL))objc_msgSend)(self, @selector(bounds));
+	double sc = ((double (*)(id, SEL))objc_msgSend)(self, @selector(contentsScale));
+	((void (*)(id, SEL, void *))sm_orig_drawInContext)(self, _cmd, ctx);
+	if (b.size.width * sc < 900 && b.size.height * sc < 900) return;
+	BOOL op = ((BOOL (*)(id, SEL))objc_msgSend)(self, @selector(isOpaque));
+	id dl = [self respondsToSelector:@selector(delegate)] ? [self performSelector:@selector(delegate)] : nil;
+	static int nl; if (nl++ < 24) slog("SweetMTL: SB drawInContext %s delegate %s %.0fx%.0f@%.0f opaque %d", sm_cls(self), sm_cls(dl), b.size.width, b.size.height, sc, op);
+}
+static void sm_sb_display(id self, SEL _cmd)
+{
+	((void (*)(id, SEL))sm_orig_display)(self, _cmd);
+	CGRect b = ((CGRect (*)(id, SEL))objc_msgSend)(self, @selector(bounds));
+	double sc = ((double (*)(id, SEL))objc_msgSend)(self, @selector(contentsScale));
+	if (b.size.width * sc < 900 && b.size.height * sc < 900) return;
+	id dl = [self respondsToSelector:@selector(delegate)] ? [self performSelector:@selector(delegate)] : nil;
+	BOOL op = ((BOOL (*)(id, SEL))objc_msgSend)(self, @selector(isOpaque));
+	static int nl; if (nl++ < 24) slog("SweetMTL: SB display %s delegate %s %.0fx%.0f@%.0f opaque %d", sm_cls(self), sm_cls(dl), b.size.width, b.size.height, sc, op);
+}
 static const char *sm_cls(id o) { return o ? object_getClassName(o) : "-"; }
 static void sm_sb_setContents(id self, SEL _cmd, id contents)
 {
@@ -2872,6 +2894,8 @@ static void sm_sb_hooks(void)
 	if (L && (m = class_getInstanceMethod(L, @selector(setContents:)))) sm_orig_setContents = method_setImplementation(m, (IMP)sm_sb_setContents);
 	if (L && (m = class_getInstanceMethod(L, NSSelectorFromString(@"renderInContext:")))) sm_orig_renderInContext = method_setImplementation(m, (IMP)sm_sb_renderInContext);
 	if (V && (m = class_getInstanceMethod(V, NSSelectorFromString(@"drawViewHierarchyInRect:afterScreenUpdates:")))) sm_orig_drawHier = method_setImplementation(m, (IMP)sm_sb_drawHier);
+	if (L && (m = class_getInstanceMethod(L, NSSelectorFromString(@"drawInContext:")))) sm_orig_drawInContext = method_setImplementation(m, (IMP)sm_sb_drawInContext);
+	if (L && (m = class_getInstanceMethod(L, @selector(display)))) sm_orig_display = method_setImplementation(m, (IMP)sm_sb_display);
 	slog("SweetMTL: SB hooks in %s: setContents %d renderInContext %d drawHier %d", getprogname(), sm_orig_setContents != NULL, sm_orig_renderInContext != NULL, sm_orig_drawHier != NULL);
 }
 
@@ -2932,7 +2956,7 @@ static void sm_layer_hooks(void)
 + (void)load
 {
 	/* refused processes stay silent: their crash reports filled the 128 KiB pmsg log (run47, AegirPoster) */
-	if (!sm_process_allowed()) { if (getprogname() && !strcmp(getprogname(), "SpringBoard")) sm_sb_hooks(); return; }
+	if (!sm_process_allowed()) { const char *pn = getprogname(); if (pn && (!strcmp(pn, "SpringBoard") || strstr(pn, "Poster") || strstr(pn, "chrono") || strstr(pn, "Widget"))) sm_sb_hooks(); return; }
 	if (sm_is_poster(getprogname())) sm_layer_hooks();
 	sm_fc_hook();
 	if (getprogname() && strcmp(getprogname(), "malitest")) { sm_diag_install(); sm_trace_install(self); }
