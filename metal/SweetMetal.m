@@ -1171,6 +1171,7 @@ static __weak id sm_device;
 @end
 
 static void sm_bt_kept(void);
+static void sm_region_info(const void *p);
 @class SweetMTLTexture;
 @interface SweetMTLBuffer : SweetMTLObject
 @property (nonatomic, readonly) NSUInteger length;
@@ -1737,7 +1738,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		const uint8_t *c = src; bool any = false; NSUInteger rb = r.size.width * sm_pf_bpp(_pixelFormat);
 		for (NSUInteger y = 0; y < r.size.height && !any; y += 4) for (NSUInteger x = 0; x < rb; x += 7) if (c[y * bpr + x]) { any = true; break; }
 		_allZero = !any;
-		if (!any && r.size.width >= 1000) { static int nb; if (nb++ < 2) { slog("SweetMTL: empty upload %lux%lu pf%lu bt:", (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)_pixelFormat); sm_bt_kept(); } }
+		if (!any && r.size.width >= 1000) { static int nb; if (nb++ < 2) { slog("SweetMTL: empty upload %lux%lu pf%lu bt:", (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)_pixelFormat); sm_region_info(src); sm_bt_kept(); } }
 	} else if (src) _allZero = false;
 	if (r.size.width >= 300 && src && !sm_astc(_pixelFormat, NULL, NULL)) {
 		uint64_t nz = 0, nn = 0; const uint8_t *c = src;
@@ -2588,6 +2589,14 @@ static void sm_sym(const char *tag, void *pc)
 		slog("SweetMTL: %s %p (%s+0x%lx)", tag, pc, di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?",
 		    (unsigned long)((char *)pc - (char *)di.dli_fbase));
 }
+/* VM region of a client pointer: who provided the memory (user tag, share mode) */
+static void sm_region_info(const void *p)
+{
+	vm_address_t a = (vm_address_t)p; vm_size_t sz = 0; natural_t depth = 4;
+	vm_region_submap_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+	kern_return_t kr = vm_region_recurse_64(mach_task_self(), &a, &sz, &depth, (vm_region_recurse_info_t)&info, &cnt);
+	slog("SweetMTL: ebt region %p kr %x start %lx size %lx tag %u share %u prot %x obj %x refs %u", p, kr, a, sz, info.user_tag, info.share_mode, info.protection, info.object_id, info.ref_count);
+}
 /* backtrace into the kept lines (prefix "ebt") */
 static void sm_bt_kept(void)
 {
@@ -2595,7 +2604,8 @@ static void sm_bt_kept(void)
 	for (int i = 1; i < n; i++) {
 		Dl_info di; memset(&di, 0, sizeof di); dladdr(f[i], &di);
 		const char *lib = di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?";
-		slog("SweetMTL: ebt %d %.24s %.90s+0x%lx", i, lib, di.dli_sname ? di.dli_sname : "?", (unsigned long)((char *)f[i] - (char *)(di.dli_saddr ? di.dli_saddr : di.dli_fbase)));
+		slog("SweetMTL: ebt %d %.24s %.60s+0x%lx base+0x%lx", i, lib, di.dli_sname ? di.dli_sname : "?", (unsigned long)((char *)f[i] - (char *)(di.dli_saddr ? di.dli_saddr : di.dli_fbase)),
+		    (unsigned long)((char *)f[i] - (char *)di.dli_fbase));
 	}
 }
 static void sm_bt(void)
