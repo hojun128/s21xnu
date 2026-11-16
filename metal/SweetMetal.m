@@ -36,7 +36,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -2820,6 +2820,61 @@ static void *sm_watchdog(void *arg)
 	return NULL;
 }
 
+
+/* ------------------------------------------------------------------ SpringBoard diagnostics
+ * The home screen showed a black rectangle: backboardd received an opaque 1105x1160 image (and a 1271x1823 one) whose
+ * shared-memory pixels were all zero, made by a client process (run131). SpringBoard gets no Metal device, but the
+ * bundle is loaded there: log which layers get large image contents and whether those images are empty. */
+static IMP sm_orig_setContents, sm_orig_renderInContext, sm_orig_drawHier;
+static const char *sm_cls(id o) { return o ? object_getClassName(o) : "-"; }
+static void sm_sb_setContents(id self, SEL _cmd, id contents)
+{
+	((void (*)(id, SEL, id))sm_orig_setContents)(self, _cmd, contents);
+	if (!contents) return;
+	static unsigned long (*tid)(void); static size_t (*gw)(void *), (*gh)(void *), (*gbpr)(void *); static void *(*gdp)(void *); static CFDataRef (*cpy)(void *);
+	static bool init;
+	if (!init) { init = true; tid = dlsym(RTLD_DEFAULT, "CGImageGetTypeID"); gw = dlsym(RTLD_DEFAULT, "CGImageGetWidth"); gh = dlsym(RTLD_DEFAULT, "CGImageGetHeight");
+		gbpr = dlsym(RTLD_DEFAULT, "CGImageGetBytesPerRow"); gdp = dlsym(RTLD_DEFAULT, "CGImageGetDataProvider"); cpy = dlsym(RTLD_DEFAULT, "CGDataProviderCopyData"); }
+	CFTypeRef c = (__bridge CFTypeRef)contents;
+	bool img = tid && CFGetTypeID(c) == tid();
+	if (img && gw((void *)c) < 600 && gh((void *)c) < 600) return;   /* hot path: small images are not of interest */
+	id dl = [self respondsToSelector:@selector(delegate)] ? [self performSelector:@selector(delegate)] : nil;
+	id sup = [self respondsToSelector:@selector(superlayer)] ? [self performSelector:@selector(superlayer)] : nil;
+	id sdl = sup && [sup respondsToSelector:@selector(delegate)] ? [sup performSelector:@selector(delegate)] : nil;
+	NSString *nm = [self respondsToSelector:@selector(name)] ? [self performSelector:@selector(name)] : nil;
+	if (img) {
+		size_t w = gw((void *)c), h = gh((void *)c);
+		int zero = -1; long nz = 0;
+		CFDataRef d = cpy && gdp ? cpy(gdp((void *)c)) : NULL;
+		if (d) { const uint8_t *b = CFDataGetBytePtr(d); CFIndex n = CFDataGetLength(d); for (CFIndex i = 0; i < n; i += 97) if (b[i]) nz++; zero = nz == 0; CFRelease(d); }
+		static int nl; if (nl++ < 24) slog("SweetMTL: SB contents %zux%zu bpr %zu zero %d layer %s name %.30s delegate %s super %s/%s", w, h, gbpr ? gbpr((void *)c) : 0, zero,
+		    sm_cls(self), nm ? nm.UTF8String : "-", sm_cls(dl), sm_cls(sup), sm_cls(sdl));
+		if (zero == 1) { static int nb; if (nb++ < 2) { NSArray *st = [NSThread callStackSymbols]; for (NSUInteger i = 1; i < st.count && i < 16; i++) slog("SweetMTL: SB bt %.140s", [st[i] UTF8String]); } }
+	} else {
+		static int nl; if (nl++ < 12) slog("SweetMTL: SB contents (%s) layer %s delegate %s", object_getClassName(contents), sm_cls(self), sm_cls(dl));
+	}
+}
+static void sm_sb_renderInContext(id self, SEL _cmd, void *ctx)
+{
+	static int nl; if (nl++ < 16) { id dl = [self respondsToSelector:@selector(delegate)] ? [self performSelector:@selector(delegate)] : nil;
+		slog("SweetMTL: SB renderInContext layer %s delegate %s", sm_cls(self), sm_cls(dl)); }
+	((void (*)(id, SEL, void *))sm_orig_renderInContext)(self, _cmd, ctx);
+}
+static BOOL sm_sb_drawHier(id self, SEL _cmd, CGRect r, BOOL after)
+{
+	static int nl; if (nl++ < 16) slog("SweetMTL: SB drawViewHierarchy %s %.0fx%.0f after %d", sm_cls(self), r.size.width, r.size.height, after);
+	return ((BOOL (*)(id, SEL, CGRect, BOOL))sm_orig_drawHier)(self, _cmd, r, after);
+}
+static void sm_sb_hooks(void)
+{
+	Class L = NSClassFromString(@"CALayer"), V = NSClassFromString(@"UIView");
+	Method m;
+	if (L && (m = class_getInstanceMethod(L, @selector(setContents:)))) sm_orig_setContents = method_setImplementation(m, (IMP)sm_sb_setContents);
+	if (L && (m = class_getInstanceMethod(L, NSSelectorFromString(@"renderInContext:")))) sm_orig_renderInContext = method_setImplementation(m, (IMP)sm_sb_renderInContext);
+	if (V && (m = class_getInstanceMethod(V, NSSelectorFromString(@"drawViewHierarchyInRect:afterScreenUpdates:")))) sm_orig_drawHier = method_setImplementation(m, (IMP)sm_sb_drawHier);
+	slog("SweetMTL: SB hooks in %s: setContents %d renderInContext %d drawHier %d", getprogname(), sm_orig_setContents != NULL, sm_orig_renderInContext != NULL, sm_orig_drawHier != NULL);
+}
+
 @interface SweetMTLDevice : _MTLDevice <MTLDevice, MTLDeviceSPI>
 @end
 
@@ -2877,7 +2932,7 @@ static void sm_layer_hooks(void)
 + (void)load
 {
 	/* refused processes stay silent: their crash reports filled the 128 KiB pmsg log (run47, AegirPoster) */
-	if (!sm_process_allowed()) return;
+	if (!sm_process_allowed()) { if (getprogname() && !strcmp(getprogname(), "SpringBoard")) sm_sb_hooks(); return; }
 	if (sm_is_poster(getprogname())) sm_layer_hooks();
 	sm_fc_hook();
 	if (getprogname() && strcmp(getprogname(), "malitest")) { sm_diag_install(); sm_trace_install(self); }
