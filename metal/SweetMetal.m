@@ -37,7 +37,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto " };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto ", "texmem " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -2916,9 +2916,32 @@ static uint64_t sm_tex_bytes(MTLTextureDescriptor *d)
 	return (sz + 0x3FFF) & ~0x3FFFULL;
 }
 @interface SweetMTLTextureLayout : SweetMTLObject
-@property (nonatomic) NSUInteger size, alignment, watermark;
+@property (nonatomic) NSUInteger size, alignment, watermark, rowBytes, pf, width, height;
 @end
 @implementation SweetMTLTextureLayout
+/* PosterBoard decodes images on the CPU and lays them out into "texture memory" with these (run137); our textures are
+ * linear with rowBytes = align64(width * bpp) (ASTC: block rows), so the layout is a row copy. */
+- (void)initializeTextureMemory:(void *)m {}
+- (void)finalizeTextureMemory:(void *)m {}
+- (void)copyFromLinearBytes:(const void *)src linearOffset:(NSUInteger)lo linearBytesPerRow:(NSUInteger)lbpr linearBytesPerImage:(NSUInteger)lbpi
+    toTextureMemory:(void *)dst textureSlice:(NSUInteger)sl textureLevel:(NSUInteger)lv textureRegion:(MTLRegion)r
+{
+	static int nl; if (nl++ < 6) slog("SweetMTL: texmem copy %lux%lu at %lu,%lu lbpr %lu -> rowBytes %lu slice %lu level %lu pf%lu", (unsigned long)r.size.width, (unsigned long)r.size.height,
+	    (unsigned long)r.origin.x, (unsigned long)r.origin.y, (unsigned long)lbpr, (unsigned long)self.rowBytes, (unsigned long)sl, (unsigned long)lv, (unsigned long)self.pf);
+	if (!src || !dst || sl || lv) return;
+	uint32_t bh = 0, bw = sm_astc(self.pf, &bh, NULL);
+	NSUInteger x0 = r.origin.x, y0 = r.origin.y, w = r.size.width, h = r.size.height, bpp = sm_pf_bpp(self.pf);
+	if (bw) { x0 /= bw; y0 /= bh; w = (w + bw - 1) / bw; h = (h + bh - 1) / bh; bpp = 16; }
+	NSUInteger n = w * bpp; if (n > lbpr && lbpr) n = lbpr;
+	for (NSUInteger y = 0; y < h; y++) memcpy((uint8_t *)dst + (y0 + y) * self.rowBytes + x0 * bpp, (const uint8_t *)src + lo + y * lbpr, n);
+}
+- (void)forwardInvocation:(NSInvocation *)inv
+{
+	/* unknown selector on a layout: log its full name (selectors here are long) */
+	const char *sn = sel_getName(inv.selector); size_t L = strlen(sn);
+	static int nl; if (nl++ < 6) for (size_t o = 0; o < L; o += 100) slog("SweetMTL: texmem sel %.100s", sn + o);
+	[super forwardInvocation:inv];
+}
 @end
 @interface SweetMTLHeap : SweetMTLObject
 @property (nonatomic) NSUInteger size, usedSize;
@@ -3196,6 +3219,10 @@ static void sm_layer_hooks(void)
 		free(pl);
 	}
 	SweetMTLTextureLayout *l = [SweetMTLTextureLayout new]; l.size = sm_tex_bytes(d); l.alignment = 0x4000; l.watermark = l.size;
+	l.pf = d.pixelFormat; l.width = d.width; l.height = d.height;
+	{ uint32_t bh = 0, bw = sm_astc(d.pixelFormat, &bh, NULL); l.rowBytes = bw ? (d.width + bw - 1) / bw * 16 : ((d.width * sm_pf_bpp(d.pixelFormat) + 63) & ~(NSUInteger)63); }
+	static int nl; if (nl++ < 8) slog("SweetMTL: texmem layout %lux%lu pf%lu rowBytes %lu size %lu heap/buffer %d", (unsigned long)d.width, (unsigned long)d.height,
+	    (unsigned long)d.pixelFormat, (unsigned long)l.rowBytes, (unsigned long)l.size, hb);
 	return l;
 }
 - (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d { MTLSizeAndAlign r = { sm_tex_bytes(d), 0x4000 }; return r; }
