@@ -2896,6 +2896,9 @@ static void *sm_watchdog(void *arg)
 			static const char *const what[] = { "boot", "home", "settings-open", "settings-idle", "home2", "safari" };
 			struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
 			id tg = sm_last_target;
+			/* boot-arg sweetstay=1: interactive use, no scripted touches and no reboot to recovery */
+			static int stay = -1; if (stay < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; stay = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetstay=1") ? 1 : 0; }
+			if (stay) step = 6;
 			bool fire = step == 0 ? ((c >= 50 && stable >= 2) || ts.tv_sec >= 1000) : ts.tv_sec >= due;
 			if (step < 6 && fire && tg && !sm_is_poster(getprogname())) {
 				sm_perf_report(what[step], ts.tv_sec);
