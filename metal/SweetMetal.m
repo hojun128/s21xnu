@@ -834,6 +834,9 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	if (preload) { const sm_shader *rs = sm_find(@"read_surf_frag"); if (!rs || rs->size > 0x300) preload = false; }
 	sm_jl_beginl(target_va, (uint64_t)stride * h);
 	sm_desc_span = 0x10000; uint32_t sm_slot_cur = 0x10000;
+	/* compact draw slots are opt-in (boot-arg sweetcompact=1): with them the dock blur and widget corners broke and a
+	 * fragment job page-faulted (runs 150-154); fixed 64 KiB slots as before */
+	static int compact = -1; if (compact < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; compact = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetcompact=1") ? 1 : 0; }
 	for (uint32_t i = 0; i < ndraw; i++) {
 		const sm_drawrec *r = &dr[i];
 		for (int k = 0; k < 31; k++) { sm_jl_add(r->buf[k]); sm_jl_add(r->fbuf[k]); }
@@ -942,7 +945,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		const sm_drawrec *r = &dr[i];
 		/* compact draw slots: 4 KiB of descriptors + the two shader binaries (was a fixed 64 KiB per draw, all of it
 		 * cache-flushed before and after every job: ~7 MiB x 4 per scrolling frame) */
-		uint32_t base = sm_slot_cur;
+		uint32_t base = compact ? sm_slot_cur : 0x10000 + i * SM_DRAW_STRIDE;
 		uint8_t *P = cpu + base; uint64_t PV = D + base;
 		memset(P, 0, 0x1000);
 		const sm_shader *vs = r->vs, *fs = r->fs;
@@ -950,8 +953,8 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 			slog("SweetMTL: shader too large for the draw slot (vs %u fs %u)", vs->size, fs ? fs->size : 0);
 			continue;
 		}
-		uint32_t fs_off = 0x1000 + ((vs->size + 127) & ~127u), fs_len = fs ? fs->size : (uint32_t)sizeof FS_GREEN;
-		sm_slot_cur = base + ((fs_off + fs_len + 127 + 0xFFF) & ~0xFFFu);
+		uint32_t fs_off = compact ? 0x1000 + ((vs->size + 127) & ~127u) : 0x6000, fs_len = fs ? fs->size : (uint32_t)sizeof FS_GREEN;
+		sm_slot_cur = base + (compact ? ((fs_off + fs_len + 127 + 0xFFF) & ~0xFFFu) : SM_DRAW_STRIDE);
 		sm_desc_span = sm_slot_cur;
 		uint64_t vs_bin = PV + 0x1000, fs_bin = PV + fs_off;
 		memcpy(P + 0x1000, vs->bin, vs->size);
