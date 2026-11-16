@@ -1966,7 +1966,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		r->has_scissor = 1; r->sc_x0 = x0; r->sc_y0 = y0; r->sc_x1 = x1 - 1; r->sc_y1 = y1 - 1;
 	}
 	if (_pipeline.fs && _pipeline.fs->bad) { _skipped++; return NULL; }
-	static int skipz = -1; if (skipz < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; skipz = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetskipempty=1") ? 1 : 0; }
+	static int skipz = -1; if (skipz < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; skipz = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetskipempty=0") ? 0 : 1; }   /* default on: source not found (runs 130-141) */
 	if (skipz && _pipeline.fs && strstr(_pipeline.fs->name, "Ixrg")) {
 		/* opaque-image draw (alpha ignored) of a texture whose content never arrived (all-zero upload): it would paint a solid
 		 * black rectangle over the home screen wallpaper (run128 bisect). Skip it until the content source is fixed. */
