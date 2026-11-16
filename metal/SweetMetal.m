@@ -1966,7 +1966,8 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		r->has_scissor = 1; r->sc_x0 = x0; r->sc_y0 = y0; r->sc_x1 = x1 - 1; r->sc_y1 = y1 - 1;
 	}
 	if (_pipeline.fs && _pipeline.fs->bad) { _skipped++; return NULL; }
-	if (_pipeline.fs && strstr(_pipeline.fs->name, "Ixrg")) {
+	static int skipz = -1; if (skipz < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; skipz = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetskipempty=1") ? 1 : 0; }
+	if (skipz && _pipeline.fs && strstr(_pipeline.fs->name, "Ixrg")) {
 		/* opaque-image draw (alpha ignored) of a texture whose content never arrived (all-zero upload): it would paint a solid
 		 * black rectangle over the home screen wallpaper (run128 bisect). Skip it until the content source is fixed. */
 		for (uint32_t k = 0; k < 8; k++) {
@@ -2759,9 +2760,10 @@ static void sm_swipe_up(void)
 	/* wake tap, then a home-indicator swipe from the bottom edge to mid screen */
 	kern_return_t k0 = sm_touch(1, 540, 1400); usleep(60000); sm_touch(0, 540, 1400);
 	usleep(700000);
+	/* a full, fast flick to the top: the half swipe to y 952 could leave the lock screen card part-way (run134 theory) */
 	kern_return_t k1 = sm_touch(1, 540, 2392);
-	for (int i = 1; i <= 24; i++) { usleep(12000); sm_touch(1, 540, 2392 - i * 60); }
-	usleep(20000); sm_touch(0, 540, 2392 - 24 * 60);
+	for (int i = 1; i <= 16; i++) { usleep(8000); sm_touch(1, 540, 2392 - i * 140); }
+	usleep(8000); sm_touch(0, 540, 2392 - 16 * 140);
 	slog("SweetMTL: swipe up sent kr=%x/%x", k0, k1);
 }
 static void *sm_watchdog(void *arg)
