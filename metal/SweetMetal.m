@@ -2903,7 +2903,9 @@ static void *sm_watchdog(void *arg)
 			/* boot-arg sweetstay=1: interactive use, no scripted touches and no reboot to recovery */
 			static int stay = -1; if (stay < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; stay = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetstay=1") ? 1 : 0; }
 			if (stay) step = 6;
-			bool fire = step == 0 ? ((c >= 50 && stable >= 2) || ts.tv_sec >= 1000) : ts.tv_sec >= due;
+			/* boot-arg sweetminunlock=<s>: do not unlock before that uptime (late-loading UI test) */
+			static long minul = -1; if (minul < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; minul = 0; if (sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0) { const char *q = strstr(ba, "sweetminunlock="); if (q) minul = atol(q + 15); } }
+			bool fire = step == 0 ? (((c >= 50 && stable >= 2) && ts.tv_sec >= minul) || ts.tv_sec >= 1000) : ts.tv_sec >= due;
 			if (step < 6 && fire && tg && !sm_is_poster(getprogname())) {
 				sm_perf_report(what[step], ts.tv_sec);
 				SweetMTLTexture *tx = tg;
