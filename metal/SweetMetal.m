@@ -2826,12 +2826,15 @@ static void *sm_watchdog(void *arg)
 			 * sweetlong=1 runs the whole script (Settings, scroll, home, Safari) */
 			static long due; static uint32_t rc; static int stable, longrun = -1;
 			if (longrun < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; longrun = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetlong=1") ? 1 : 0; }
-			if (c == rc) stable++; else { stable = 0; rc = c; }
+			/* idle = at most 3 commits over the last two 10 s ticks (the lock screen still redraws now and then) */
+			{ static uint32_t h1, h2; stable = (c - h2 <= 3) ? 2 : 0; h2 = h1; h1 = c; (void)rc; }
+			{ static const uint32_t mk[] = { 5, 20, 40, 50, 60 }; static int nmk; struct timespec t2; clock_gettime(CLOCK_MONOTONIC, &t2);
+			  while (nmk < 5 && c >= mk[nmk]) { slog("SweetMTL: step mark commits>=%u at %lds (now %u) target %d", mk[nmk], (long)t2.tv_sec, c, sm_last_target != nil); nmk++; } }
 			static const long gap[] = { 0, 30, 80, 90, 80, 100 };
 			static const char *const what[] = { "boot", "home", "settings-open", "settings-idle", "home2", "safari" };
 			struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
 			id tg = sm_last_target;
-			bool fire = step == 0 ? ((c >= 45 && stable >= 2) || ts.tv_sec >= 1000) : ts.tv_sec >= due;
+			bool fire = step == 0 ? ((c >= 50 && stable >= 2) || ts.tv_sec >= 1000) : ts.tv_sec >= due;
 			if (step < 6 && fire && tg && !sm_is_poster(getprogname())) {
 				sm_perf_report(what[step], ts.tv_sec);
 				SweetMTLTexture *tx = tg;
