@@ -37,7 +37,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto ", "texmem " };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto ", "texmem ", "sharer" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1173,6 +1173,7 @@ static __weak id sm_device;
 
 static void sm_bt_kept(void);
 static void sm_region_info(const void *p);
+static void sm_find_sharers(const void *p, const char *what);
 @class SweetMTLTexture;
 @interface SweetMTLBuffer : SweetMTLObject
 @property (nonatomic, readonly) NSUInteger length;
@@ -1761,7 +1762,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		const uint8_t *c = src; bool any = false; NSUInteger rb = r.size.width * sm_pf_bpp(_pixelFormat);
 		for (NSUInteger y = 0; y < r.size.height && !any; y += 4) for (NSUInteger x = 0; x < rb; x += 7) if (c[y * bpr + x]) { any = true; break; }
 		_allZero = !any;
-		if (!any && r.size.width >= 1000) { static int nb; if (nb++ < 2) { slog("SweetMTL: empty upload %lux%lu pf%lu bt:", (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)_pixelFormat); sm_region_info(src); sm_bt_kept(); } }
+		if (!any && r.size.width >= 1000) { static int nb; if (nb++ < 2) { slog("SweetMTL: empty upload %lux%lu pf%lu bt:", (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)_pixelFormat); sm_region_info(src); sm_find_sharers(src, r.size.width == 1105 ? "img1105" : "img1271"); } }
 	} else if (src) _allZero = false;
 	if (r.size.width >= 300 && src && !sm_astc(_pixelFormat, NULL, NULL)) {
 		uint64_t nz = 0, nn = 0; const uint8_t *c = src;
@@ -2623,6 +2624,45 @@ static void sm_region_info(const void *p)
 	vm_region_submap_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
 	kern_return_t kr = vm_region_recurse_64(mach_task_self(), &a, &sz, &depth, (vm_region_recurse_info_t)&info, &cnt);
 	slog("SweetMTL: ebt region %p kr %x start %lx size %lx tag %u share %u prot %x obj %x refs %u", p, kr, a, sz, info.user_tag, info.share_mode, info.protection, info.object_id, info.ref_count);
+}
+/* Which process shares this memory? The VM object id reported by vm_region_recurse is the same in every task that maps
+ * the object, and backboardd is root: walk every task's regions for it (writable mapping = the producer). */
+extern kern_return_t processor_set_default(host_t, processor_set_name_t *);
+extern kern_return_t host_processor_set_priv(host_priv_t, processor_set_name_t, processor_set_t *);
+extern kern_return_t processor_set_tasks(processor_set_t, task_array_t *, mach_msg_type_number_t *);
+extern kern_return_t task_for_pid(mach_port_name_t, int, mach_port_name_t *);
+extern int pid_for_task(mach_port_name_t, int *);
+extern int proc_name(int, void *, uint32_t);
+static void sm_find_sharers(const void *p, const char *what)
+{
+	vm_address_t a = (vm_address_t)p; vm_size_t sz = 0; natural_t depth = 4;
+	vm_region_submap_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+	if (vm_region_recurse_64(mach_task_self(), &a, &sz, &depth, (vm_region_recurse_info_t)&info, &cnt)) return;
+	uint32_t want = info.object_id; vm_size_t wsz = sz;
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		task_array_t tasks = NULL; mach_msg_type_number_t nt = 0; processor_set_name_t ps = 0; processor_set_t pp = 0;
+		kern_return_t k1 = processor_set_default(mach_host_self(), &ps), k2 = k1 ? k1 : host_processor_set_priv(mach_host_self(), ps, &pp);
+		kern_return_t k3 = k2 ? k2 : processor_set_tasks(pp, &tasks, &nt);
+		slog("SweetMTL: sharers of %s obj %x size %lx: tasks kr %x/%x/%x n %u", what, want, (unsigned long)wsz, k1, k2, k3, nt);
+		int found = 0;
+		for (int i = 0; i < (k3 ? 4000 : (int)nt) && found < 6; i++) {
+			mach_port_name_t t = 0; int pid = i;
+			if (k3) { if (task_for_pid(mach_task_self(), i, &t) || !t) continue; } else { t = tasks[i]; pid_for_task(t, &pid); }
+			if (t == mach_task_self()) continue;
+			vm_address_t ra = 0; vm_size_t rs = 0;
+			for (int guard = 0; guard < 20000; guard++) {
+				natural_t d = 4; vm_region_submap_info_data_64_t ri; mach_msg_type_number_t rc = VM_REGION_SUBMAP_INFO_COUNT_64;
+				if (vm_region_recurse_64(t, &ra, &rs, &d, (vm_region_recurse_info_t)&ri, &rc)) break;
+				if (ri.object_id == want) {
+					char nm[64] = "?"; proc_name(pid, nm, sizeof nm);
+					slog("SweetMTL: sharer %s pid %d %s prot %x tag %u at %lx size %lx", what, pid, nm, ri.protection, ri.user_tag, (unsigned long)ra, (unsigned long)rs);
+					found++; break;
+				}
+				ra += rs;
+			}
+		}
+		slog("SweetMTL: sharers of %s done, %d found", what, found);
+	});
 }
 /* backtrace into the kept lines (prefix "ebt") */
 static void sm_bt_kept(void)
