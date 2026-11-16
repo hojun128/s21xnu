@@ -348,7 +348,9 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 			for (uint32_t i = 0; i < sm_njr; i++) ADD(sm_jr[i], sm_jrl[i], PRE);
 		}
 		for (uint32_t i = 0; i < sm_nalways; i++)
-			ADD(sm_always[i], sm_always[i] == sm_desc_va ? sm_desc_span : 0, PRE | POST);   /* the GPU writes job headers there */
+			/* descriptors: flushed before the job only (the CPU never reads what the GPU writes there and rewrites whole
+			 * slots after a clean+invalidate); later jobs of a pass only changed the pass header */
+			ADD(sm_always[i], sm_always[i] == sm_desc_va ? (sm_jlight && slot == 0 ? 0x10000 : sm_desc_span) : 0, PRE);
 		for (uint32_t i = 0; i < sm_njw; i++) ADD(sm_jw[i], sm_jwl[i], slot == 1 ? PRE : PRE | POST);
 #undef ADD
 		uint64_t in4[4] = { slot, jc, 4000, sm_wc == 1 ? 2 : 0 }, o4[4] = { 0xdead, 0, 0, 0 }; uint32_t oc4 = 4;
@@ -831,7 +833,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 {
 	if (preload) { const sm_shader *rs = sm_find(@"read_surf_frag"); if (!rs || rs->size > 0x300) preload = false; }
 	sm_jl_beginl(target_va, (uint64_t)stride * h);
-	sm_desc_span = 0x10000 + (uint64_t)(ndraw ? ndraw : 1) * SM_DRAW_STRIDE;
+	sm_desc_span = 0x10000; uint32_t sm_slot_cur = 0x10000;
 	for (uint32_t i = 0; i < ndraw; i++) {
 		const sm_drawrec *r = &dr[i];
 		for (int k = 0; k < 31; k++) { sm_jl_add(r->buf[k]); sm_jl_add(r->fbuf[k]); }
@@ -938,7 +940,9 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	uint32_t nchain = 0; uint8_t *prevjob = NULL; uint64_t first_va = 0;
 	for (uint32_t i = 0; i < ndraw; i++) {
 		const sm_drawrec *r = &dr[i];
-		uint32_t base = 0x10000 + i * SM_DRAW_STRIDE;
+		/* compact draw slots: 4 KiB of descriptors + the two shader binaries (was a fixed 64 KiB per draw, all of it
+		 * cache-flushed before and after every job: ~7 MiB x 4 per scrolling frame) */
+		uint32_t base = sm_slot_cur;
 		uint8_t *P = cpu + base; uint64_t PV = D + base;
 		memset(P, 0, 0x1000);
 		const sm_shader *vs = r->vs, *fs = r->fs;
@@ -946,13 +950,16 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 			slog("SweetMTL: shader too large for the draw slot (vs %u fs %u)", vs->size, fs ? fs->size : 0);
 			continue;
 		}
-		uint64_t vs_bin = PV + 0x1000, fs_bin = PV + 0x6000;
+		uint32_t fs_off = 0x1000 + ((vs->size + 127) & ~127u), fs_len = fs ? fs->size : (uint32_t)sizeof FS_GREEN;
+		sm_slot_cur = base + ((fs_off + fs_len + 127 + 0xFFF) & ~0xFFFu);
+		sm_desc_span = sm_slot_cur;
+		uint64_t vs_bin = PV + 0x1000, fs_bin = PV + fs_off;
 		memcpy(P + 0x1000, vs->bin, vs->size);
 		if (vs->cdata_size) memcpy(P + 0x600, vs->cdata, vs->cdata_size);
 		if (fs && fs->cdata_size) memcpy(P + 0x800, fs->cdata, fs->cdata_size);
 		uint32_t fs_preload_hi, fs_wr, fs_push;
-		if (fs) { memcpy(P + 0x6000, fs->bin, fs->size); fs_preload_hi = 0; fs_wr = fs->work_regs; fs_push = fs->push_words; }
-		else { memcpy(P + 0x6000, FS_GREEN, sizeof FS_GREEN); fs_wr = 32; fs_push = 0; }
+		if (fs) { memcpy(P + fs_off, fs->bin, fs->size); fs_preload_hi = 0; fs_wr = fs->work_regs; fs_push = fs->push_words; }
+		else { memcpy(P + fs_off, FS_GREEN, sizeof FS_GREEN); fs_wr = 32; fs_push = 0; }
 		sm_shader_desc(P + 0x200, vs, MALI_SHADER_STAGE_VERTEX, vs_bin, vs->preload, vs->work_regs);
 		bool sec = (vs->flags & 1) != 0;
 		if (sec) sm_shader_desc(P + 0x220, vs, MALI_SHADER_STAGE_VERTEX, vs_bin + vs->sec_off, vs->sec_preload, vs->work_regs);
