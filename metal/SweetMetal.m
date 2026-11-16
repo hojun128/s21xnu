@@ -37,7 +37,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap " };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -3160,6 +3160,24 @@ static void sm_layer_hooks(void)
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d { return [[SweetMTLTexture alloc] initWithDevice:self descriptor:d]; }
 - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBacked:(BOOL)hb
 {
+	static bool dumped;
+	if (!dumped) {
+		/* the texture-layout protocol is private: log its methods with type encodings (selectors split over lines) */
+		dumped = true; unsigned np = 0; Protocol * __unsafe_unretained *pl = objc_copyProtocolList(&np);
+		for (unsigned i = 0; i < np; i++) {
+			const char *pn = protocol_getName(pl[i]); if (!strstr(pn, "TextureLayout")) continue;
+			for (int req = 0; req < 2; req++) {
+				unsigned nm = 0; struct objc_method_description *md = protocol_copyMethodDescriptionList(pl[i], req, YES, &nm);
+				for (unsigned k = 0; k < nm; k++) {
+					const char *sn = sel_getName(md[k].name); size_t L = strlen(sn);
+					for (size_t o = 0; o < L; o += 100) slog("SweetMTL: proto %s %u.%zu %.100s", pn, k, o / 100, sn + o);
+					slog("SweetMTL: proto %s %u types %.110s", pn, k, md[k].types ? md[k].types : "-");
+				}
+				free(md);
+			}
+		}
+		free(pl);
+	}
 	SweetMTLTextureLayout *l = [SweetMTLTextureLayout new]; l.size = sm_tex_bytes(d); l.alignment = 0x4000; l.watermark = l.size;
 	return l;
 }
