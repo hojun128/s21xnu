@@ -37,7 +37,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto ", "texmem ", "sharer" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto ", "texmem ", "sharer", "bootdiag" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -2747,6 +2747,51 @@ static const char *sm_symof(uint64_t a, char *buf, size_t n)
 	} else snprintf(buf, n, "%llx", (unsigned long long)a);
 	return buf;
 }
+/* Boot diagnosis (boot-arg sweetbootdiag=1): nothing is drawn between the boot logo (26 s) and the lock screen (916 s).
+ * From backboardd (root): list the processes and symbolicate another task's main thread (the shared cache has the same
+ * slide in every process, so dladdr here resolves their PCs). */
+extern int proc_listallpids(void *, int);
+static void sm_remote_stack(int pid, const char *nm, int nthreads)
+{
+	mach_port_name_t t = 0;
+	if (task_for_pid(mach_task_self(), pid, &t) || !t) { slog("SweetMTL: bootdiag %s pid %d: no task port", nm, pid); return; }
+	thread_act_array_t th = NULL; mach_msg_type_number_t n = 0;
+	if (task_threads(t, &th, &n)) return;
+	for (mach_msg_type_number_t i = 0; i < n && (int)i < nthreads; i++) {
+		arm_thread_state64_t st; mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
+		if (thread_get_state(th[i], ARM_THREAD_STATE64, (thread_state_t)&st, &c)) continue;
+		uint64_t pcs[14]; int np = 0;
+		pcs[np++] = (uint64_t)arm_thread_state64_get_pc(st) & 0xFFFFFFFFFULL; pcs[np++] = (uint64_t)arm_thread_state64_get_lr(st) & 0xFFFFFFFFFULL;
+		uint64_t fp = (uint64_t)arm_thread_state64_get_fp(st);
+		for (int k = 0; k < 12 && fp && np < 14; k++) {
+			uint64_t fr[2] = { 0, 0 }; vm_size_t got = 0;
+			if (vm_read_overwrite(t, (vm_address_t)fp, 16, (vm_address_t)fr, &got) || got != 16) break;
+			pcs[np++] = fr[1] & 0xFFFFFFFFFULL; fp = fr[0];
+		}
+		for (int k = 0; k < np; k += 2) {
+			char a[70], b[70];
+			slog("SweetMTL: bootdiag %s T%u %d: %s < %s", nm, i, k, sm_symof(pcs[k], a, sizeof a), k + 1 < np ? sm_symof(pcs[k + 1], b, sizeof b) : "-");
+		}
+	}
+}
+static void sm_boot_diag(long sec)
+{
+	static int pids[1024]; int n = proc_listallpids(pids, sizeof pids) ; if (n > 1024) n = 1024;
+	char line[140]; int L = snprintf(line, sizeof line, "bootdiag %lds %d procs:", sec, n); int sb = 0, sbd = 0;
+	for (int i = n - 1; i >= 0; i--) {
+		char nm[40] = "?"; proc_name(pids[i], nm, sizeof nm);
+		if (!strcmp(nm, "SpringBoard")) sb = pids[i];
+		if (!strcmp(nm, "backboardd")) sbd = pids[i];
+		int k = snprintf(line + L, sizeof line - L, " %.14s", nm);
+		if (L + k >= 128) { slog("SweetMTL: %s", line); L = snprintf(line, sizeof line, "bootdiag +"); k = snprintf(line + L, sizeof line - L, " %.14s", nm); }
+		L += k;
+	}
+	slog("SweetMTL: %s", line);
+	(void)sbd;
+	if (sb) sm_remote_stack(sb, "SpringBoard", 2); else slog("SweetMTL: bootdiag no SpringBoard yet");
+	for (int i = 0; i < n; i++) { char nm[40] = "?"; proc_name(pids[i], nm, sizeof nm);
+		if (!strcmp(nm, "launchd") || !strcmp(nm, "mobileactivationd") || !strcmp(nm, "keybagd") || !strcmp(nm, "runningboardd") || !strcmp(nm, "installd") || !strcmp(nm, "lsd")) sm_remote_stack(pids[i], nm, 1); }
+}
 static void sm_dump_threads(void)
 {
 	thread_act_array_t th; mach_msg_type_number_t nth = 0;
@@ -2819,6 +2864,15 @@ static void *sm_watchdog(void *arg)
 	for (int t = 1;; t++) {
 		sleep(10);
 		uint32_t c = sm_commits;
+		{
+			static int bd = -1, nd;
+			if (bd < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; bd = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetbootdiag=1") && !strcmp(getprogname(), "backboardd") ? 1 : 0; }
+			if (bd) {
+				struct timespec bt; clock_gettime(CLOCK_MONOTONIC, &bt);
+				if ((nd == 0 && bt.tv_sec >= 150) || (nd == 1 && bt.tv_sec >= 420)) { nd++; sm_boot_diag(bt.tv_sec); }
+				else if (nd == 2 && bt.tv_sec >= 440) { nd++; slog("SweetMTL: bootdiag done, rebooting to recovery"); IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL); }
+			}
+		}
 		if (t % (sm_is_poster(getprogname()) ? 30 : 3) == 0) {
 			slog("SweetMTL: alive %ds commits=%u bo %lluMB/%u vfree %u%s%s", t * 10, c, sm_live_bytes >> 20, sm_live_n, sm_vfree_n,
 			    sm_off_reason[0] ? " OFF: " : "", sm_off_reason);
