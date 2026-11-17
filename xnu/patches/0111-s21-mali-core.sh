@@ -29,6 +29,8 @@ cat > bsd/dev/sweet_mali.c <<'EOF_SWEET_SRC'
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
+#include <kern/thread_call.h>
+#include <libkern/OSAtomic.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
@@ -104,7 +106,7 @@ mali_log(const char *fmt, ...)
 	/* job failures/timeouts are also kept for the replay before a recovery reboot (sweet_mali_keep_dump) */
 	/* ... and the clock settings and present-copy timings, which the 128 KiB ring loses by the end of a run (run164) */
 	if (!strncmp(line, "job ", 4) || !strncmp(line, "fault", 5) || !strncmp(line, "recover", 7) ||
-	    !strncmp(line, "dvfs", 4) || !strncmp(line, "gpucomp:", 8)) {
+	    !strncmp(line, "dvfs", 4) || !strncmp(line, "gpucomp:", 8) || !strncmp(line, "chg:", 4)) {
 		size_t n = strlen(line);
 		if (mali_keep_len + n + 2 < sizeof(mali_keep)) {
 			memcpy(mali_keep + mali_keep_len, line, n);
@@ -371,12 +373,15 @@ mali_recover(const char *why)
 	mali_log("recover after %s: reset %s, power %s", why, t == 0xFFFFFFFFU ? "timed out" : "ok", p ? "failed" : "ok");
 }
 
+static inline void gov_job(void);   /* idle clock governor, below mali_dvfs() */
+
 /* ---- job submission (polling) ---- */
 /* returns 0 on DONE, else the JS_STATUS exception code (or 0xFFFF on timeout) */
 static uint32_t
 mali_submit_wait(struct mali_ctx *c, uint32_t slot, uint64_t jc_va, uint32_t timeout_ms)
 {
 	uint32_t done = 1U << slot, fail = 1U << (slot + 16), raw = 0, t;
+	gov_job();
 	wr(R_JOB_IRQ_CLEAR, 0xFFFFFFFFU);
 	wr(R_MMU_IRQ_CLEAR, 0xFFFFFFFFU);
 	wr(R_JS(slot, 0x40), (uint32_t)jc_va);
@@ -685,23 +690,36 @@ cpu_measure_mhz(void)
 	return ns ? (uint32_t)(x * 1000ULL / ns) : 0;
 }
 
+/*
+ * Clock domains on ACPM channel 5. "hi" = the level used while the UI draws (boot-args sweetdsu/cl0/cl1/cl2/g3d
+ * override it), "lo" = the idle level of the governor below (sweetg3dlo/cl0lo/cl1lo/cl2lo; 0 = leave as is).
+ * All values are entries of the DT freq tables (exynos-acme domain@0..2, gpu_dvfs_table).
+ */
+static const struct dvfs_dom { const char *name, *arg, *arglo; uint32_t id, def, lo; } D[] = {
+	{ "mif", "sweetmif", "sweetmiflo", 0, 0, 0 },          /* S-Boot runs MIF at its boot level (3172 MHz) */
+	{ "dsu", "sweetdsu", "sweetdsulo", 6, 1586000, 0 },    /* DT dm-table: CL2 2288 MHz needs DSU >= 1586 MHz */
+	{ "cl0", "sweetcl0", "sweetcl0lo", 2, 1794000, 1066000 },
+	{ "cl1", "sweetcl1", "sweetcl1lo", 3, 2080000, 1040000 },
+	{ "cl2", "sweetcl2", "sweetcl2lo", 4, 2288000, 1040000 },
+	{ "g3d", "sweetg3d", "sweetg3dlo", 11, 676000, 130000 },
+	{ "int", "sweetint", "sweetintlo", 1, 0, 0 },
+};
+#define DVFS_N (sizeof(D) / sizeof(D[0]))
+static uint32_t dvfs_hi[DVFS_N], dvfs_lo[DVFS_N];
+static int dvfs_ok;
+
 static void
 mali_dvfs(int gpu_ready)
 {
 	int on = 1;
 	PE_parse_boot_argn("sweetdvfs", &on, sizeof(on));
-	static const struct { const char *name, *arg; uint32_t id, def; } D[] = {
-		{ "mif", "sweetmif", 0, 0 },          /* S-Boot runs MIF at its boot level (3172 MHz) */
-		{ "dsu", "sweetdsu", 6, 1586000 },    /* DT dm-table: CL2 2288 MHz needs DSU >= 1586 MHz */
-		{ "cl0", "sweetcl0", 2, 1794000 },
-		{ "cl1", "sweetcl1", 3, 2080000 },
-		{ "cl2", "sweetcl2", 4, 2288000 },
-		{ "g3d", "sweetg3d", 11, 676000 },
-		{ "int", "sweetint", 1, 0 },
-	};
 	char ln[192]; int L = 0;
 	uint32_t g0 = gpu_ready ? mali_measure_mhz() : 0, c0 = cpu_measure_mhz();
-	for (unsigned i = 0; i < sizeof(D) / sizeof(D[0]); i++) {
+	for (unsigned i = 0; i < DVFS_N; i++) {
+		dvfs_hi[i] = D[i].def;
+		PE_parse_boot_argn(D[i].arg, &dvfs_hi[i], sizeof(dvfs_hi[i]));
+		dvfs_lo[i] = D[i].lo;
+		PE_parse_boot_argn(D[i].arglo, &dvfs_lo[i], sizeof(dvfs_lo[i]));
 		int64_t cur = acd_xfer(D[i].id, 0, 1, 20);
 		L += snprintf(ln + L, sizeof(ln) - L, " %s %lld", D[i].name, cur);
 		if (acd_state < 0) {
@@ -713,9 +731,8 @@ mali_dvfs(int gpu_ready)
 		return;
 	}
 	L = 0;
-	for (unsigned i = 0; i < sizeof(D) / sizeof(D[0]); i++) {
-		uint32_t f = D[i].def;
-		PE_parse_boot_argn(D[i].arg, &f, sizeof(f));
+	for (unsigned i = 0; i < DVFS_N; i++) {
+		uint32_t f = dvfs_hi[i];
 		if (!f) {
 			continue;
 		}
@@ -726,6 +743,115 @@ mali_dvfs(int gpu_ready)
 	}
 	uint32_t g1 = gpu_ready ? mali_measure_mhz() : 0, c1 = cpu_measure_mhz();
 	mali_log("dvfs set:%s gpu %u MHz cpu %u MHz", ln, g1, c1);
+	dvfs_ok = 1;
+}
+
+/*
+ * Idle governor (boot-arg sweetgov=0 disables): the clocks stay at "hi" while GPU jobs arrive. The GPU drops to
+ * its "lo" level after sweetgov_gpu_ms (1000) without a job, the CPU clusters after sweetgov_cpu_ms (8000) and
+ * only once uptime passed sweetgov_cpu_after s (480, the boot is CPU-bound behind a static logo). The first job
+ * after idle wakes the governor thread, which restores "hi" (the submitter never waits for ACPM).
+ * Raising goes DSU first, lowering goes CPU first (dm-table constraint CL -> DSU).
+ */
+static int gov_on = 1;
+static uint32_t gov_gpu_ms = 1000, gov_cpu_ms = 8000, gov_cpu_after = 480;
+static volatile uint64_t gov_last_job;
+static volatile int gov_gpu_lo, gov_cpu_lo;
+static volatile UInt32 gov_busy, gov_pending;
+static thread_call_t gov_tc;
+static uint32_t gov_switches;
+
+static void
+gov_set(int gpu, int lo)
+{
+	for (unsigned k = 0; k < DVFS_N; k++) {
+		unsigned i = lo ? (unsigned)(DVFS_N - 1 - k) : k;
+		int is_gpu = D[i].id == 11;
+		if (is_gpu != gpu || !dvfs_lo[i] || !dvfs_hi[i]) {
+			continue;
+		}
+		(void)acd_xfer(D[i].id, lo ? dvfs_lo[i] : dvfs_hi[i], 0, 20);
+	}
+}
+
+static void
+gov_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	if (!OSCompareAndSwap(0, 1, &gov_busy)) {
+		uint64_t dl;   /* another run is active: retry shortly so a pending wake-up is never lost */
+		clock_interval_to_deadline(5, NSEC_PER_MSEC, &dl);
+		thread_call_enter_delayed(gov_tc, dl);
+		return;
+	}
+	gov_pending = 0;
+	uint64_t now = mach_absolute_time(), idle_ns = 0, up_ns = 0;
+	absolutetime_to_nanoseconds(now - gov_last_job, &idle_ns);
+	absolutetime_to_nanoseconds(now, &up_ns);
+	uint32_t idle_ms = (uint32_t)(idle_ns / 1000000ULL);
+	int want_gpu_lo = idle_ms >= gov_gpu_ms;
+	int want_cpu_lo = idle_ms >= gov_cpu_ms && up_ns / 1000000000ULL >= gov_cpu_after;
+	if (!want_cpu_lo && gov_cpu_lo) {
+		gov_set(0, 0);
+		gov_cpu_lo = 0;
+		gov_switches++;
+	}
+	if (want_gpu_lo != gov_gpu_lo) {
+		gov_set(1, want_gpu_lo);
+		gov_gpu_lo = want_gpu_lo;
+		gov_switches++;
+	}
+	if (want_cpu_lo && !gov_cpu_lo) {
+		gov_set(0, 1);
+		gov_cpu_lo = 1;
+		gov_switches++;
+	}
+	if (gov_switches <= 24 || (gov_switches % 200) == 0) {
+		static uint32_t logged;
+		if (logged != gov_switches) {
+			logged = gov_switches;
+			mali_log("dvfs gov: gpu %s cpu %s (idle %u ms, %u switches)", gov_gpu_lo ? "lo" : "hi",
+			    gov_cpu_lo ? "lo" : "hi", idle_ms, gov_switches);
+		}
+	}
+	gov_busy = 0;
+	/* keep checking until everything is low; a job re-arms it from mali_submit_wait */
+	if (!gov_gpu_lo || (!gov_cpu_lo && gov_cpu_ms)) {
+		uint64_t dl;
+		clock_interval_to_deadline(gov_gpu_lo ? 1000 : 250, NSEC_PER_MSEC, &dl);
+		thread_call_enter_delayed(gov_tc, dl);
+	}
+}
+
+static inline void
+gov_job(void)
+{
+	gov_last_job = mach_absolute_time();
+	if (gov_tc && (gov_gpu_lo || gov_cpu_lo) && OSCompareAndSwap(0, 1, &gov_pending)) {
+		thread_call_enter(gov_tc);
+	}
+}
+
+static void
+gov_start(void)
+{
+	PE_parse_boot_argn("sweetgov", &gov_on, sizeof(gov_on));
+	PE_parse_boot_argn("sweetgov_gpu_ms", &gov_gpu_ms, sizeof(gov_gpu_ms));
+	PE_parse_boot_argn("sweetgov_cpu_ms", &gov_cpu_ms, sizeof(gov_cpu_ms));
+	PE_parse_boot_argn("sweetgov_cpu_after", &gov_cpu_after, sizeof(gov_cpu_after));
+	if (!gov_on || !dvfs_ok) {
+		mali_log("dvfs gov: off");
+		return;
+	}
+	if (!gov_cpu_ms) {
+		gov_cpu_ms = 0xFFFFFFFFU;   /* never lower the CPU */
+	}
+	gov_last_job = mach_absolute_time();
+	gov_tc = thread_call_allocate(gov_run, NULL);
+	uint64_t dl;
+	clock_interval_to_deadline(250, NSEC_PER_MSEC, &dl);
+	thread_call_enter_delayed(gov_tc, dl);
+	mali_log("dvfs gov: on (gpu lo after %u ms, cpu lo after %u ms once up %u s)", gov_gpu_ms, gov_cpu_ms,
+	    gov_cpu_after);
 }
 
 void sweet_mali_boot(void);
@@ -783,6 +909,7 @@ sweet_mali_boot(void)
 	}
 	mali_log("powered: shader=%x tiler=%x l2=%x", rd(R_SHADER_READY), rd(R_TILER_READY), rd(R_L2_READY));
 	mali_dvfs(1);
+	gov_start();
 	mali_selftest();
 	mali_selftest_heap();
 	mali_log("ready, left powered (pool used %u of %u pages)", mali.pool_next, mali.pool_pages);
