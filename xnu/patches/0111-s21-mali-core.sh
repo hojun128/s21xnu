@@ -514,7 +514,8 @@ mali_selftest_heap(void)
 static vm_offset_t acd_sram, acd_mbox;
 static uint32_t acd_seq;
 static int acd_state;   /* 0 = not tried, 1 = ok, -1 = unusable */
-static struct { uint32_t txr, txf, txb, rxr, rxf, rxb, len, sz; } acd;
+static struct { uint32_t txr, txf, txb, rxr, rxf, rxb, len, sz, type, fld; } acd;
+static int acd_buf_ok;   /* boot-arg sweetdvfsbuf=1: talk to a buffer-type (type 2) channel */
 #define ACD(o) (*(volatile uint32_t *)(acd_sram + (o)))
 
 static int
@@ -556,14 +557,15 @@ acd_init(void)
 		}
 		acd.txr = ACD(e + 16); acd.txf = ACD(e + 20); acd.txb = ACD(e + 24);
 		acd.rxr = ACD(e + 40); acd.rxf = ACD(e + 44); acd.rxb = ACD(e + 48);
-		acd.len = ACD(e + 52); acd.sz = ACD(e + 56);
+		acd.len = ACD(e + 52); acd.sz = ACD(e + 56); acd.type = ACD(e + 12); acd.fld = ACD(e + 4);
+		PE_parse_boot_argn("sweetdvfsbuf", &acd_buf_ok, sizeof(acd_buf_ok));
 		if (acd.len == 0 || acd.len > 64 || acd.sz < 16 || acd.sz > 64 || acd.txb >= ACD_SRAM_SIZE || acd.rxb >= ACD_SRAM_SIZE ||
 		    acd.txf >= ACD_SRAM_SIZE || acd.rxf >= ACD_SRAM_SIZE || acd.txr >= ACD_SRAM_SIZE || acd.rxr >= ACD_SRAM_SIZE) {
 			mali_log("dvfs: ch%u bad queue len=%u sz=%u", ACD_CH, acd.len, acd.sz);
 			return -1;
 		}
 		acd_state = 1;
-		mali_log("dvfs: ch%u len=%u sz=%u", ACD_CH, acd.len, acd.sz);
+		mali_log("dvfs: ch%u len=%u sz=%u type=%u fld=%x", ACD_CH, acd.len, acd.sz, acd.type, acd.fld);
 		return 0;
 	}
 	mali_log("dvfs: ch%u not found", ACD_CH);
@@ -581,6 +583,44 @@ acd_xfer(uint32_t id, uint32_t w1, uint32_t type, uint32_t wait_ms)
 		acd_seq = 1;
 	}
 	uint32_t cmd[4] = { (id & 0xFFFU) | ((acd_seq & 0x3FU) << 16), w1, type, 0 };
+	if (acd.type == 2) {
+		/* run167 table dump: the acpm_dvfs channel is TYPE_BUFFER (q_len 1, no usable front/rear ring): one command
+		 * buffer at the AP-TX base, doorbell, the reply lands in the AP-RX buffer with the mailbox INTSR1 bit set */
+		if (!acd_buf_ok) {
+			static int nl;
+			if (nl++ < 1) {
+				mali_log("dvfs: ch%u is a buffer channel (type 2), boot-arg sweetdvfsbuf=1 to use it", ACD_CH);
+			}
+			return -1;
+		}
+		uint32_t bit = acd.fld ? acd.fld : (1U << ACD_CH);
+		*(volatile uint32_t *)(acd_mbox + 0x20) = bit;              /* INTCR1: drop a stale reply flag */
+		for (uint32_t w = 0; w < acd.sz / 4; w++) {
+			ACD(acd.txb + w * 4) = w < 4 ? cmd[w] : 0;
+		}
+		__asm__ volatile ("dsb sy" ::: "memory");
+		*(volatile uint32_t *)(acd_mbox + 0x08) = bit << 16;        /* INTGR0 doorbell */
+		for (uint32_t t = 0; t < wait_ms * 10; t++) {
+			if (*(volatile uint32_t *)(acd_mbox + 0x28) & bit) {     /* INTSR1 */
+				uint32_t r0 = ACD(acd.rxb), r1 = ACD(acd.rxb + 4);
+				*(volatile uint32_t *)(acd_mbox + 0x20) = bit;
+				static int nl;
+				if (nl++ < 4) {
+					mali_log("dvfs: buf reply %08x %08x after %u00us", r0, r1, t);
+				}
+				return (int64_t)r1;
+			}
+			us(100);
+		}
+		{
+			static int nl;
+			if (nl++ < 4) {
+				mali_log("dvfs: buf no reply (rx %08x %08x sr1 %x)", ACD(acd.rxb), ACD(acd.rxb + 4),
+				    *(volatile uint32_t *)(acd_mbox + 0x28));
+			}
+		}
+		return -1;
+	}
 	uint32_t front = ACD(acd.txf);
 	if (front >= acd.len) {
 		mali_log("dvfs: bad tx front %u", front);
