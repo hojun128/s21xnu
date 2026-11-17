@@ -123,6 +123,23 @@ static void sm_jl_writel(uint64_t va, uint64_t len)
 	if (sm_njw < sizeof sm_jw / sizeof *sm_jw) { sm_jwl[sm_njw] = len; sm_jw[sm_njw++] = va; } else sm_jover = true;
 }
 static void sm_jl_add(uint64_t va) { sm_jl_addl(va, 0); }
+/* read ranges already cleaned in this commit: only a CPU write can make them dirty again, and during a commit the CPU only
+ * writes descriptors/ring (listed separately), blit copies and shadow write-backs (both reset this set). A texture
+ * sampled by several passes of one commit was flushed for every pass (scroll: ~6 ms/commit). boot-arg sweetnodedupe. */
+static uint64_t sm_cf_va[256], sm_cf_len[256]; static uint32_t sm_cf_n; static int sm_cf_on = -1;
+static bool sm_cf_seen(uint64_t va, uint64_t len)
+{
+	if (sm_cf_on < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; sm_cf_on = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetnodedupe") ? 0 : 1; }
+	if (!sm_cf_on) return false;
+	for (uint32_t i = 0; i < sm_cf_n; i++)
+		if (sm_cf_va[i] == va) {
+			if (!sm_cf_len[i] || (len && len <= sm_cf_len[i])) return true;
+			sm_cf_len[i] = len; return false;   /* wider now: flush, remember the wider span */
+		}
+	if (sm_cf_n < 256) { sm_cf_va[sm_cf_n] = va; sm_cf_len[sm_cf_n++] = len; }
+	return false;
+}
+static void sm_cf_reset(void) { sm_cf_n = 0; }
 static void sm_jl_write(uint64_t va) { sm_jl_writel(va, 0); }
 /* targets only the GPU touches (IOSurface render targets: displayed by the GPU compositor, never written or read by a
  * CPU except our own debug captures, which flush first): no cache maintenance, ~22 MB per screen pass saved */
@@ -378,7 +395,7 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 		if (!sm_jlight) {
 			for (uint32_t i = 0; i < sm_ninfra; i++) if (sm_infra[i] != sm_desc_va) ADD(sm_infra[i], sm_infra_len[i], PRE);
 			uint64_t rv, rl; sm_ring_take(&rv, &rl); ADD(rv, rl, PRE);
-			for (uint32_t i = 0; i < sm_njr; i++) ADD(sm_jr[i], sm_jrl[i], PRE);
+			for (uint32_t i = 0; i < sm_njr; i++) if (n < 250 && !sm_cf_seen(sm_jr[i], sm_jrl[i])) ADD(sm_jr[i], sm_jrl[i], PRE);
 		}
 		for (uint32_t i = 0; i < sm_nalways; i++)
 			/* descriptors: flushed before the job only (the CPU never reads what the GPU writes there and rewrites whole
@@ -1645,6 +1662,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	}
 	if (_wbOK != 1) return;
 	for (NSUInteger y = 0; y < _height; y++) memcpy((uint8_t *)_src + y * _srcBpr, _shadow.cpu + y * _bytesPerRow, rb);
+	sm_cf_reset();
 }
 /* true when this texture can skip the pre-job cache flush: private and not written by the CPU since the last flush */
 - (bool)sm_noflush
@@ -2396,11 +2414,12 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 	if (!have) { have = sm_bo_alloc(&desc, 0x10000 + 32 * SM_DRAW_STRIDE); if (have) { sm_always_add(&desc); sm_desc_va = desc.gpu; } }
 	_status = 4; /* MTLCommandBufferStatusCompleted */
 	sm_commits++;
+	sm_cf_reset();
 	uint64_t pf_t0 = sm_ns();
 	if (sm_pf_last) { uint64_t g = (pf_t0 - sm_pf_last) / 1000000; sm_pf_gap[g < 20 ? 0 : g < 40 ? 1 : g < 100 ? 2 : 3]++; }
 	for (SweetMTLRenderEncoder *e in _passes) if ([e isKindOfClass:[SweetMTLRenderEncoder class]] && ![e isKindOfClass:[SweetMTLComputeEncoder class]]) sm_pf_draws += e->_ndraw;
 	for (SweetMTLRenderEncoder *e in _passes) {
-		if ([e isKindOfClass:[SweetMTLBlitEncoder class]]) { [(SweetMTLBlitEncoder *)e sm_run]; continue; }
+		if ([e isKindOfClass:[SweetMTLBlitEncoder class]]) { [(SweetMTLBlitEncoder *)e sm_run]; sm_cf_reset(); continue; }
 		if ([e isKindOfClass:[SweetMTLComputeEncoder class]]) { if (!sm_gpu_off) [(SweetMTLComputeEncoder *)e sm_run]; continue; }
 		if (!have || !e.target) { _status = 5; continue; }
 		sm_target_pf = e.target.pixelFormat;
