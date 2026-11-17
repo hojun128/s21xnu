@@ -124,7 +124,17 @@ static void sm_jl_writel(uint64_t va, uint64_t len)
 }
 static void sm_jl_add(uint64_t va) { sm_jl_addl(va, 0); }
 static void sm_jl_write(uint64_t va) { sm_jl_writel(va, 0); }
-static void sm_jl_beginl(uint64_t target, uint64_t len) { sm_njr = sm_njw = 0; sm_jover = false; sm_jlight = false; sm_jl_writel(target, len); }
+/* targets only the GPU touches (IOSurface render targets: displayed by the GPU compositor, never written or read by a
+ * CPU except our own debug captures, which flush first): no cache maintenance, ~22 MB per screen pass saved */
+static bool sm_target_noflush;
+static void sm_jl_beginl(uint64_t target, uint64_t len) { sm_njr = sm_njw = 0; sm_jover = false; sm_jlight = false; if (!sm_target_noflush) sm_jl_writel(target, len); }
+/* clean+invalidate a GPU range now (kernel selector 13), before a CPU read of GPU-only memory */
+static void sm_flush_now(uint64_t va, uint64_t len)
+{
+	if (!va || !len) return;
+	uint64_t R[2] = { va, (len & 0xFFFFFFFFFFULL) | (3ULL << 62) };
+	IOConnectCallMethod(sm_conn, 13, NULL, 0, R, 16, NULL, NULL, NULL, NULL);
+}
 static void sm_jl_begin(uint64_t target) { sm_jl_beginl(target, 0); }
 static int sm_wc = -1;
 static uint64_t sm_next_va = 0x30000000ULL;
@@ -368,7 +378,7 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 			 * slots after a clean+invalidate); later jobs of a pass only changed the pass header */
 			/* descriptors: boot-arg sweetdescpre=1 flushes them before jobs only (the CPU never reads what the GPU writes
 			 * there); run153's broken visuals turned out to be the page-table pool exhaustion, so this is re-tested */
-			{ static int dp = -1; if (dp < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; dp = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetdescpre=1") ? 1 : 0; }
+			{ static int dp = -1; if (dp < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; dp = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetdescpre=0") ? 0 : 1; }   /* on: run161 clean */
 			  ADD(sm_always[i], sm_always[i] == sm_desc_va ? (dp && sm_jlight && slot == 0 ? 0x10000 : sm_desc_span) : 0, dp ? PRE : PRE | POST); }
 		for (uint32_t i = 0; i < sm_njw; i++) ADD(sm_jw[i], sm_jwl[i], slot == 1 ? PRE : PRE | POST);
 #undef ADD
@@ -1774,6 +1784,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (uint8_t *)sm_cpu { _cpuDirty = true; return _store.cpu; }
 - (void)getBytes:(void *)dst bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl
 {
+	if (_surface && _store.gpu) sm_flush_now(_store.gpu, (uint64_t)_bytesPerRow * _height);
 	{
 		static int nl;
 		if (nl++ < 6) {
@@ -2363,6 +2374,8 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 		if ([e isKindOfClass:[SweetMTLComputeEncoder class]]) { if (!sm_gpu_off) [(SweetMTLComputeEncoder *)e sm_run]; continue; }
 		if (!have || !e.target) { _status = 5; continue; }
 		sm_target_pf = e.target.pixelFormat;
+		{ static int nf = -1; if (nf < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; nf = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetiosflush=1") ? 0 : 1; }
+		  sm_target_noflush = nf && e.target.iosurface && e.target.bo && e.target.bo->imported; }
 		if (sm_pf_bpp(e.target.pixelFormat) != 4 && sm_rt_writeback(e.target.pixelFormat) == MALI_COLOR_FORMAT_R8G8B8A8) {
 			/* render targets are written as 4-byte RGBA8/BGRA8 only: a 1/2/8-byte target would overflow */
 			static int nl; if (nl++ < 6) slog("SweetMTL: skipped pass into pixel format %lu", (unsigned long)e.target.pixelFormat);
@@ -2934,6 +2947,7 @@ static void *sm_watchdog(void *arg)
 			if (step < 6 && fire && tg && !sm_is_poster(getprogname())) {
 				sm_perf_report(what[step], ts.tv_sec);
 				SweetMTLTexture *tx = tg;
+				if (tx.bo) sm_flush_now(tx.bo->gpu, (uint64_t)tx.bytesPerRow * tx.height);   /* GPU-only target: invalidate before the CPU thumbnail */
 				int st = step++;
 				slog("SweetMTL: step %d at %lds commits=%u", st, (long)ts.tv_sec, c);
 				if (!longrun && st == 1) { step = 5; due = ts.tv_sec + 5; } else due = ts.tv_sec + (step < 6 ? gap[step] : 0);
