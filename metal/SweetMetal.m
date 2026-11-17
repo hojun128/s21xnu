@@ -38,7 +38,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto ", "texmem ", "sharer", "bootdiag" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto ", "texmem ", "sharer", "bootdiag", "tolerated" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -406,7 +406,13 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 		size_t L = strlen(sm_fail_log);
 		snprintf(sm_fail_log + L, sizeof sm_fail_log - L, "%x/s%u@%.36s; ", r, slot, sm_cur_pass);
 	}
-	if (r == 0xFFFFu || r == 0xFFFCu || (r >> 16) == 0xffff || (r && (sm_is_poster(getprogname()) || !strcmp(getprogname(), "PosterBoard")))) {   /* guests: first fault ends their GPU use */
+	/* a timeout (0xFFFF) is recovered by the kernel (GPU reset): tolerate two per process before giving up; the faulting
+	 * pass's texturing shaders get quarantined by the caller. 0xFFFC = kernel fenced the GPU: off for good */
+	static int ntimeouts;
+	bool fatal = r == 0xFFFCu || (r >> 16) == 0xffff || (r && (sm_is_poster(getprogname()) || !strcmp(getprogname(), "PosterBoard")));
+	if (r == 0xFFFFu && ++ntimeouts > 2) fatal = true;
+	if (r == 0xFFFFu && !fatal) slog("SweetMTL: GPU timeout %d tolerated in %s", ntimeouts, sm_cur_pass);
+	if (fatal) {   /* guests: first fault ends their GPU use */
 		sm_gpu_off = true;
 		snprintf(sm_off_reason, sizeof sm_off_reason, "status %x slot %u in %s", r, slot, sm_cur_pass);
 		slog("SweetMTL: GPU off: %s", sm_off_reason);
@@ -1146,7 +1152,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	}
 	if (chain && nchain) {
 		uint32_t cst = sm_submit(1, first_va);
-		static int nl; if (cst || nl++ < 3) slog("SweetMTL: vertex chain of %u jobs -> %x", nchain, cst);
+		static int nl; if ((cst && cst != 0xFFFCu) || nl++ < 3) slog("SweetMTL: vertex chain of %u jobs -> %x", nchain, cst);
 		vs_all |= cst;
 	}
 	if (vstatus) *vstatus = vs_all;
