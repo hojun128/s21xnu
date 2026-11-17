@@ -38,7 +38,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto ", "texmem ", "sharer", "bootdiag", "tolerated", "sampler wrap" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "blend split", "blend fallback", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto ", "texmem ", "sharer", "bootdiag", "tolerated", "sampler wrap" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -861,6 +861,7 @@ static void sm_pack_blend(void *dst, const sm_drawrec *r)
 		bool ok = r && r->blend_on && sm_blend_func(r->rgb_op, r->rgb_sf, r->rgb_df, &b.equation.rgb) &&
 		    sm_blend_func(r->a_op, r->a_sf, r->a_df, &b.equation.alpha);
 		if (!ok) {
+			if (r && r->blend_on) { static int nl; if (nl++ < 8) slog("SweetMTL: blend fallback opaque: rgb %u/%u/%u alpha %u/%u/%u", r->rgb_op, r->rgb_sf, r->rgb_df, r->a_op, r->a_sf, r->a_df); }
 			b.equation.rgb.a = MALI_BLEND_OPERAND_A_SRC; b.equation.rgb.b = MALI_BLEND_OPERAND_B_SRC; b.equation.rgb.c = MALI_BLEND_OPERAND_C_ZERO;
 			b.equation.alpha.a = MALI_BLEND_OPERAND_A_SRC; b.equation.alpha.b = MALI_BLEND_OPERAND_B_SRC; b.equation.alpha.c = MALI_BLEND_OPERAND_C_ZERO;
 			b.internal.mode = MALI_BLEND_MODE_OPAQUE;
@@ -2025,6 +2026,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	if (ib) [_keep addObject:ib];
 	r->base_vertex = 0;
 	_ndraw++;
+	[self sm_split_blend];
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)it indexBuffer:(id)ib indexBufferOffset:(NSUInteger)off instanceCount:(NSUInteger)ic
 {
@@ -2033,8 +2035,9 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)it indexBuffer:(id)ib indexBufferOffset:(NSUInteger)off instanceCount:(NSUInteger)ic baseVertex:(NSInteger)bv baseInstance:(NSUInteger)bi
 {
 	if (ic != 1) return;
+	uint32_t first = _ndraw;
 	[self drawIndexedPrimitives:type indexCount:count indexType:it indexBuffer:ib indexBufferOffset:off];
-	if (_ndraw && _draws[_ndraw - 1].index_va) _draws[_ndraw - 1].base_vertex = (int32_t)bv;
+	for (uint32_t k = first; k < _ndraw; k++) if (_draws[k].index_va) _draws[k].base_vertex = (int32_t)bv;   /* both halves of a split */
 }
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
 {
@@ -2042,6 +2045,38 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	if (!r) return;
 	r->vcount = (uint32_t)count; r->vstart = (uint32_t)start;
 	_ndraw++;
+	[self sm_split_blend];
+}
+/* Wallpaper seam (run165 bisect): CoreAnimation's sourceAtop draws the head image with rgb = src * Da + dst * (1 - Sa).
+ * Mali fixed-function blending has one factor operand per equation and cannot do it (Mesa uses a blend shader); the
+ * draw fell back to opaque and painted the head where its mask is transparent. Split it into two fixed-function
+ * draws of the same geometry: A = dst * (1 - Sa) with alpha untouched, then B = dst + src * Da (Da still the
+ * original, A left alpha alone). Alpha (Da, 1 - Sa) is Sa*Da + Da*(1 - Sa) = Da: kept as is. Boot-arg sweetnosplit=1 off. */
+- (void)sm_split_blend
+{
+	static int off = -1;
+	if (off < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; off = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetnosplit=1") ? 1 : 0; }
+	if (off || !_ndraw || _ndraw >= 32) return;
+	sm_drawrec *r = &_draws[_ndraw - 1];
+	struct MALI_BLEND_FUNCTION f;
+	if (!r->blend_on || r->rgb_op != MTLBlendOperationAdd || sm_blend_func(r->rgb_op, r->rgb_sf, r->rgb_df, &f)) return;
+	if (r->rgb_sf != MTLBlendFactorDestinationAlpha && r->rgb_sf != MTLBlendFactorOneMinusDestinationAlpha) return;
+	uint32_t asf = r->a_sf, adf = r->a_df;
+	if (!sm_blend_func(r->a_op, asf, adf, &f)) {
+		if (r->a_op != MTLBlendOperationAdd || asf != MTLBlendFactorDestinationAlpha || adf != MTLBlendFactorOneMinusSourceAlpha) {
+			static int nl; if (nl++ < 4) slog("SweetMTL: blend split: alpha %u/%u/%u not handled", r->a_op, asf, adf);
+			return;
+		}
+		asf = MTLBlendFactorZero; adf = MTLBlendFactorOne;
+	}
+	sm_drawrec *b = &_draws[_ndraw];
+	memcpy(b, r, sizeof *b);
+	r->rgb_sf = MTLBlendFactorZero;                         /* A: rgb = dst * df(src), alpha kept */
+	r->a_op = MTLBlendOperationAdd; r->a_sf = MTLBlendFactorZero; r->a_df = MTLBlendFactorOne;
+	b->rgb_df = MTLBlendFactorOne;                          /* B: rgb = dst + src * sf(Da) */
+	b->a_sf = asf; b->a_df = adf;
+	_ndraw++;
+	static int nl; if (nl++ < 6) slog("SweetMTL: blend split: rgb %u/%u alpha %u/%u -> two draws", b->rgb_sf, r->rgb_df, b->a_sf, b->a_df);
 }
 - (sm_drawrec *)sm_record:(MTLPrimitiveType)type
 {

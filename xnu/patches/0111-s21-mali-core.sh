@@ -535,6 +535,17 @@ acd_init(void)
 		mali_log("dvfs: bad initdata chans=%x apmax=%u", chans, apmax);
 		return -1;
 	}
+	/* channel table dump (run165: the id-5 entry read q_len 1, which no sender can use) */
+	mali_log("dvfs: initdata chans=%x nch=%u apmax=%u", chans, ACD(ACD_INIT + 12), apmax);
+	for (uint32_t i = 0; i < apmax && i < 16; i++) {
+		uint32_t e = chans + i * 72U;
+		if (e + 72U > ACD_SRAM_SIZE) {
+			break;
+		}
+		mali_log("dvfs: ch[%u] id %u fld %u own %d ty %u rx %x/%x/%x ib %x/%x/%x tx %x/%x/%x q %u/%u cr %u mb %x poll %u",
+		    i, ACD(e), ACD(e + 4), (int)ACD(e + 8), ACD(e + 12), ACD(e + 16), ACD(e + 20), ACD(e + 24), ACD(e + 28), ACD(e + 32),
+		    ACD(e + 36), ACD(e + 40), ACD(e + 44), ACD(e + 48), ACD(e + 52), ACD(e + 56), ACD(e + 60), ACD(e + 64), ACD(e + 68));
+	}
 	for (uint32_t i = 0; i < apmax; i++) {
 		uint32_t e = chans + i * 72U;
 		if (e + 72U > ACD_SRAM_SIZE) {
