@@ -38,7 +38,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto ", "texmem ", "sharer", "bootdiag", "tolerated" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto ", "texmem ", "sharer", "bootdiag", "tolerated", "sampler wrap" };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -1040,10 +1040,13 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		{
 			for (uint32_t k = 0; k < 16; k++) {
 				bool nearest = k < r->nsmp ? r->smp[k].nearest : false;
+				uint32_t w = k < r->nsmp ? r->smp[k].wrap : 0;
 				pan_pack(P + 0xA00 + 32 * k, SAMPLER, sc) {
 					sc.minify_nearest = nearest; sc.magnify_nearest = nearest;
 					sc.normalized_coordinates = true;
 					sc.wrap_mode_s = sc.wrap_mode_t = sc.wrap_mode_r = MALI_WRAP_MODE_CLAMP_TO_EDGE;
+					if (w) { sc.wrap_mode_s = w & 0xFF; sc.wrap_mode_t = (w >> 8) & 0xFF; sc.wrap_mode_r = (w >> 16) & 0xFF; }
+					if (w >> 24) { sc.border_color_r = sc.border_color_g = sc.border_color_b = sc.border_color_a = 0x3F800000u; }
 				}
 			}
 			for (uint32_t k = 0; k < 8; k++) {
@@ -1881,6 +1884,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 
 @interface SweetMTLSampler : SweetMTLObject
 @property (nonatomic) uint32_t nearest;
+@property (nonatomic) uint32_t wrap;   /* Mali wrap modes s | t << 8 | r << 16 | border white << 24 (0 = clamp to edge) */
 @end
 @implementation SweetMTLSampler
 @end
@@ -2077,7 +2081,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 			if (sm_describe > 0) { static int nl; if (nl++ < 60) slog("SweetMTL:  rt%u draw%u %ux%u pf%lu%s fs %.40s", k, _ndraw, r->tex[k].w, r->tex[k].h,
 			    (unsigned long)t.pixelFormat, t.bo->imported ? " imp" : "", _pipeline.fs ? _pipeline.fs->name + (strncmp(_pipeline.fs->name, "com.apple.coreanimation.frag.", 29) ? 0 : 29) : "-"); }
 		}
-		if (_smp[k]) { r->smp[k].nearest = _smp[k].nearest; r->nsmp = k + 1; }
+		if (_smp[k]) { r->smp[k].nearest = _smp[k].nearest; r->smp[k].wrap = _smp[k].wrap; r->nsmp = k + 1; }
 	}
 	return r;
 }
@@ -3314,6 +3318,19 @@ static void sm_layer_hooks(void)
 {
 	SweetMTLSampler *smp = [SweetMTLSampler new];
 	smp.nearest = d.minFilter == MTLSamplerMinMagFilterNearest;
+	/* address modes as asked (always clamp-to-edge before: CA's ClampToZero layer edges drew a seam, run146+) */
+	uint32_t (^wm)(MTLSamplerAddressMode) = ^uint32_t(MTLSamplerAddressMode m) {
+		switch (m) {
+		case MTLSamplerAddressModeRepeat: return MALI_WRAP_MODE_REPEAT;
+		case MTLSamplerAddressModeMirrorRepeat: return MALI_WRAP_MODE_MIRRORED_REPEAT;
+		case MTLSamplerAddressModeMirrorClampToEdge: return MALI_WRAP_MODE_MIRRORED_CLAMP_TO_EDGE;
+		case MTLSamplerAddressModeClampToZero: case MTLSamplerAddressModeClampToBorderColor: return MALI_WRAP_MODE_CLAMP_TO_BORDER;
+		default: return MALI_WRAP_MODE_CLAMP_TO_EDGE;
+		}
+	};
+	bool white = d.sAddressMode == MTLSamplerAddressModeClampToBorderColor && d.borderColor == MTLSamplerBorderColorOpaqueWhite;
+	smp.wrap = wm(d.sAddressMode) | wm(d.tAddressMode) << 8 | wm(d.rAddressMode) << 16 | (white ? 1u << 24 : 0);
+	{ static int nl; if (smp.wrap != (MALI_WRAP_MODE_CLAMP_TO_EDGE * 0x10101u) && nl++ < 6) slog("SweetMTL: sampler wrap %x nearest %u", smp.wrap, smp.nearest); }
 	return smp;
 }
 - (id)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)o { return [[SweetMTLBuffer alloc] initWithLength:len bytes:NULL]; }
