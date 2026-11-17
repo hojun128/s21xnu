@@ -352,6 +352,13 @@ static char sm_cur_pass[96];      /* what was being drawn */
 static char sm_fail_log[240];     /* first GPU failures, also repeated in the alive lines */
 static id sm_last_target;         /* last full-screen render target (thumbnails are timed, an idle lock screen draws nothing) */
 static bool sm_is_poster(const char *pn);
+/* paired submit: the pass's fragment job rides along with its vertex chain in one kernel call (kernel runs it on slot 0
+ * after a clean vertex chain). sm_pair_ok: -1 unknown, 0 old kernel / sweetnopair, 1 on. */
+static uint64_t sm_pair_frag;
+static uint32_t sm_pair_status;
+static bool sm_pair_done;
+static int sm_pair_ok = -1;
+static uint32_t sm_check(uint32_t r, uint32_t slot);
 static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 {
 	if (sm_gpu_off) return 0xFFFCu;
@@ -380,10 +387,15 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 			 * there); run153's broken visuals turned out to be the page-table pool exhaustion, so this is re-tested */
 			{ static int dp = -1; if (dp < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; dp = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetdescpre=0") ? 0 : 1; }   /* on: run161 clean */
 			  ADD(sm_always[i], sm_always[i] == sm_desc_va ? (dp && sm_jlight && slot == 0 ? 0x10000 : sm_desc_span) : 0, dp ? PRE : PRE | POST); }
-		for (uint32_t i = 0; i < sm_njw; i++) ADD(sm_jw[i], sm_jwl[i], slot == 1 ? PRE : PRE | POST);
+		for (uint32_t i = 0; i < sm_njw; i++) ADD(sm_jw[i], sm_jwl[i], slot == 1 && !sm_pair_frag ? PRE : PRE | POST);
 #undef ADD
-		uint64_t in4[4] = { slot, jc, 4000, sm_wc == 1 ? 2 : 0 }, o4[5] = { 0xdead, 0, 0, 0, 0 }; uint32_t oc4 = 5;
-		kr = IOConnectCallMethod(sm_conn, 12, in4, 4, R, n * 16, o4, &oc4, NULL, NULL);
+		uint64_t in4[5] = { slot, jc, 4000, sm_wc == 1 ? 2 : 0, sm_pair_frag }, o4[6] = { 0xdead, 0, 0, 0, 0, 0xFFFFFFFF }; uint32_t oc4 = 6;
+		kr = IOConnectCallMethod(sm_conn, 12, in4, sm_pair_frag ? 5 : 4, R, n * 16, o4, &oc4, NULL, NULL);
+		if (!kr && sm_pair_frag) {
+			/* an old kernel ignores input 4 and returns at most 5 outputs: the fragment job did not run */
+			if (oc4 > 5 && o4[5] != 0xFFFFFFFFULL) { sm_pair_done = o4[5] != 0xFFFE; sm_pair_status = (uint32_t)o4[5]; if (sm_pair_ok < 0) { sm_pair_ok = 1; slog("SweetMTL: paired vertex+fragment submits on"); } }
+			else { sm_pair_ok = 0; slog("SweetMTL: kernel has no paired submit"); }
+		}
 		if (kr == (kern_return_t)0xe00002c7) { slog("SweetMTL: range flush unsupported: per-BO lists"); rangemode = 0; kr = 1; }
 		else {
 			out[0] = o4[0];
@@ -414,7 +426,12 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 	}
 	if (kr == 1) { oc = 1; kr = IOConnectCallMethod(sm_conn, 3, in, 3, NULL, 0, out, &oc, NULL, NULL); }
 	sm_pf_gpu_ns += sm_ns() - t0; sm_pf_jobs++;
+	if (sm_pair_done) sm_pf_jobs++;
 	uint32_t r = kr ? 0xffff0000u | (uint32_t)kr : (uint32_t)out[0];
+	return sm_check(r, slot);
+}
+static uint32_t sm_check(uint32_t r, uint32_t slot)
+{
 	static int nfail;
 	if (r && nfail < 3) {
 		nfail++;
@@ -1168,17 +1185,26 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		}
 		vs_all |= vst;
 	}
-	if (chain && nchain) {
-		uint32_t cst = sm_submit(1, first_va);
-		static int nl; if ((cst && cst != 0xFFFCu) || nl++ < 3) slog("SweetMTL: vertex chain of %u jobs -> %x", nchain, cst);
-		vs_all |= cst;
-	}
-	if (vstatus) *vstatus = vs_all;
 	pan_section_pack(cpu + OFF_FJOB, FRAGMENT_JOB, PAYLOAD, cfg) {
 		cfg.bound_min_x = 0; cfg.bound_min_y = 0; cfg.bound_max_x = (w - 1) >> 4; cfg.bound_max_y = (h - 1) >> 4;
 		cfg.tile_render_order = MALI_TILE_RENDER_ORDER_Z_ORDER; cfg.framebuffer = D + OFF_FBD;
 	}
 	pan_section_pack(cpu + OFF_FJOB, FRAGMENT_JOB, HEADER, header) { header.type = MALI_JOB_TYPE_FRAGMENT; header.index = 1; }
+	if (sm_pair_ok < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; if (sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetnopair")) sm_pair_ok = 0; }
+	if (chain && nchain) {
+		bool pair = sm_pair_ok != 0;
+		sm_pair_frag = pair ? D + OFF_FJOB : 0; sm_pair_done = false;
+		uint32_t cst = sm_submit(1, first_va);
+		sm_pair_frag = 0;
+		static int nl; if ((cst && cst != 0xFFFCu) || nl++ < 3) slog("SweetMTL: vertex chain of %u jobs -> %x", nchain, cst);
+		vs_all |= cst;
+		if (pair && sm_pair_done) {
+			sm_pair_done = false;
+			if (vstatus) *vstatus = vs_all;
+			return sm_check(sm_pair_status, 0);
+		}
+	}
+	if (vstatus) *vstatus = vs_all;
 	return sm_submit(0, D + OFF_FJOB);
 }
 

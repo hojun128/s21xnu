@@ -738,13 +738,19 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			n = 256;
 		}
 		uint64_t t0 = mach_absolute_time(), t1 = t0, t2 = t0;
+		uint32_t second = 0xFFFFFFFFU;
 		for (int pass = 0; pass < (sub ? 2 : 1); pass++) {
 			uint64_t want = sub ? (pass == 0 ? (1ULL << 62) : (1ULL << 63)) : ~0ULL;
 			if (pass == 1) {
 				t1 = mach_absolute_time();
 				smb_last_submit = t1;
-				args->scalarOutput[0] = sweet_mali_submit(fCtx, (uint32_t)args->scalarInput[0], args->scalarInput[1],
-				    (uint32_t)args->scalarInput[2] > 5000 ? 5000 : (uint32_t)args->scalarInput[2]);
+				uint32_t tmo = (uint32_t)args->scalarInput[2] > 5000 ? 5000 : (uint32_t)args->scalarInput[2];
+				args->scalarOutput[0] = sweet_mali_submit(fCtx, (uint32_t)args->scalarInput[0], args->scalarInput[1], tmo);
+				/* scalarInput[4]: a fragment job chain run on slot 0 right after a clean vertex/tiler chain (one call per
+				 * pass instead of two); its status comes back in scalarOutput[5] (0xFFFE = not run) */
+				if (ins > 4 && args->scalarInput[4]) {
+					second = args->scalarOutput[0] == 0 ? sweet_mali_submit(fCtx, 0, args->scalarInput[4], tmo) : 0xFFFEU;
+				}
 				t2 = mach_absolute_time();
 			}
 			for (uint32_t i = 0; i < SM_MAX_BO; i++) {
@@ -790,7 +796,8 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			if (oc > 2) { absolutetime_to_nanoseconds(t2 - t1, &ns); args->scalarOutput[2] = ns; }
 			if (oc > 3) { absolutetime_to_nanoseconds(t3 - t2, &ns); args->scalarOutput[3] = ns; }
 			if (oc > 4) { absolutetime_to_nanoseconds(lk1 - lk0, &ns); args->scalarOutput[4] = ns; }
-			args->scalarOutputCount = oc > 5 ? 5 : oc;
+			if (oc > 5) { args->scalarOutput[5] = second; }
+			args->scalarOutputCount = oc > 6 ? 6 : oc;
 		}
 		ret = kIOReturnSuccess;
 		break;
