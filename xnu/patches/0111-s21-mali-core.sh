@@ -88,7 +88,7 @@ static struct {
 	int         up, powered;
 } mali;
 
-static char mali_keep[3072];
+static char mali_keep[8192];
 static uint32_t mali_keep_len;
 static void mali_log(const char *fmt, ...) __printflike(1, 2);
 static void
@@ -102,7 +102,9 @@ mali_log(const char *fmt, ...)
 	printf("sweet_mali: %s\n", line);
 	s21_plog(line);
 	/* job failures/timeouts are also kept for the replay before a recovery reboot (sweet_mali_keep_dump) */
-	if (!strncmp(line, "job ", 4) || !strncmp(line, "fault", 5) || !strncmp(line, "recover", 7)) {
+	/* ... and the clock settings and present-copy timings, which the 128 KiB ring loses by the end of a run (run164) */
+	if (!strncmp(line, "job ", 4) || !strncmp(line, "fault", 5) || !strncmp(line, "recover", 7) ||
+	    !strncmp(line, "dvfs", 4) || !strncmp(line, "gpucomp:", 8)) {
 		size_t n = strlen(line);
 		if (mali_keep_len + n + 2 < sizeof(mali_keep)) {
 			memcpy(mali_keep + mali_keep_len, line, n);

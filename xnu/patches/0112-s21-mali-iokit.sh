@@ -1239,8 +1239,9 @@ sweet_mali_blit(IOMemoryDescriptor *srcmd, uint64_t srcoff, uint32_t srcbpr, uin
 			smb_fl_ns += a;
 			smb_job_ns += b;
 		}
-		if (smb_ok == 1 || (smb_ok % 600) == 0) {
-			sm_log("gpucomp: ok=%llu fail=%llu last %llux...", smb_ok, smb_fail, ((uint64_t)w << 32) | h);
+		if (smb_ok == 1 || (smb_ok % 300) == 0) {
+			{ uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+			  sm_log("gpucomp: ok=%llu fail=%llu at %llus", smb_ok, smb_fail, ns / 1000000000ULL); }
 			sm_log("gpucomp: avg flush %llu us job %llu us, full flushes %llu", smb_fl_ns / 1000 / (smb_ok ? smb_ok : 1),
 			    smb_job_ns / 1000 / (smb_ok ? smb_ok : 1), smb_flushes);
 		}

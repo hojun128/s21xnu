@@ -50,8 +50,10 @@ static void slog(const char *fmt, ...)
 		if (sm_rep_len + n + 2 < sizeof sm_rep) { memcpy(sm_rep + sm_rep_len, b, n); sm_rep_len += n; sm_rep[sm_rep_len++] = '\n'; sm_rep[sm_rep_len] = 0; }
 		/* and into the kernel's keep buffer (all processes), replayed right before a recovery reboot */
 		if (sm_conn) {
-			static int nk; char kb[176];
-			if (nk++ < 300) {
+			static int nk, nkp; char kb[176];
+			/* perf / bisect lines get their own budget: the first 300 kept lines are mostly pass descriptions (run164) */
+			bool imp = strstr(b, "perf ") || strstr(b, "bisect2");
+			if (imp ? nkp++ < 120 : nk++ < 300) {
 				const char *pn = getprogname();
 				int L = snprintf(kb, sizeof kb, "K %.5s %s", pn ? pn : "?", strncmp(b, "SweetMTL: ", 10) ? b : b + 10);
 				IOConnectCallMethod(sm_conn, 9, NULL, 0, kb, (size_t)(L < (int)sizeof kb ? L : (int)sizeof kb - 1), NULL, NULL, NULL, NULL);
@@ -2444,13 +2446,15 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 				 * wallpaper (600,1500): the first k that turns the inside pixel black is the culprit */
 				uint8_t *save = NULL; static int nbis2;
 				uint32_t W = (uint32_t)e.target.width, H = (uint32_t)e.target.height, bpr = (uint32_t)e.target.bytesPerRow;
-				bool lay = (W == 1082 && H == 1226) || (W == 1085 && H == 1227);
+				/* the head layer offscreen is 1082x1226 / 1085x1227 / 1064x1150 depending on the zoom (run164): match a range */
+				bool lay = W >= 1000 && W <= 1120 && H >= 1100 && H <= 1260;
 				/* wallpaper seam (run163): the head layer (1085x1227) must be transparent where its mask is (top-left corner),
 				 * yet the screen looked lighter inside it: sample the layer at (20,20) (mask 0) and the screen at (100,100)
 				 * (inside the layer, mask 0) against (20,100) (left of the layer) */
-				uint32_t ix = lay ? 20 : 100, iy = lay ? 20 : 100, ox = lay ? W / 2 : 20, oy = lay ? 300 : 100;
+				/* run164 thumbnail: the lighter rectangle spans screen x 40..1125, y 120..1700: inside (80,400) vs left of it (20,400) */
+				uint32_t ix = lay ? 20 : 80, iy = lay ? 20 : 400, ox = lay ? W / 2 : 20, oy = lay ? 300 : 400;
 				bool scr = e.load && (W == 1125 || W == 1127) && (H == 2436 || H == 2438) && e->_ndraw >= 2;
-				if (sm_describe > 0 && (scr || lay) && e.target.bo->cpu && nbis2 < 8) {
+				if (sm_describe > 0 && (scr || lay) && e.target.bo->cpu && nbis2 < 12) {
 					sm_target_noflush = false;   /* the CPU reads and rewrites this target here: keep cache maintenance on */
 					sm_flush_now(e.target.bo->gpu, (uint64_t)bpr * H);
 					save = malloc((size_t)bpr * H); if (save) memcpy(save, e.target.bo->cpu, (size_t)bpr * H);
