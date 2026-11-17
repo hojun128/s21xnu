@@ -1161,6 +1161,7 @@ sweet_mali_blit(IOMemoryDescriptor *srcmd, uint64_t srcoff, uint32_t srcbpr, uin
 	}
 	IOLockLock(sm_lock);
 	int ret = -1;
+	uint64_t bt0 = 0, bt1 = 0;
 	uint64_t sva = 0, last = srcoff + (uint64_t)(h - 1) * srcbpr + (uint64_t)w * 4;
 	if (!smb_init(fbpa, fbsize) || dstoff + (uint64_t)(h - 1) * fbbpr + (uint64_t)w * 4 > fbsize ||
 	    last > srcmd->getLength() || (sva = smb_src_va(srcmd)) == 0) {
@@ -1171,7 +1172,7 @@ sweet_mali_blit(IOMemoryDescriptor *srcmd, uint64_t srcoff, uint32_t srcbpr, uin
 	 * dirty lines left from before the GPU took it over: flushing the whole 11 MB surface on every vsync held sm_lock
 	 * for milliseconds per frame (run163). A source is flushed again whenever no GPU job was submitted in the last
 	 * 2 s (CPU fallback). Boot-arg sweetpresflush=1 = always flush. */
-	uint64_t bt0 = mach_absolute_time(), bt1;
+	bt0 = mach_absolute_time();
 	{
 		static int always = -1;
 		if (always < 0) {
