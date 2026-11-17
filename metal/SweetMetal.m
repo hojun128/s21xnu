@@ -366,7 +366,10 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 		for (uint32_t i = 0; i < sm_nalways; i++)
 			/* descriptors: flushed before the job only (the CPU never reads what the GPU writes there and rewrites whole
 			 * slots after a clean+invalidate); later jobs of a pass only changed the pass header */
-			ADD(sm_always[i], sm_always[i] == sm_desc_va ? sm_desc_span : 0, PRE | POST);   /* PRE-only lost the dock blur and widget corners (run153) */
+			/* descriptors: boot-arg sweetdescpre=1 flushes them before jobs only (the CPU never reads what the GPU writes
+			 * there); run153's broken visuals turned out to be the page-table pool exhaustion, so this is re-tested */
+			{ static int dp = -1; if (dp < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; dp = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetdescpre=1") ? 1 : 0; }
+			  ADD(sm_always[i], sm_always[i] == sm_desc_va ? (dp && sm_jlight && slot == 0 ? 0x10000 : sm_desc_span) : 0, dp ? PRE : PRE | POST); }
 		for (uint32_t i = 0; i < sm_njw; i++) ADD(sm_jw[i], sm_jwl[i], slot == 1 ? PRE : PRE | POST);
 #undef ADD
 		uint64_t in4[4] = { slot, jc, 4000, sm_wc == 1 ? 2 : 0 }, o4[4] = { 0xdead, 0, 0, 0 }; uint32_t oc4 = 4;
@@ -858,7 +861,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	sm_desc_span = 0x10000; uint32_t sm_slot_cur = 0x10000;
 	/* compact draw slots are opt-in (boot-arg sweetcompact=1): with them the dock blur and widget corners broke and a
 	 * fragment job page-faulted (runs 150-154); fixed 64 KiB slots as before */
-	static int compact = -1; if (compact < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; compact = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetcompact=1") ? 1 : 0; }
+	static int compact = -1; if (compact < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; compact = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetcompact=0") ? 0 : 1; }   /* on: run160 clean */
 	for (uint32_t i = 0; i < ndraw; i++) {
 		const sm_drawrec *r = &dr[i];
 		for (int k = 0; k < 31; k++) { sm_jl_add(r->buf[k]); sm_jl_add(r->fbuf[k]); }
