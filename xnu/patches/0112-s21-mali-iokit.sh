@@ -79,6 +79,7 @@ static char sm_keep_buf[40960];
 static uint32_t sm_keep_len;
 
 static IOLock *sm_lock;                 /* serializes all hardware / context calls */
+static uint64_t smb_last_submit;        /* mach time of the last client job (present-copy flush policy) */
 static uint64_t sm_total;               /* bytes of BOs alive */
 
 static void
@@ -553,7 +554,9 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		    (int)args->scalarInput[2], (int)args->scalarInput[3]);
 		return kIOReturnSuccess;
 	}
+	uint64_t lk0 = mach_absolute_time();
 	IOLockLock(sm_lock);
+	uint64_t lk1 = mach_absolute_time();   /* lock wait (vsync panel copies hold the lock), returned by kSMSubmitRange */
 	switch (selector) {
 	case kSMGetInfo: {
 		uint32_t info[6];
@@ -739,6 +742,7 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			uint64_t want = sub ? (pass == 0 ? (1ULL << 62) : (1ULL << 63)) : ~0ULL;
 			if (pass == 1) {
 				t1 = mach_absolute_time();
+				smb_last_submit = t1;
 				args->scalarOutput[0] = sweet_mali_submit(fCtx, (uint32_t)args->scalarInput[0], args->scalarInput[1],
 				    (uint32_t)args->scalarInput[2] > 5000 ? 5000 : (uint32_t)args->scalarInput[2]);
 				t2 = mach_absolute_time();
@@ -785,7 +789,8 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			if (oc > 1) { absolutetime_to_nanoseconds(t1 - t0, &ns); args->scalarOutput[1] = ns; }
 			if (oc > 2) { absolutetime_to_nanoseconds(t2 - t1, &ns); args->scalarOutput[2] = ns; }
 			if (oc > 3) { absolutetime_to_nanoseconds(t3 - t2, &ns); args->scalarOutput[3] = ns; }
-			args->scalarOutputCount = oc > 4 ? 4 : oc;
+			if (oc > 4) { absolutetime_to_nanoseconds(lk1 - lk0, &ns); args->scalarOutput[4] = ns; }
+			args->scalarOutputCount = oc > 5 ? 5 : oc;
 		}
 		ret = kIOReturnSuccess;
 		break;
@@ -1135,6 +1140,8 @@ smb_src_va(IOMemoryDescriptor *md)
 	return base;
 }
 
+static uintptr_t smb_seen_md[8];
+static uint64_t smb_seen_pa[8], smb_seen_i, smb_fl_ns, smb_job_ns, smb_flushes;
 int sweet_mali_blit(IOMemoryDescriptor *srcmd, uint64_t srcoff, uint32_t srcbpr, uint64_t fbpa, uint32_t fbbpr,
     uint64_t fbsize, uint64_t dstoff, uint32_t w, uint32_t h);
 
@@ -1152,14 +1159,47 @@ sweet_mali_blit(IOMemoryDescriptor *srcmd, uint64_t srcoff, uint32_t srcbpr, uin
 	    last > srcmd->getLength() || (sva = smb_src_va(srcmd)) == 0) {
 		goto out;
 	}
-	/* CoreAnimation wrote the source through the CPU caches */
-	for (uint64_t o = srcoff & ~0xFFFULL; o < last; o += 4096) {
-		IOByteCount l = 0;
-		uint64_t pa = srcmd->getPhysicalSegment((IOByteCount)o, &l, kIOMemoryMapperNone);
-		if (pa != 0) {
-			sm_flush_pa(pa & ~0xFFFULL, 4096);
+	/* a CPU-drawn source sits in the CPU caches: clean it to memory first. A Mali-rendered source (backboardd's Metal
+	 * plugin draws every layer with the GPU and never touches render targets with the CPU) only needs this once, for
+	 * dirty lines left from before the GPU took it over: flushing the whole 11 MB surface on every vsync held sm_lock
+	 * for milliseconds per frame (run163). A source is flushed again whenever no GPU job was submitted in the last
+	 * 2 s (CPU fallback). Boot-arg sweetpresflush=1 = always flush. */
+	uint64_t bt0 = mach_absolute_time(), bt1;
+	{
+		static int always = -1;
+		if (always < 0) {
+			always = 0;
+			PE_parse_boot_argn("sweetpresflush", &always, sizeof(always));
+		}
+		IOByteCount l0 = 0;
+		uint64_t pa0 = srcmd->getPhysicalSegment((IOByteCount)(srcoff & ~0xFFFULL), &l0, kIOMemoryMapperNone);
+		uint64_t ns_since = ~0ULL;
+		if (smb_last_submit) {
+			absolutetime_to_nanoseconds(bt0 - smb_last_submit, &ns_since);
+		}
+		bool known = false;
+		for (int i = 0; i < 8; i++) {
+			if (smb_seen_md[i] == (uintptr_t)srcmd && smb_seen_pa[i] == pa0) {
+				known = true;
+			}
+		}
+		if (always || !known || ns_since > 2000000000ULL) {
+			for (uint64_t o = srcoff & ~0xFFFULL; o < last; o += 4096) {
+				IOByteCount l = 0;
+				uint64_t pa = srcmd->getPhysicalSegment((IOByteCount)o, &l, kIOMemoryMapperNone);
+				if (pa != 0) {
+					sm_flush_pa(pa & ~0xFFFULL, 4096);
+				}
+			}
+			smb_flushes++;
+			if (!known) {
+				smb_seen_md[smb_seen_i & 7] = (uintptr_t)srcmd;
+				smb_seen_pa[smb_seen_i & 7] = pa0;
+				smb_seen_i++;
+			}
 		}
 	}
+	bt1 = mach_absolute_time();
 	{
 		uint8_t *d = (uint8_t *)smb_desc->getBytesNoCopy();
 		uint32_t *j = (uint32_t *)d;
@@ -1184,8 +1224,17 @@ sweet_mali_blit(IOMemoryDescriptor *srcmd, uint64_t srcoff, uint32_t srcbpr, uin
 			}
 			sm_log("gpucomp: job status %llx fails %llu (dead=%llu)", r, smb_fail, smb_dead);
 		}
+		{
+			uint64_t bt2 = mach_absolute_time(), a, b;
+			absolutetime_to_nanoseconds(bt1 - bt0, &a);
+			absolutetime_to_nanoseconds(bt2 - bt1, &b);
+			smb_fl_ns += a;
+			smb_job_ns += b;
+		}
 		if (smb_ok == 1 || (smb_ok % 600) == 0) {
 			sm_log("gpucomp: ok=%llu fail=%llu last %llux...", smb_ok, smb_fail, ((uint64_t)w << 32) | h);
+			sm_log("gpucomp: avg flush %llu us job %llu us, full flushes %llu", smb_fl_ns / 1000 / (smb_ok ? smb_ok : 1),
+			    smb_job_ns / 1000 / (smb_ok ? smb_ok : 1), smb_flushes);
 		}
 	}
 out:

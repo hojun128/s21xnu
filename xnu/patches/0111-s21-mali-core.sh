@@ -21,6 +21,7 @@ cat > bsd/dev/sweet_mali.c <<'EOF_SWEET_SRC'
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <kern/clock.h>
+#include <mach/mach_time.h>
 #include <machine/machine_routines.h>
 #include <arm/caches_internal.h>
 #include <vm/pmap.h>
@@ -498,6 +499,182 @@ mali_selftest_heap(void)
 	return o[0] == 0xC0FFEE02U ? 0 : -1;
 }
 
+/* ---- ACPM DVFS: CPU/GPU clocks. S-Boot leaves the GPU at its DVFS start clock (221 MHz, DT gpu_dvfs_start_clock)
+ * and nothing in XNU ever raised a clock. Protocol = Samsung acpm_dvfs (also mainline exynos-acpm-dvfs.c): 4 words
+ * { domain id | seq << 16, rate kHz, 0 = FREQ_REQ / 1 = FREQ_GET, 0 } on the acpm_dvfs IPC channel (5 in the
+ * SM-G991N DT); domain ids = cal_id & 0xFFF (dm_domains: MIF 0, INT 1, CL0 2, CL1 3, CL2 4, DSU 6, G3D 11).
+ * Boot-args (kHz): sweetdvfs=0 off, sweetg3d, sweetcl0, sweetcl1, sweetcl2, sweetdsu, sweetmif (0 = leave). ---- */
+#define ACD_SRAM      0x02039000U
+#define ACD_SRAM_SIZE 0x41000U
+#define ACD_INIT      0x8000U
+#define ACD_MBOX      0x15900000U
+#define ACD_CH        5U
+static vm_offset_t acd_sram, acd_mbox;
+static uint32_t acd_seq;
+static int acd_state;   /* 0 = not tried, 1 = ok, -1 = unusable */
+static struct { uint32_t txr, txf, txb, rxr, rxf, rxb, len, sz; } acd;
+#define ACD(o) (*(volatile uint32_t *)(acd_sram + (o)))
+
+static int
+acd_init(void)
+{
+	if (acd_state) {
+		return acd_state > 0 ? 0 : -1;
+	}
+	acd_state = -1;
+	acd_sram = ml_io_map(ACD_SRAM, ACD_SRAM_SIZE);
+	acd_mbox = ml_io_map(ACD_MBOX, 0x1000);
+	if (!acd_sram || !acd_mbox) {
+		mali_log("dvfs: map failed");
+		return -1;
+	}
+	uint32_t chans = ACD(ACD_INIT + 8), apmax = ACD(ACD_INIT + 24);
+	if (chans == 0 || chans >= ACD_SRAM_SIZE || apmax == 0 || apmax > 32) {
+		mali_log("dvfs: bad initdata chans=%x apmax=%u", chans, apmax);
+		return -1;
+	}
+	for (uint32_t i = 0; i < apmax; i++) {
+		uint32_t e = chans + i * 72U;
+		if (e + 72U > ACD_SRAM_SIZE) {
+			break;
+		}
+		if (ACD(e) != ACD_CH) {
+			continue;
+		}
+		acd.txr = ACD(e + 16); acd.txf = ACD(e + 20); acd.txb = ACD(e + 24);
+		acd.rxr = ACD(e + 40); acd.rxf = ACD(e + 44); acd.rxb = ACD(e + 48);
+		acd.len = ACD(e + 52); acd.sz = ACD(e + 56);
+		if (acd.len == 0 || acd.len > 64 || acd.sz < 16 || acd.sz > 64 || acd.txb >= ACD_SRAM_SIZE || acd.rxb >= ACD_SRAM_SIZE ||
+		    acd.txf >= ACD_SRAM_SIZE || acd.rxf >= ACD_SRAM_SIZE || acd.txr >= ACD_SRAM_SIZE || acd.rxr >= ACD_SRAM_SIZE) {
+			mali_log("dvfs: ch%u bad queue len=%u sz=%u", ACD_CH, acd.len, acd.sz);
+			return -1;
+		}
+		acd_state = 1;
+		mali_log("dvfs: ch%u len=%u sz=%u", ACD_CH, acd.len, acd.sz);
+		return 0;
+	}
+	mali_log("dvfs: ch%u not found", ACD_CH);
+	return -1;
+}
+
+/* one request; returns the reply's word 1 or -1 (no reply within ~wait_ms) */
+static int64_t
+acd_xfer(uint32_t id, uint32_t w1, uint32_t type, uint32_t wait_ms)
+{
+	if (acd_init()) {
+		return -1;
+	}
+	if (++acd_seq >= 64) {
+		acd_seq = 1;
+	}
+	uint32_t cmd[4] = { (id & 0xFFFU) | ((acd_seq & 0x3FU) << 16), w1, type, 0 };
+	uint32_t front = ACD(acd.txf);
+	if (front >= acd.len) {
+		mali_log("dvfs: bad tx front %u", front);
+		return -1;
+	}
+	uint32_t next = (front + 1) % acd.len;
+	for (int t = 0; t < 200 && next == ACD(acd.txr); t++) {
+		us(100);
+	}
+	if (next == ACD(acd.txr)) {
+		mali_log("dvfs: tx full");
+		return -1;
+	}
+	for (uint32_t w = 0; w < acd.sz / 4; w++) {
+		ACD(acd.txb + acd.sz * front + w * 4) = w < 4 ? cmd[w] : 0;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	ACD(acd.txf) = next;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(acd_mbox + 0x08) = (1U << ACD_CH) << 16;   /* INTGR0 */
+	for (uint32_t t = 0; t < wait_ms * 10; t++) {
+		uint32_t f = ACD(acd.rxf), i = ACD(acd.rxr);
+		while (i != f && i < acd.len) {
+			uint32_t e = acd.rxb + acd.sz * i;
+			if (((ACD(e) >> 16) & 0x3FU) == (acd_seq & 0x3FU)) {
+				uint32_t r1 = ACD(e + 4);
+				ACD(acd.rxr) = (i + 1) % acd.len;
+				*(volatile uint32_t *)(acd_mbox + 0x20) = 1U << ACD_CH;   /* INTCR1 */
+				return (int64_t)r1;
+			}
+			i = (i + 1) % acd.len;
+		}
+		us(100);
+	}
+	return -1;
+}
+
+/* GPU clock from its cycle counter against the system timer */
+static uint32_t
+mali_measure_mhz(void)
+{
+	wr(R_GPU_CMD, 0x05U);   /* CYCLE_COUNT_START */
+	us(50);
+	uint64_t c0 = rd(0x090U) | ((uint64_t)rd(0x094U) << 32), t0 = mach_absolute_time();
+	us(2000);
+	uint64_t c1 = rd(0x090U) | ((uint64_t)rd(0x094U) << 32), t1 = mach_absolute_time(), ns;
+	wr(R_GPU_CMD, 0x06U);   /* CYCLE_COUNT_STOP */
+	absolutetime_to_nanoseconds(t1 - t0, &ns);
+	return ns ? (uint32_t)((c1 - c0) * 1000ULL / ns) : 0;
+}
+
+/* boot CPU clock: a chain of dependent adds runs at one per cycle on A55/A78/X1 */
+static uint32_t
+cpu_measure_mhz(void)
+{
+	uint64_t x = 0, t0 = mach_absolute_time(), ns;
+	for (int i = 0; i < 200000; i++) {
+		__asm__ volatile ("add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n"
+		                  "add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1" : "+r"(x));
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	return ns ? (uint32_t)(x * 1000ULL / ns) : 0;
+}
+
+static void
+mali_dvfs(int gpu_ready)
+{
+	int on = 1;
+	PE_parse_boot_argn("sweetdvfs", &on, sizeof(on));
+	static const struct { const char *name, *arg; uint32_t id, def; } D[] = {
+		{ "mif", "sweetmif", 0, 0 },          /* S-Boot runs MIF at its boot level (3172 MHz) */
+		{ "dsu", "sweetdsu", 6, 1586000 },    /* DT dm-table: CL2 2288 MHz needs DSU >= 1586 MHz */
+		{ "cl0", "sweetcl0", 2, 1794000 },
+		{ "cl1", "sweetcl1", 3, 2080000 },
+		{ "cl2", "sweetcl2", 4, 2288000 },
+		{ "g3d", "sweetg3d", 11, 676000 },
+		{ "int", "sweetint", 1, 0 },
+	};
+	char ln[192]; int L = 0;
+	uint32_t g0 = gpu_ready ? mali_measure_mhz() : 0, c0 = cpu_measure_mhz();
+	for (unsigned i = 0; i < sizeof(D) / sizeof(D[0]); i++) {
+		int64_t cur = acd_xfer(D[i].id, 0, 1, 20);
+		L += snprintf(ln + L, sizeof(ln) - L, " %s %lld", D[i].name, cur);
+		if (acd_state < 0) {
+			break;
+		}
+	}
+	mali_log("dvfs before (kHz):%s gpu %u MHz cpu %u MHz", ln, g0, c0);
+	if (!on || acd_state < 0) {
+		return;
+	}
+	L = 0;
+	for (unsigned i = 0; i < sizeof(D) / sizeof(D[0]); i++) {
+		uint32_t f = D[i].def;
+		PE_parse_boot_argn(D[i].arg, &f, sizeof(f));
+		if (!f) {
+			continue;
+		}
+		int64_t r = acd_xfer(D[i].id, f, 0, 20);
+		us(1000);
+		int64_t now = acd_xfer(D[i].id, 0, 1, 20);
+		L += snprintf(ln + L, sizeof(ln) - L, " %s %u->%lld(%lld)", D[i].name, f, now, r);
+	}
+	uint32_t g1 = gpu_ready ? mali_measure_mhz() : 0, c1 = cpu_measure_mhz();
+	mali_log("dvfs set:%s gpu %u MHz cpu %u MHz", ln, g1, c1);
+}
+
 void sweet_mali_boot(void);
 
 void
@@ -552,6 +729,7 @@ sweet_mali_boot(void)
 		return;
 	}
 	mali_log("powered: shader=%x tiler=%x l2=%x", rd(R_SHADER_READY), rd(R_TILER_READY), rd(R_L2_READY));
+	mali_dvfs(1);
 	mali_selftest();
 	mali_selftest_heap();
 	mali_log("ready, left powered (pool used %u of %u pages)", mali.pool_next, mali.pool_pages);

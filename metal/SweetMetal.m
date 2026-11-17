@@ -104,7 +104,7 @@ static bool sm_jlight;
 static uint64_t sm_jr[480], sm_jw[24], sm_jrl[480], sm_jwl[24]; static uint32_t sm_njr, sm_njw; static bool sm_jover;
 static uint64_t sm_infra_len[16];     /* bytes to flush from the BO start (0 = the whole BO) */
 static uint64_t sm_desc_va, sm_desc_span = 0;   /* the pass descriptor BO: only the part the current pass wrote */
-static volatile uint64_t sm_pf_pre_ns, sm_pf_job_ns, sm_pf_post_ns;
+static volatile uint64_t sm_pf_pre_ns, sm_pf_job_ns, sm_pf_post_ns, sm_pf_lock_ns;
 static void sm_ring_take(uint64_t *va, uint64_t *len);
 static int sm_listmode = -1;   /* -1 unknown, 0 off (boot-arg sweetflushall or old kernel), 1 on */
 static void sm_infra_add(const sm_bo *b) { if (b && b->gpu && sm_ninfra < 16) sm_infra[sm_ninfra++] = b->gpu; }
@@ -382,12 +382,12 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 			  ADD(sm_always[i], sm_always[i] == sm_desc_va ? (dp && sm_jlight && slot == 0 ? 0x10000 : sm_desc_span) : 0, dp ? PRE : PRE | POST); }
 		for (uint32_t i = 0; i < sm_njw; i++) ADD(sm_jw[i], sm_jwl[i], slot == 1 ? PRE : PRE | POST);
 #undef ADD
-		uint64_t in4[4] = { slot, jc, 4000, sm_wc == 1 ? 2 : 0 }, o4[4] = { 0xdead, 0, 0, 0 }; uint32_t oc4 = 4;
+		uint64_t in4[4] = { slot, jc, 4000, sm_wc == 1 ? 2 : 0 }, o4[5] = { 0xdead, 0, 0, 0, 0 }; uint32_t oc4 = 5;
 		kr = IOConnectCallMethod(sm_conn, 12, in4, 4, R, n * 16, o4, &oc4, NULL, NULL);
 		if (kr == (kern_return_t)0xe00002c7) { slog("SweetMTL: range flush unsupported: per-BO lists"); rangemode = 0; kr = 1; }
 		else {
 			out[0] = o4[0];
-			if (!kr) { sm_jlight = true; sm_pf_pre_ns += o4[1]; sm_pf_job_ns += o4[2]; sm_pf_post_ns += o4[3]; }
+			if (!kr) { sm_jlight = true; sm_pf_pre_ns += o4[1]; sm_pf_job_ns += o4[2]; sm_pf_post_ns += o4[3]; if (oc4 > 4) sm_pf_lock_ns += o4[4]; }
 			static int nl; if (!kr && nl++ < 3) slog("SweetMTL: range flush job: %u ranges, pre %llu us job %llu us post %llu us", n, o4[1] / 1000, o4[2] / 1000, o4[3] / 1000);
 		}
 	}
@@ -2400,8 +2400,14 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 				uint8_t *save = NULL; static int nbis2;
 				uint32_t W = (uint32_t)e.target.width, H = (uint32_t)e.target.height, bpr = (uint32_t)e.target.bytesPerRow;
 				bool lay = (W == 1082 && H == 1226) || (W == 1085 && H == 1227);
-				uint32_t ix = lay ? W / 2 : 600, iy = lay ? 300 : 300, ox = lay ? W / 2 : 600, oy = lay ? 1100 : 1500;
-				if (sm_describe > 0 && ((e.load && W == 1125 && H == 2436 && e->_ndraw >= 2) || lay) && e.target.bo->cpu && nbis2 < 6) {
+				/* wallpaper seam (run163): the head layer (1085x1227) must be transparent where its mask is (top-left corner),
+				 * yet the screen looked lighter inside it: sample the layer at (20,20) (mask 0) and the screen at (100,100)
+				 * (inside the layer, mask 0) against (20,100) (left of the layer) */
+				uint32_t ix = lay ? 20 : 100, iy = lay ? 20 : 100, ox = lay ? W / 2 : 20, oy = lay ? 300 : 100;
+				bool scr = e.load && (W == 1125 || W == 1127) && (H == 2436 || H == 2438) && e->_ndraw >= 2;
+				if (sm_describe > 0 && (scr || lay) && e.target.bo->cpu && nbis2 < 8) {
+					sm_target_noflush = false;   /* the CPU reads and rewrites this target here: keep cache maintenance on */
+					sm_flush_now(e.target.bo->gpu, (uint64_t)bpr * H);
 					save = malloc((size_t)bpr * H); if (save) memcpy(save, e.target.bo->cpu, (size_t)bpr * H);
 				}
 				_lastJobStatus = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
@@ -2883,7 +2889,7 @@ static void sm_perf_reset(void)
 {
 	sm_pf_ns = sm_pf_gpu_ns = sm_pf_max_ns = 0; sm_pf_n = sm_pf_jobs = sm_pf_draws = 0;
 	memset((void *)sm_pf_gap, 0, sizeof sm_pf_gap); sm_pf_win = sm_ns();
-	sm_pf_pre_ns = sm_pf_job_ns = sm_pf_post_ns = 0;
+	sm_pf_pre_ns = sm_pf_job_ns = sm_pf_post_ns = sm_pf_lock_ns = 0;
 }
 static void sm_perf_report(const char *what, long now)
 {
@@ -2891,7 +2897,7 @@ static void sm_perf_report(const char *what, long now)
 	slog("SweetMTL: perf %s: %.1fs %u commits (%.1f/s) commit avg %.2fms max %.1fms gpu %.2fms/commit %u jobs %.0f draws/commit gaps<20:%u <40:%u <100:%u more:%u",
 	    what, win / 1e9, sm_pf_n, win ? sm_pf_n * 1e9 / win : 0.0, sm_pf_ns / 1e6 / n, sm_pf_max_ns / 1e6, sm_pf_gpu_ns / 1e6 / n, sm_pf_jobs,
 	    (double)sm_pf_draws / n, sm_pf_gap[0], sm_pf_gap[1], sm_pf_gap[2], sm_pf_gap[3]);
-	slog("SweetMTL: perf %s kernel: flush-before %.1fms job %.1fms flush-after %.1fms per commit", what, sm_pf_pre_ns / 1e6 / n, sm_pf_job_ns / 1e6 / n, sm_pf_post_ns / 1e6 / n);
+	slog("SweetMTL: perf %s kernel: flush-before %.1fms job %.1fms flush-after %.1fms lock-wait %.1fms per commit", what, sm_pf_pre_ns / 1e6 / n, sm_pf_job_ns / 1e6 / n, sm_pf_post_ns / 1e6 / n, sm_pf_lock_ns / 1e6 / n);
 	(void)now;
 }
 static void sm_swipe_up(void)
