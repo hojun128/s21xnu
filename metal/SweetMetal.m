@@ -189,10 +189,12 @@ void sm_va_give_ext(uint64_t va, uint64_t size) { sm_va_give(va, size); }
 static void sm_bo_free(sm_bo *bo)
 {
 	if (!sm_conn || !bo->handle) return;
-	if (bo->vsize) { sm_va_give(bo->vbase, bo->vsize); sm_live_bytes -= bo->vsize; sm_live_n--; }
 	if (!bo->imported && bo->cpu) IOConnectUnmapMemory64(sm_conn, (uint32_t)bo->handle, mach_task_self(), (mach_vm_address_t)bo->cpu);
 	uint64_t in[1] = { bo->handle }; uint32_t oc = 0;
 	IOConnectCallMethod(sm_conn, 4, in, 1, NULL, 0, NULL, &oc, NULL, NULL);
+	/* the VA goes back only after the kernel unmapped it: given back first, another thread could map a new BO there
+	 * and then have its pages unmapped by this destroy (GPU translation faults, run157/158) */
+	if (bo->vsize) { sm_va_give(bo->vbase, bo->vsize); sm_live_bytes -= bo->vsize; sm_live_n--; }
 	memset(bo, 0, sizeof *bo);
 }
 /* Wire a range of this process's memory (an IOSurface) and map it into the GPU address space. */
