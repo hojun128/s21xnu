@@ -61,6 +61,15 @@ def main(root):
         os.makedirs(dst, exist_ok=True)
         shutil.move(hal, os.path.join(dst, 'VirtualAudio.plugin'))
         print('VirtualAudio.plugin moved aside')
+    # The CPU hog itself (plugin hog sampler, run200): BTAudioHALPlugin inside mediaserverd reconnects to the Bluetooth
+    # daemon's XPC service from its connection-invalidated handler at once; there is no Bluetooth stack here, so each
+    # lookup fails and the next starts immediately: mediaserverd ~50 % + launchd ~65 % of a core answering the lookups.
+    bt = os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver')
+    if os.path.exists(bt):
+        dst = os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL.disabled')
+        os.makedirs(dst, exist_ok=True)
+        shutil.move(bt, os.path.join(dst, 'BTAudioHALPlugin.driver'))
+        print('BTAudioHALPlugin.driver moved aside')
     for cfg in glob.glob(os.path.join(root, 'System/Library/Frameworks/MediaToolbox.framework/*/SubServerConfiguration.plist')) + \
             glob.glob(os.path.join(root, 'System/Library/Frameworks/MediaToolbox.framework/SubServerConfiguration.plist')):
         with open(cfg, 'rb') as f:
