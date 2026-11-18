@@ -1895,31 +1895,39 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		    slog("SweetMTL: astc upload %lux%lu at %lu,%lu bpr %lu src %016llx store %p", (unsigned long)r.size.width, (unsigned long)r.size.height,
 		    (unsigned long)r.origin.x, (unsigned long)r.origin.y, (unsigned long)bpr, b0, _store.cpu); }
 		NSUInteger bx = r.origin.x / abw, by = r.origin.y / abh, nbx = (r.size.width + abw - 1) / abw, nby = (r.size.height + abh - 1) / abh;
-		uint32_t px[144]; NSUInteger nerr = 0, ntot = 0, ex = 0, ey = 0;
+		NSUInteger nerr = 0, ntot = 0, ex = 0, ey = 0;
 		bool ident = (_swz[0] == 2 && _swz[1] == 3 && _swz[2] == 4 && _swz[3] == 5) || !(_swz[0] | _swz[1] | _swz[2] | _swz[3]);
-		for (NSUInteger y = 0; y < nby; y++) {
+		/*
+		 * Block rows decoded in parallel on the big cores: an app snapshot (1125x2436, 171k blocks) decoded on one core
+		 * held the render thread for tens of ms at every app launch (the launch animation stalled).
+		 */
+		uint32_t *rerr = calloc(nby ? nby : 1, sizeof(uint32_t)), *rtot = calloc(nby ? nby : 1, sizeof(uint32_t));
+		uint8_t *store = _store.cpu; NSUInteger sbpr = _bytesPerRow, dec = _dec, W = _width, H = _height;
+		const uint32_t s0 = _swz[0], s1 = _swz[1], s2 = _swz[2], s3 = _swz[3];
+		uint64_t dt0 = sm_ns();
+		dispatch_apply(nby, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t y) {
+			uint32_t px[144];
 			const uint8_t *row = (const uint8_t *)src + y * bpr;
 			for (NSUInteger x = 0; x < nbx; x++) {
 				NSUInteger X0 = (bx + x) * abw, Y0 = (by + y) * abh;
-				/* only blocks holding a kept (every _dec-th) texel */
-				NSUInteger fx = (X0 + _dec - 1) / _dec * _dec, fy = (Y0 + _dec - 1) / _dec * _dec;
+				/* only blocks holding a kept (every dec-th) texel */
+				NSUInteger fx = (X0 + dec - 1) / dec * dec, fy = (Y0 + dec - 1) / dec * dec;
 				if (fx >= X0 + abw || fy >= Y0 + abh) continue;
 				decode_block(row + x * 16, (int)abw, (int)abh, px);
-				ntot++;
-				if (px[0] == 0xFFFF00FFu && px[abw * abh - 1] == 0xFFFF00FFu) {
-					if (!nerr++) { ex = bx + x; ey = by + y; }
-					static int nd; if (nd < 6 && (nerr == 1 || nerr == 50 || nerr == 500)) { nd++; const uint64_t *q = (const uint64_t *)(row + x * 16);
-					  slog("SweetMTL: astc bad block %lu,%lu: %016llx %016llx", (unsigned long)(bx + x), (unsigned long)(by + y), q[0], q[1]); }
-				}
+				rtot[y]++;
+				if (px[0] == 0xFFFF00FFu && px[abw * abh - 1] == 0xFFFF00FFu) rerr[y]++;
 				if (!ident) for (uint32_t q = 0; q < abw * abh; q++) {
 					uint32_t v = px[q], ch[6] = { 0, 255, (v >> 16) & 255, (v >> 8) & 255, v & 255, v >> 24 };
-					px[q] = (ch[_swz[3] < 6 ? _swz[3] : 5] << 24) | (ch[_swz[0] < 6 ? _swz[0] : 2] << 16) | (ch[_swz[1] < 6 ? _swz[1] : 3] << 8) | ch[_swz[2] < 6 ? _swz[2] : 4];
+					px[q] = (ch[s3 < 6 ? s3 : 5] << 24) | (ch[s0 < 6 ? s0 : 2] << 16) | (ch[s1 < 6 ? s1 : 3] << 8) | ch[s2 < 6 ? s2 : 4];
 				}
-				for (NSUInteger yy = fy; yy < Y0 + abh && yy < _height; yy += _dec)
-					for (NSUInteger xx = fx; xx < X0 + abw && xx < _width; xx += _dec)
-						memcpy(_store.cpu + (yy / _dec) * _bytesPerRow + (xx / _dec) * 4, &px[(yy - Y0) * abw + (xx - X0)], 4);
+				for (NSUInteger yy = fy; yy < Y0 + abh && yy < H; yy += dec)
+					for (NSUInteger xx = fx; xx < X0 + abw && xx < W; xx += dec)
+						memcpy(store + (yy / dec) * sbpr + (xx / dec) * 4, &px[(yy - Y0) * abw + (xx - X0)], 4);
 			}
-		}
+		});
+		for (NSUInteger y = 0; y < nby; y++) { if (rerr[y] && !nerr) { ey = by + y; ex = bx; } nerr += rerr[y]; ntot += rtot[y]; }
+		free(rerr); free(rtot);
+		{ static int nt; uint64_t dms = (sm_ns() - dt0) / 1000000; if (nt < 12 && (dms >= 5 || nt < 3)) { nt++; slog("SweetMTL: astc decode time %lux%lu: %llu ms (%lu blocks, parallel)", (unsigned long)_width, (unsigned long)_height, dms, (unsigned long)ntot); } }
 		{
 			/* decoded content summary: mean colour and share of near-black texels (sampled grid) */
 			uint64_t sr = 0, sg = 0, sb = 0, nd = 0, nn = 0;
