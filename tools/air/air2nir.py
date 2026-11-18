@@ -1035,9 +1035,8 @@ class Fn:
         raise Unsupported('intrinsic ' + fn)
 
     def ret(self, rhs):
-        m = re.match(r'^ret (.+) (\S+)$', rhs)
         if rhs == 'ret void': self.single_ret = {}; return
-        ty, v = m.groups()
+        ty, v = split_tv(rhs[4:])        # aggregate/vector types and constant literals contain spaces
         self.single_ret = self.ret_members(ty, v)
 
     def ret_members(self, ty, v):
@@ -1045,8 +1044,13 @@ class Fn:
             agg = self.vals[v]
             return dict(agg) if isinstance(agg, dict) else {0: agg}
         mm = re.match(r'^<?\{(.*)\}>?$', ty.strip())
-        if mm:      # constant aggregate (zeroinitializer / undef)
-            return {i: self.tmp(self.const(et, 'zeroinitializer')) for i, et in enumerate(split_top(mm.group(1)))}
+        if mm:
+            ets = split_top(mm.group(1))
+            mv = re.match(r'^<?\{(.*)\}>?$', v.strip())
+            if mv:  # constant aggregate literal '<{ T1 V1, T2 V2 }>' (e.g. an early 'ret' of a NaN colour)
+                return {i: self.tmp(self.const(et, split_tv(mem)[1])) for i, (et, mem) in enumerate(zip(ets, split_top(mv.group(1))))}
+            # zeroinitializer / undef / poison
+            return {i: self.tmp(self.const(et, 'zeroinitializer')) for i, et in enumerate(ets)}
         return {0: self.val(ty, v)}
 
     def emit_outputs(self, members):
