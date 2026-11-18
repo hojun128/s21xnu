@@ -1,0 +1,53 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 231bf58..bc3b8b6 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -423,10 +423,31 @@ static uint32_t ts_g_poll_us;
+ static int ts_g_ev;
+ static int ts_g_burst = 32; /* 0098: events drained per poll; touch_burst=1 = old behaviour */
+ 
++/*
++ * S21 (patch 0139): the poll sleep is an absolute deadline with no coalescing leeway (assert_wait_timeout's default
++ * leeway let 8 ms sleeps run long), and while a finger is on the panel (an event in the last 120 ms) ATTN is sampled
++ * every touch_poll_active_us (default 4000 us) instead of touch_poll_us: less touch-to-screen latency in drags.
++ * touch_poll_active_us=0 keeps the old timing.
++ */
++static uint32_t ts_g_active_us = 4000;
++static uint64_t ts_g_last_ev_abs;
++
+ static void
+ ts_block_us(uint32_t us)
+ {
+-	assert_wait_timeout((event_t)&ts_g_ev, THREAD_UNINT, us, NSEC_PER_USEC);
++	uint64_t now = mach_absolute_time(), dl = 0;
++	if (ts_g_active_us) {
++		uint64_t act = 0;
++		nanoseconds_to_absolutetime(120ULL * NSEC_PER_MSEC, &act);
++		if (ts_g_last_ev_abs && now - ts_g_last_ev_abs < act && ts_g_active_us < us) {
++			us = ts_g_active_us;
++		}
++		nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &dl);
++		assert_wait_deadline_with_leeway((event_t)&ts_g_ev, THREAD_UNINT,
++		    TIMEOUT_URGENCY_SYS_CRITICAL | TIMEOUT_URGENCY_LEEWAY, now + dl, 0);
++	} else {
++		assert_wait_timeout((event_t)&ts_g_ev, THREAD_UNINT, us, NSEC_PER_USEC);
++	}
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
+@@ -454,6 +475,7 @@ sweet_touch_poll(void *arg, wait_result_t w)
+ 				}
+ 				if (decode_event(ev, &t)) {
+ 					dec++;
++					ts_g_last_ev_abs = mach_absolute_time();
+ 					if ((uint32_t)t.x > maxx) { maxx = (uint32_t)t.x; }
+ 					if ((uint32_t)t.y > maxy) { maxy = (uint32_t)t.y; }
+ 					sweet_touch_post(&t, (uint32_t)ts_g_flip);
+@@ -907,6 +929,7 @@ sweet_touch_init(void)
+ 	PE_parse_boot_argn("touch_flip", &touch_flip, sizeof(touch_flip));
+ 	PE_parse_boot_argn("touch_trace", &touch_trace, sizeof(touch_trace));
+ 	PE_parse_boot_argn("touch_poll_us", &touch_poll_us, sizeof(touch_poll_us));
++	PE_parse_boot_argn("touch_poll_active_us", &ts_g_active_us, sizeof(ts_g_active_us));
+ 	{
+ 		int burst = 0;
+ 		if (PE_parse_boot_argn("touch_burst", &burst, sizeof(burst)) && burst >= 1 && burst <= 256) {

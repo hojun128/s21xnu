@@ -108,6 +108,9 @@ static uint64_t sm_jr[480], sm_jw[24], sm_jrl[480], sm_jwl[24]; static uint32_t 
 static uint64_t sm_infra_len[16];     /* bytes to flush from the BO start (0 = the whole BO) */
 static uint64_t sm_desc_va, sm_desc_span = 0;   /* the pass descriptor BO: only the part the current pass wrote */
 static volatile uint64_t sm_pf_pre_ns, sm_pf_job_ns, sm_pf_post_ns, sm_pf_lock_ns;
+/* per-pass profile of one command buffer (armed by the scroll step: the 30th commit after arming is described) */
+static volatile int sm_pf_detail; static uint32_t sm_pf_dn;
+static struct { uint16_t w, h, n, load; uint32_t job_us, pre_us, wall_us; } sm_pf_d[48];
 static void sm_ring_take(uint64_t *va, uint64_t *len);
 static void sm_q_drain(void);   /* asynchronous commits, below SweetMTLCommandBuffer */
 @class SweetMTLTexture;
@@ -2579,6 +2582,7 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 	if (!have) { have = sm_bo_alloc(&desc, 0x10000 + 32 * SM_DRAW_STRIDE); if (have) { sm_always_add(&desc); sm_desc_va = desc.gpu; } }
 	_status = 4; /* MTLCommandBufferStatusCompleted */
 	sm_commits++;
+	{ static uint32_t armed_at; if (sm_pf_detail >= 2) { if (!armed_at) armed_at = sm_commits; if (sm_commits - armed_at >= 30) { sm_pf_detail = 1; sm_pf_dn = 0; armed_at = 0; } } }
 	sm_cf_reset();
 	uint64_t pf_t0 = sm_ns();
 	if (sm_pf_last) { uint64_t g = (pf_t0 - sm_pf_last) / 1000000; sm_pf_gap[g < 20 ? 0 : g < 40 ? 1 : g < 100 ? 2 : 3]++; }
@@ -2622,8 +2626,14 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 					sm_flush_now(e.target.bo->gpu, (uint64_t)bpr * H);
 					save = malloc((size_t)bpr * H); if (save) memcpy(save, e.target.bo->cpu, (size_t)bpr * H);
 				}
+				uint64_t dj0 = sm_pf_job_ns, dp0 = sm_pf_pre_ns, dw0 = sm_ns();
 				_lastJobStatus = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
 				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, e->_draws, e->_ndraw, &vs, e.load);
+				if (sm_pf_detail == 1 && sm_pf_dn < 48) {
+					sm_pf_d[sm_pf_dn].w = (uint16_t)W; sm_pf_d[sm_pf_dn].h = (uint16_t)H; sm_pf_d[sm_pf_dn].n = (uint16_t)e->_ndraw; sm_pf_d[sm_pf_dn].load = e.load;
+					sm_pf_d[sm_pf_dn].job_us = (uint32_t)((sm_pf_job_ns - dj0) / 1000); sm_pf_d[sm_pf_dn].pre_us = (uint32_t)((sm_pf_pre_ns - dp0) / 1000);
+					sm_pf_d[sm_pf_dn].wall_us = (uint32_t)((sm_ns() - dw0) / 1000); sm_pf_dn++;
+				}
 				if (save) {
 					nbis2++;
 					const uint8_t *c = e.target.bo->cpu;
@@ -2837,6 +2847,16 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 	[_toPresent removeAllObjects];
 	if (_status == 2) _status = 4;
 	if (self.smTicket) sm_fence_call(1, self.smTicket);   /* the present gate may show this frame now */
+	if (sm_pf_detail == 1) {
+		sm_pf_detail = 0;
+		char ln[150]; int L = 0;
+		slog("SweetMTL: perf passes: %u in one scrolling commit (%.2f ms)", sm_pf_dn, (sm_ns() - pf_t0) / 1e6);
+		for (uint32_t i = 0; i < sm_pf_dn; i++) {
+			L += snprintf(ln + L, sizeof ln - L, " %ux%u/%u%s j%u p%u w%u", sm_pf_d[i].w, sm_pf_d[i].h, sm_pf_d[i].n, sm_pf_d[i].load ? "L" : "",
+			    sm_pf_d[i].job_us, sm_pf_d[i].pre_us, sm_pf_d[i].wall_us);
+			if (L > 100 || i + 1 == sm_pf_dn) { slog("SweetMTL: perf pass%s", ln); L = 0; ln[0] = 0; }
+		}
+	}
 	{ uint64_t t1 = sm_ns(), d = t1 - pf_t0; sm_pf_ns += d; if (d > sm_pf_max_ns) sm_pf_max_ns = d; sm_pf_n++; sm_pf_last = t1; }
 	[self sm_runHandlers];
 }
@@ -3219,6 +3239,7 @@ static void *sm_watchdog(void *arg)
 					/* settings-open shot dropped: four deferred shots overflowed the pmsg ring (run113 lost the lock screen) */
 					/* scroll the Settings list: three flicks up, then two back down, measured on their own */
 					sm_perf_reset();
+					sm_pf_detail = 2;   /* describe the passes of one commit during the first flick */
 					for (int f = 0; f < 5; f++) { sm_drag(540, f < 3 ? 1900 : 900, 540, f < 3 ? 900 : 1900, 20); usleep(1200000); }
 					usleep(1500000);
 					sm_perf_report("scrolling", ts.tv_sec);
