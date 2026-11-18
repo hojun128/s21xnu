@@ -1173,6 +1173,18 @@ static void
 gov_start(void)
 {
 	PE_parse_boot_argn("sweetgov", &gov_on, sizeof(gov_on));
+	{
+		/* boot-arg sweetgovboost=1: stronger touch floors for app open/close animations (GPU 858/676 MHz, mid/big
+		 * clusters at their top/second rung for 130/500 ms): the default floors leave the GPU at 312-494 MHz in the app-open
+		 * animation (~10.7 ms GPU per frame there, runs 188-193), so frames tend to miss the next refresh */
+		int boost = 0;
+		PE_parse_boot_argn("sweetgovboost", &boost, sizeof(boost));
+		if (boost == 1) {
+			g2[1].head = 3; g2[1].tail = 2;
+			g2[2].head = 3; g2[2].tail = 2;
+			g2[3].head = 4; g2[3].tail = 3;
+		}
+	}
 	PE_parse_boot_argn("sweetgov_gpu_ms", &gov_gpu_ms, sizeof(gov_gpu_ms));
 	PE_parse_boot_argn("sweetgov_cpu_ms", &gov_cpu_ms, sizeof(gov_cpu_ms));
 	PE_parse_boot_argn("sweetgov_cpu_after", &gov_cpu_after, sizeof(gov_cpu_after));
