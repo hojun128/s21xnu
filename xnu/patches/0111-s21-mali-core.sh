@@ -106,7 +106,7 @@ mali_log(const char *fmt, ...)
 	/* job failures/timeouts are also kept for the replay before a recovery reboot (sweet_mali_keep_dump) */
 	/* ... and the clock settings and present-copy timings, which the 128 KiB ring loses by the end of a run (run164) */
 	if (!strncmp(line, "job ", 4) || !strncmp(line, "fault", 5) || !strncmp(line, "recover", 7) ||
-	    !strncmp(line, "dvfs", 4) || !strncmp(line, "gpucomp:", 8) || !strncmp(line, "chg:", 4)) {
+	    !strncmp(line, "dvfs", 4) || !strncmp(line, "gpucomp:", 8) || !strncmp(line, "chg:", 4) || !strncmp(line, "keys:", 5)) {
 		size_t n = strlen(line);
 		if (mali_keep_len + n + 2 < sizeof(mali_keep)) {
 			memcpy(mali_keep + mali_keep_len, line, n);
@@ -373,6 +373,7 @@ mali_recover(const char *why)
 	mali_log("recover after %s: reset %s, power %s", why, t == 0xFFFFFFFFU ? "timed out" : "ok", p ? "failed" : "ok");
 }
 
+int sweet_s21keys_start(void);
 static inline void gov_job(void);   /* idle clock governor, below mali_dvfs() */
 
 /* ---- job submission (polling) ---- */
@@ -910,6 +911,7 @@ sweet_mali_boot(void)
 	mali_log("powered: shader=%x tiler=%x l2=%x", rd(R_SHADER_READY), rd(R_TILER_READY), rd(R_L2_READY));
 	mali_dvfs(1);
 	gov_start();
+	(void)sweet_s21keys_start();   /* S21 side keys (0125) */
 	mali_selftest();
 	mali_selftest_heap();
 	mali_log("ready, left powered (pool used %u of %u pages)", mali.pool_next, mali.pool_pages);
