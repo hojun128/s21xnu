@@ -1633,6 +1633,17 @@ static uint32_t sm_astc(NSUInteger pf, uint32_t *bh, bool *srgb)
 }
 void decode_block(const uint8_t *buf, const int bw, const int bh, uint32_t *outbuf);   /* astc_dec.c */
 static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 6 ? 2 : d == 8 ? 4 : d == 10 ? 6 : 7; }
+/* boot-arg sweetastcgpu=1: ASTC sampled by the Mali itself (Mesa v9 rules: blocks in 16x16-block u-interleaved tiles,
+ * texel interleave, linear formats as "ASTC 2D HDR" with decode_wide, sRGB as "ASTC 2D LDR" + sRGB bit) instead of the
+ * CPU decode into BGRA8 (25 ms per app snapshot on the GPU thread at every app re-open). Runs 80-86 saw the error colour
+ * with the LDR format id for linear textures and copies made before the client filled no-copy memory. */
+static int sm_astcgpu_v = -1;
+static bool sm_astcgpu(void)
+{
+	if (sm_astcgpu_v < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; sm_astcgpu_v = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetastcgpu=1") ? 1 : 0; }
+	return sm_astcgpu_v == 1;
+}
+static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c >= 2 && c <= 5 ? (uint32_t)(c - 2) : 0; }
 
 @interface SweetMTLTexture : SweetMTLObject
 @property (nonatomic, readonly) NSUInteger width, height, pixelFormat, bytesPerRow;
@@ -1782,7 +1793,13 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	uint32_t abh = 0, abw = sm_astc(_pixelFormat, &abh, NULL);
 	if (abw) { static int nl; if (nl++ < 8) slog("SweetMTL: astc create %lux%lu pf%lu mips %lu storage %lu usage %lu", (unsigned long)_width, (unsigned long)_height,
 	    (unsigned long)_pixelFormat, (unsigned long)d.mipmapLevelCount, (unsigned long)d.storageMode, (unsigned long)d.usage); }
-	if (abw) {
+	if (abw && sm_astcgpu()) {
+		/* GPU ASTC: one row of 16x16-block tiles (4096 bytes each) per _bytesPerRow */
+		NSUInteger tbx = ((_width + abw - 1) / abw + 15) & ~(NSUInteger)15, tby = ((_height + abh - 1) / abh + 15) & ~(NSUInteger)15;
+		_dec = 1; _gw = _width; _gh = _height;
+		_bytesPerRow = 16 * 16 * tbx;
+		rows = tby / 16;
+	} else if (abw) {
 		/* ASTC is decoded on the CPU at upload (the GPU ASTC path gave the magenta error colour in every layout,
 		 * runs 80-86) into BGRA8, downscaled by _dec so the copy stays <= 8 MiB (4096x4096 -> 1024x1024) */
 		_dec = 1;
@@ -1830,11 +1847,20 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (uint32_t)maliFormat
 {
 	bool srgb = false;
+	if (sm_astc(_pixelFormat, NULL, &srgb) && sm_astcgpu())
+		return srgb ? ((MALI_ASTC_2D_LDR << 12) | MALI_RGB_COMPONENT_ORDER_RGBA | (1u << 20)) : ((MALI_ASTC_2D_HDR << 12) | MALI_RGB_COMPONENT_ORDER_RGBA);
 	if (sm_astc(_pixelFormat, NULL, &srgb))   /* decoded on the CPU into BGRA8 */
 		return (MALI_RGBA8_UNORM << 12) | MALI_RGB_COMPONENT_ORDER_BGRA;
 	uint32_t f; sm_pf_info(_pixelFormat, &f, NULL); return f;
 }
-- (uint32_t)maliSwizzle { uint32_t w; sm_pf_info(_pixelFormat, NULL, &w); return w; }
+- (uint32_t)maliSwizzle
+{
+	uint32_t w; sm_pf_info(_pixelFormat, NULL, &w);
+	/* GPU ASTC: the texture's MTLTextureSwizzleChannels go into the descriptor (the CPU decode applied them itself) */
+	if (sm_astc(_pixelFormat, NULL, NULL) && sm_astcgpu() && (_swz[0] | _swz[1] | _swz[2] | _swz[3]))
+		w = SM_SWZ(sm_mtl2mali_swz(_swz[0]), sm_mtl2mali_swz(_swz[1]), sm_mtl2mali_swz(_swz[2]), sm_mtl2mali_swz(_swz[3]));
+	return w;
+}
 - (uint32_t)bpp { return sm_pf_bpp(_pixelFormat); }
 - (NSUInteger)depth { return 1; }
 - (NSUInteger)mipmapLevelCount { return 1; }
@@ -1897,6 +1923,23 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		    slog("SweetMTL: astc upload %lux%lu at %lu,%lu bpr %lu src %016llx store %p", (unsigned long)r.size.width, (unsigned long)r.size.height,
 		    (unsigned long)r.origin.x, (unsigned long)r.origin.y, (unsigned long)bpr, b0, _store.cpu); }
 		NSUInteger bx = r.origin.x / abw, by = r.origin.y / abh, nbx = (r.size.width + abw - 1) / abw, nby = (r.size.height + abh - 1) / abh;
+		if (sm_astcgpu()) {
+			/* GPU ASTC: blocks into Mesa's 16x16 u-interleaved tile order (pan_tiling.c bit duplication ^ spacing) */
+			static const uint8_t dup[16] = { 0x00, 0x03, 0x0c, 0x0f, 0x30, 0x33, 0x3c, 0x3f, 0xc0, 0xc3, 0xcc, 0xcf, 0xf0, 0xf3, 0xfc, 0xff };
+			static const uint8_t sp4[16] = { 0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15, 0x40, 0x41, 0x44, 0x45, 0x50, 0x51, 0x54, 0x55 };
+			uint8_t *store = _store.cpu; NSUInteger tbpr = _bytesPerRow; uint64_t t0 = sm_ns();
+			dispatch_apply(nby, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t y) {
+				NSUInteger Y = by + y;
+				const uint8_t *row = (const uint8_t *)src + y * bpr;
+				uint8_t *trow = store + (Y >> 4) * tbpr;
+				for (NSUInteger x = 0; x < nbx; x++) {
+					NSUInteger X = bx + x;
+					memcpy(trow + (X >> 4) * 4096 + (size_t)(dup[Y & 15] ^ sp4[X & 15]) * 16, row + x * 16, 16);
+				}
+			});
+			static int nt; if (nt++ < 6) slog("SweetMTL: astc gpu upload %lux%lu: %.2f ms (tiled, no decode)", (unsigned long)r.size.width, (unsigned long)r.size.height, (sm_ns() - t0) / 1e6);
+			return;
+		}
 		NSUInteger nerr = 0, ntot = 0, ex = 0, ey = 0;
 		bool ident = (_swz[0] == 2 && _swz[1] == 3 && _swz[2] == 4 && _swz[3] == 5) || !(_swz[0] | _swz[1] | _swz[2] | _swz[3]);
 		/*
@@ -2196,7 +2239,8 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 			r->tex[k].pf = (uint32_t)t.pixelFormat; r->tex[k].imp = t.bo->imported;
 			r->tex[k].swz = [t maliSwizzle];
 			r->tex[k].nofl = [t sm_noflush];
-			{ uint32_t bh = 0; bool sr = false; uint32_t bw = sm_astc(t.pixelFormat, &bh, &sr); r->tex[k].astc = 0; (void)sr;   /* ASTC is decoded on the CPU */
+			{ uint32_t bh = 0; bool sr = false; uint32_t bw = sm_astc(t.pixelFormat, &bh, &sr); r->tex[k].astc = 0;   /* ASTC is decoded on the CPU */
+			  if (bw && sm_astcgpu()) r->tex[k].astc = bw | (bh << 8) | (sr ? 1u << 16 : 0);   /* ... or sampled by the GPU */
 			  if (bw) { static int nl; if (nl++ < 6) { uint64_t b0 = 0, b1 = 0; if (t.bo->cpu) { memcpy(&b0, t.bo->cpu, 8); memcpy(&b1, t.bo->cpu + 4096, 8); }
 			    slog("SweetMTL: astc draw tex%u pf%lu va %llx cpu %p blk0 %016llx blk256 %016llx", k, (unsigned long)t.pixelFormat, t.bo->gpu, t.bo->cpu, b0, b1); } } }
 			r->ntex = k + 1;
