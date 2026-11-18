@@ -1643,6 +1643,7 @@ static bool sm_astcgpu(void)
 	if (sm_astcgpu_v < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; sm_astcgpu_v = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetastcgpu=1") ? 1 : 0; }
 	return sm_astcgpu_v == 1;
 }
+static bool sm_astc_shot_pending, sm_astc_shot_done;   /* thumbnail 17: the first pass that drew an ASTC app snapshot */
 static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c >= 2 && c <= 5 ? (uint32_t)(c - 2) : 0; }
 
 @interface SweetMTLTexture : SweetMTLObject
@@ -2241,6 +2242,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 			r->tex[k].nofl = [t sm_noflush];
 			{ uint32_t bh = 0; bool sr = false; uint32_t bw = sm_astc(t.pixelFormat, &bh, &sr); r->tex[k].astc = 0;   /* ASTC is decoded on the CPU */
 			  if (bw && sm_astcgpu()) r->tex[k].astc = bw | (bh << 8) | (sr ? 1u << 16 : 0);   /* ... or sampled by the GPU */
+			  if (bw && t.width >= 1000 && !sm_astc_shot_done) sm_astc_shot_pending = true;   /* one shot of a pass drawing an app snapshot */
 			  if (bw) { static int nl; if (nl++ < 6) { uint64_t b0 = 0, b1 = 0; if (t.bo->cpu) { memcpy(&b0, t.bo->cpu, 8); memcpy(&b1, t.bo->cpu + 4096, 8); }
 			    slog("SweetMTL: astc draw tex%u pf%lu va %llx cpu %p blk0 %016llx blk256 %016llx", k, (unsigned long)t.pixelFormat, t.bo->gpu, t.bo->cpu, b0, b1); } } }
 			r->ntex = k + 1;
@@ -3043,6 +3045,13 @@ static void sm_tag_surfaces(NSArray *passes, uint64_t t)
 			}
 			if (_lastJobStatus != 0 || vs != 0) _status = 5;
 			[e.target sm_writeback];
+			if (sm_astc_shot_pending && !sm_astc_shot_done && e.target.bo && e.target.bo->cpu && e.target.width >= 300 && sm_pf_bpp(e.target.pixelFormat) == 4) {
+				/* verification shot of the ASTC snapshot as drawn (CPU decode, or the GPU's with sweetastcgpu=1) */
+				sm_astc_shot_done = true; sm_astc_shot_pending = false;
+				sm_flush_now(e.target.bo->gpu, (uint64_t)e.target.bytesPerRow * e.target.height);
+				slog("SweetMTL: astc shot %lux%lu pf%lu (%s decode)", (unsigned long)e.target.width, (unsigned long)e.target.height, (unsigned long)e.target.pixelFormat, sm_astcgpu() ? "GPU" : "CPU");
+				sm_thumb(e.target.bo->cpu, (uint32_t)e.target.width, (uint32_t)e.target.height, (uint32_t)e.target.bytesPerRow, 0x100 | 17);
+			}
 		} else if (e.clear) {
 			_lastJobStatus = sm_clear(&desc, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
 			    (uint32_t)e.target.bytesPerRow, e.packed, bgra);
