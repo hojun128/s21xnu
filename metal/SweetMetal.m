@@ -3304,6 +3304,23 @@ static bool sm_hog_wanted(const char *nm)
 	}
 	return false;
 }
+/* the sampled process's loaded images (dyld_all_image_infos infoArray: load address, path pointer, date) */
+static uint64_t *sm_hog_img; static uint32_t sm_hog_nimg; static mach_port_name_t sm_hog_task;
+static bool sm_hog_imgsym(uint64_t a, char *buf, size_t n)
+{
+	uint64_t best = 0, path = 0;
+	for (uint32_t i = 0; i < sm_hog_nimg; i++) {
+		uint64_t ld = sm_hog_img[3 * i];
+		if (ld <= a && ld > best && a - ld < 0x4000000ULL) { best = ld; path = sm_hog_img[3 * i + 1]; }
+	}
+	if (!best) return false;
+	char pb[160] = ""; vm_size_t got = 0;
+	if (path) (void)vm_read_overwrite(sm_hog_task, (vm_address_t)path, sizeof pb - 1, (vm_address_t)pb, &got);
+	pb[sizeof pb - 1] = 0;
+	const char *b = strrchr(pb, '/'); b = b ? b + 1 : pb;
+	snprintf(buf, n, "%.16s+%llx", b[0] ? b : "img", (unsigned long long)(a - best));
+	return true;
+}
 static void sm_hog_sym(uint64_t a, uint64_t mh, uint64_t cs, size_t cl, char *buf, size_t n)
 {
 	if (cs && a >= cs && a < cs + cl) {
@@ -3318,6 +3335,7 @@ static void sm_hog_sym(uint64_t a, uint64_t mh, uint64_t cs, size_t cl, char *bu
 			return;
 		}
 	}
+	if (sm_hog_imgsym(a, buf, n)) return;
 	if (mh && a >= mh && a < mh + 0x8000000ULL) { snprintf(buf, n, "main+%llx", (unsigned long long)(a - mh)); return; }
 	snprintf(buf, n, "%llx", (unsigned long long)a);
 }
@@ -3334,9 +3352,13 @@ static void sm_hog_proc(int pid, const char *nm, uint64_t cs, size_t cl)
 			    aii.count && aii.array) {
 				uint64_t e[3] = { 0, 0, 0 }; got = 0;
 				if (!vm_read_overwrite(t, (vm_address_t)aii.array, sizeof e, (vm_address_t)e, &got) && got == sizeof e) mh = e[0];
+				uint32_t ni = aii.count < 1024 ? aii.count : 1024;
+				free(sm_hog_img); sm_hog_img = calloc(ni, 24); sm_hog_nimg = 0; got = 0;
+				if (sm_hog_img && !vm_read_overwrite(t, (vm_address_t)aii.array, ni * 24, (vm_address_t)sm_hog_img, &got) && got == ni * 24) sm_hog_nimg = ni;
 			}
 		}
 	}
+	sm_hog_task = t;
 	thread_act_array_t th = NULL; mach_msg_type_number_t nt = 0;
 	if (task_threads(t, &th, &nt)) { mach_port_deallocate(mach_task_self(), t); return; }
 	int hot[3] = { -1, -1, -1 }, hu[3] = { 0, 0, 0 }, tot = 0;
@@ -3365,6 +3387,20 @@ static void sm_hog_proc(int pid, const char *nm, uint64_t cs, size_t cl)
 			if (thread_get_state(a, ARM_THREAD_STATE64, (thread_state_t)&st, &c) == KERN_SUCCESS) {
 				pcs[np++] = (uint64_t)arm_thread_state64_get_pc(st) & 0xFFFFFFFFFULL;
 				pcs[np++] = (uint64_t)arm_thread_state64_get_lr(st) & 0xFFFFFFFFFULL;
+				if (s == 0) {
+					/* in mach_msg2_trap x0 is the message buffer: its printable strings name what is being asked for */
+					uint8_t mb[1024]; vm_size_t got = 0; char out[120]; int ol = 0, run = 0;
+					if (!vm_read_overwrite(t, (vm_address_t)st.__x[0], sizeof mb, (vm_address_t)mb, &got) && got) {
+						for (vm_size_t q = 0; q < got && ol < (int)sizeof out - 2; q++) {
+							uint8_t ch = mb[q];
+							if (ch >= 0x20 && ch < 0x7f) { run++; continue; }
+							if (run >= 5) { int w = run < (int)sizeof out - 2 - ol ? run : (int)sizeof out - 2 - ol; memcpy(out + ol, mb + q - run, w); ol += w; out[ol++] = '|'; }
+							run = 0;
+						}
+					}
+					out[ol] = 0;
+					slog("SweetMTL: hog %.12s T%d msg: %s", nm, hot[k], ol ? out : "(none)");
+				}
 				uint64_t fp = (uint64_t)arm_thread_state64_get_fp(st);
 				for (int m = 0; m < 24 && fp && !(fp & 7) && np < 26; m++) {
 					uint64_t fr[2] = { 0, 0 }; vm_size_t got = 0;
@@ -3398,8 +3434,9 @@ static void sm_hog_round(void)
 	for (int i = 0; i < n; i++) {
 		char nm[40] = "?"; proc_name(pids[i], nm, sizeof nm);
 		if (pids[i] == 1 && !nm[0]) strlcpy(nm, "launchd", sizeof nm);
-		if (sm_hog_wanted(nm)) { sm_hog_proc(pids[i], nm, (uint64_t)cs, cl); found++; }
+		if (sm_hog_wanted(nm)) { sm_hog_proc(pids[i], nm, (uint64_t)cs, cl); found++; if (pids[i] == 1) found += 1000; }
 	}
+	if (found < 1000 && sm_hog_wanted("launchd")) { sm_hog_proc(1, "launchd", (uint64_t)cs, cl); found++; }   /* pid 1 was not listed */
 	slog("SweetMTL: hog round: %d pids, %d sampled (%s)", n, found, sm_hog_names);
 }
 static void sm_boot_diag(long sec)
