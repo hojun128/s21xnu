@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exit.c	2026-11-18 13:35:43
 +++ b/bsd/kern/kern_exit.c	2026-11-18 13:35:43
-@@ -1873,7 +1873,31 @@
+@@ -1873,7 +1873,34 @@
  
  	if (p->p_crash_behavior != 0 || p == initproc) {
  		proc_handle_critical_exit(p, rv);
@@ -12,9 +12,12 @@
 +	 * 128 KiB console ring and is replayed before a recovery reboot. Covers kills without a core
 +	 * signal too (SIGKILL from jetsam, launchd, code signing), which the CRASH lines above miss.
 +	 */
-+	if (WIFSIGNALED(rv) || PROC_HAS_EXITREASON(p)) {
++	/* skip jetsam idle exits (namespace 1 JETSAM, code 9 IDLE_EXIT) and early-boot launchd children (SIGHUP) */
++	if ((WIFSIGNALED(rv) || PROC_HAS_EXITREASON(p)) &&
++	    !(PROC_HAS_EXITREASON(p) && p->p_exit_reason->osr_namespace == 1 && p->p_exit_reason->osr_code == 9) &&
++	    !(WIFSIGNALED(rv) && WTERMSIG(rv) == SIGHUP)) {
 +		static int sweet_exit_logs;
-+		if (sweet_exit_logs < 48) {
++		if (sweet_exit_logs < 200) {
 +			extern void sweet_mali_log_str(const char *s);
 +			char sl[184];
 +			char *desc = PROC_HAS_EXITREASON(p) ? exit_reason_get_string_desc(p->p_exit_reason) : NULL;

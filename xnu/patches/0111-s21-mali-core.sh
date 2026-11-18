@@ -90,7 +90,7 @@ static struct {
 	int         up, powered;
 } mali;
 
-static char mali_keep[8192];
+static char mali_keep[24576];
 static uint32_t mali_keep_len;
 static void mali_log(const char *fmt, ...) __printflike(1, 2);
 static void
