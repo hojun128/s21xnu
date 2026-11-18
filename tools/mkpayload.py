@@ -233,6 +233,9 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, wifi_fw_path=None,
     struct.pack_into('<8sII', out, 0, b'SWEETXNU', 1, len(pieces))
     struct.pack_into('<7Q', out, 0x10, virt_base, m['entry'], adt_off, len(adt_blob), kernel_end,
                      PHYS_BASE, MEM_SIZE)
+    if len(cmdline.encode()) >= BOOT_LINE_LENGTH:
+        # XNU keeps 607 characters: everything after them was silently dropped (runs 194-197 lost their new boot-args)
+        raise SystemExit('mkpayload: command line is %d bytes, the limit is %d' % (len(cmdline.encode()), BOOT_LINE_LENGTH - 1))
     cl = cmdline.encode()[:BOOT_LINE_LENGTH - 1]
     out[CMDLINE:CMDLINE + len(cl)] = cl
     for i, t in enumerate(seg_table):

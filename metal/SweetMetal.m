@@ -2742,7 +2742,8 @@ static void sm_tag_surfaces(NSArray *passes, uint64_t t)
 {
 	if (sm_async < 0) {
 		char ba[1024] = {0}; size_t bl = sizeof(ba) - 1;
-		sm_async = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetasync=1") ? 1 : 0;
+		/* on by default since runs 179-197 (boot-args are limited to 608 bytes); sweetasync=0 = synchronous commits */
+		sm_async = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetasync=0") ? 0 : 1;
 	}
 	if (sm_async == 1 && !sm_on_worker()) {
 		pthread_mutex_lock(&sm_q_mx);

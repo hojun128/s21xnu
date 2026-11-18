@@ -82,7 +82,7 @@ static vm_offset_t mx_bank;
 static struct sweet_batt_info mx_info;
 static volatile UInt32 mx_busy;
 static int mx_write_ok = 1, mx_started;
-static uint32_t mx_cc_ma = 1500, mx_ilim_ma = 0, mx_errs, mx_polls;
+static uint32_t mx_cc_ma = 1500, mx_ilim_ma = 1200, mx_errs, mx_polls;   /* ilim 1200 mA by default (runs 177-197) */
 static thread_call_t mx_tc;
 
 static void

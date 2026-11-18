@@ -86,7 +86,7 @@ extern void s21_plog(const char *line);
  * maintenance is needed around jobs (ours cost 1-2 ms per commit and 6-17 ms spikes in app transitions, run188).
  * 1: coherency on, CPU cache maintenance kept (safety step); 2: maintenance skipped (0112 asks sweet_mali_coherent()).
  */
-static int sm_coh;
+static int sm_coh = 2;   /* default 2 since runs 192-197 (boot-arg sweetcoh=0 = old non-coherent path) */
 static uint64_t pte_share = 3ULL << 8;   /* inner shareable; 2 << 8 (outer) with sweetcoh */
 int sweet_mali_coherent(void);
 int
@@ -570,7 +570,7 @@ static vm_offset_t acd_sram, acd_mbox;
 static uint32_t acd_seq;
 static int acd_state;   /* 0 = not tried, 1 = ok, -1 = unusable */
 static struct { uint32_t txr, txf, txb, rxr, rxf, rxb, len, sz, type, fld; } acd;
-static int acd_buf_ok;   /* boot-arg sweetdvfsbuf=1: talk to a buffer-type (type 2) channel */
+static int acd_buf_ok = 1;   /* boot-arg sweetdvfsbuf (default 1 since run168): talk to a buffer-type (type 2) channel */
 #define ACD(o) (*(volatile uint32_t *)(acd_sram + (o)))
 
 static int
@@ -751,7 +751,7 @@ static const struct dvfs_dom { const char *name, *arg, *arglo; uint32_t id, def,
 	{ "cl0", "sweetcl0", "sweetcl0lo", 2, 1794000, 1066000 },
 	{ "cl1", "sweetcl1", "sweetcl1lo", 3, 2080000, 1040000 },
 	{ "cl2", "sweetcl2", "sweetcl2lo", 4, 2288000, 1040000 },
-	{ "g3d", "sweetg3d", "sweetg3dlo", 11, 676000, 130000 },
+	{ "g3d", "sweetg3d", "sweetg3dlo", 11, 858000, 130000 },
 	{ "int", "sweetint", "sweetintlo", 1, 0, 0 },
 };
 #define DVFS_N (sizeof(D) / sizeof(D[0]))
@@ -803,7 +803,7 @@ mali_dvfs(int gpu_ready)
  * after idle wakes the governor thread, which restores "hi" (the submitter never waits for ACPM).
  * Raising goes DSU first, lowering goes CPU first (dm-table constraint CL -> DSU).
  */
-static int gov_on = 1;
+static int gov_on = 2;   /* load governor by default (runs 189-197); boot-arg sweetgov=1 = idle governor, 0 = off */
 static uint32_t gov_gpu_ms = 1000, gov_cpu_ms = 8000, gov_cpu_after = 480;
 static volatile uint64_t gov_last_job;
 static volatile int gov_gpu_lo, gov_cpu_lo;
