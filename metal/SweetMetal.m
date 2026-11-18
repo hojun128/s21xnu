@@ -111,6 +111,15 @@ static volatile uint64_t sm_pf_pre_ns, sm_pf_job_ns, sm_pf_post_ns, sm_pf_lock_n
 /* per-pass profile of one command buffer (armed by the scroll step: the 30th commit after arming is described) */
 static volatile int sm_pf_detail; static uint32_t sm_pf_dn;
 static struct { uint16_t w, h, n, load; uint32_t job_us, pre_us, wall_us; } sm_pf_d[48];
+/* breakdown of the slowest command buffer of the current perf window: render passes (P), CPU blits (B), compute (C) */
+typedef struct { uint16_t w, h, n; char kind; uint32_t job_us, wall_us; } sm_wd;
+static sm_wd sm_cur_d[48], sm_worst_d[48]; static uint32_t sm_cur_dn, sm_worst_dn; static uint64_t sm_worst_ns;
+static void sm_wd_add(char kind, uint32_t w, uint32_t h, uint32_t n, uint64_t job_ns, uint64_t wall_ns)
+{
+	if (sm_cur_dn >= 48) return;
+	sm_wd *d = &sm_cur_d[sm_cur_dn++]; d->kind = kind; d->w = (uint16_t)w; d->h = (uint16_t)h; d->n = (uint16_t)n;
+	d->job_us = (uint32_t)(job_ns / 1000); d->wall_us = (uint32_t)(wall_ns / 1000);
+}
 static void sm_ring_take(uint64_t *va, uint64_t *len);
 static void sm_q_drain(void);   /* asynchronous commits, below SweetMTLCommandBuffer */
 @class SweetMTLTexture;
@@ -2680,6 +2689,7 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 	sm_commits++;
 	{ static uint32_t armed_at; if (sm_pf_detail >= 2) { if (!armed_at) armed_at = sm_commits; if (sm_commits - armed_at >= 30) { sm_pf_detail = 1; sm_pf_dn = 0; armed_at = 0; } } }
 	sm_cf_reset();
+	sm_cur_dn = 0;
 	uint64_t pf_t0 = sm_ns();
 	if (sm_pf_last) { uint64_t g = (pf_t0 - sm_pf_last) / 1000000; sm_pf_gap[g < 20 ? 0 : g < 40 ? 1 : g < 100 ? 2 : 3]++; }
 	for (SweetMTLRenderEncoder *e in _passes) if ([e isKindOfClass:[SweetMTLRenderEncoder class]] && ![e isKindOfClass:[SweetMTLComputeEncoder class]]) sm_pf_draws += e->_ndraw;
@@ -2687,8 +2697,8 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 	if (merge < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; merge = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetmerge=1") ? 1 : 0; }
 	NSArray *order = merge && have && !sm_is_poster(getprogname()) ? sm_plan_passes(_passes, desc.size) : _passes;
 	for (SweetMTLRenderEncoder *e in order) {
-		if ([e isKindOfClass:[SweetMTLBlitEncoder class]]) { [(SweetMTLBlitEncoder *)e sm_run]; sm_cf_reset(); continue; }
-		if ([e isKindOfClass:[SweetMTLComputeEncoder class]]) { if (!sm_gpu_off) [(SweetMTLComputeEncoder *)e sm_run]; continue; }
+		if ([e isKindOfClass:[SweetMTLBlitEncoder class]]) { uint64_t b0 = sm_ns(); [(SweetMTLBlitEncoder *)e sm_run]; sm_cf_reset(); sm_wd_add('B', 0, 0, 0, 0, sm_ns() - b0); continue; }
+		if ([e isKindOfClass:[SweetMTLComputeEncoder class]]) { uint64_t c0 = sm_ns(), j0 = sm_pf_job_ns; if (!sm_gpu_off) [(SweetMTLComputeEncoder *)e sm_run]; sm_wd_add('C', 0, 0, 0, sm_pf_job_ns - j0, sm_ns() - c0); continue; }
 		if (!have || !e.target) { _status = 5; continue; }
 		sm_target_pf = e.target.pixelFormat;
 		{ static int nf = -1; if (nf < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; nf = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetiosflush=1") ? 0 : 1; }
@@ -2729,6 +2739,7 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 				const sm_drawrec *pdr = e->_mN ? &sm_mbuf[e->_mOff] : e->_draws; uint32_t pnd = e->_mN ? e->_mN : e->_ndraw;
 				_lastJobStatus = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
 				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, pdr, pnd, &vs, e.load);
+				sm_wd_add('P', W, H, pnd, sm_pf_job_ns - dj0, sm_ns() - dw0);
 				if (sm_pf_detail == 1 && sm_pf_dn < 48) {
 					sm_pf_d[sm_pf_dn].w = (uint16_t)W; sm_pf_d[sm_pf_dn].h = (uint16_t)H; sm_pf_d[sm_pf_dn].n = (uint16_t)pnd; sm_pf_d[sm_pf_dn].load = e.load;
 					sm_pf_d[sm_pf_dn].job_us = (uint32_t)((sm_pf_job_ns - dj0) / 1000); sm_pf_d[sm_pf_dn].pre_us = (uint32_t)((sm_pf_pre_ns - dp0) / 1000);
@@ -2957,7 +2968,8 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 			if (L > 100 || i + 1 == sm_pf_dn) { slog("SweetMTL: perf pass%s", ln); L = 0; ln[0] = 0; }
 		}
 	}
-	{ uint64_t t1 = sm_ns(), d = t1 - pf_t0; sm_pf_ns += d; if (d > sm_pf_max_ns) sm_pf_max_ns = d; sm_pf_n++; sm_pf_last = t1; }
+	{ uint64_t t1 = sm_ns(), d = t1 - pf_t0; sm_pf_ns += d; if (d > sm_pf_max_ns) sm_pf_max_ns = d; sm_pf_n++; sm_pf_last = t1;
+	  if (d > sm_worst_ns) { sm_worst_ns = d; sm_worst_dn = sm_cur_dn; memcpy(sm_worst_d, sm_cur_d, sm_cur_dn * sizeof *sm_cur_d); } }
 	[self sm_runHandlers];
 }
 - (void)waitUntilCompleted { if (self.smSeq) sm_q_wait_seq(self.smSeq); }
@@ -3229,6 +3241,7 @@ static void sm_fbstats(uint64_t o[16])
 static void sm_perf_reset(void)
 {
 	sm_fbstats(sm_fbst0); sm_q_full = sm_q_texwaits = sm_q_drains = 0; sm_merge_saved = sm_merge_hoisted = 0;
+	sm_worst_ns = 0; sm_worst_dn = 0;
 	sm_pf_ns = sm_pf_gpu_ns = sm_pf_max_ns = 0; sm_pf_n = sm_pf_jobs = sm_pf_draws = 0;
 	memset((void *)sm_pf_gap, 0, sizeof sm_pf_gap); sm_pf_win = sm_ns();
 	sm_pf_pre_ns = sm_pf_job_ns = sm_pf_post_ns = sm_pf_lock_ns = 0;
@@ -3249,6 +3262,18 @@ static void sm_perf_report(const char *what, long now)
 		/* panel = frames that really reached the glass (kernel AppleCLCD counters, patch 0137) */
 		slog("SweetMTL: perf %s panel: %.1f presents/s (swaps %llu presents %llu dropped %llu gated %llu timeout %llu kick %llu vsync %llu mode %llu) async %d full %u texwait %u drain %u merged %u hoisted %u",
 		    what, win ? d[1] * 1e9 / win : 0.0, d[0], d[1], d[6], d[2], d[3], d[4], d[5], f[7], sm_async, sm_q_full, sm_q_texwaits, sm_q_drains, sm_merge_saved, sm_merge_hoisted);
+	}
+	if (sm_worst_ns >= 30000000ULL && sm_worst_dn) {
+		/* where the slowest command buffer of the window spent its time (largest items first, up to two lines) */
+		sm_wd t[48]; uint32_t n = sm_worst_dn; memcpy(t, sm_worst_d, n * sizeof *t);
+		for (uint32_t i = 0; i < n; i++) for (uint32_t j = i + 1; j < n; j++) if (t[j].wall_us > t[i].wall_us) { sm_wd x = t[i]; t[i] = t[j]; t[j] = x; }
+		uint64_t sum = 0; for (uint32_t i = 0; i < n; i++) sum += t[i].wall_us;
+		char ln[150]; int L = snprintf(ln, sizeof ln, "SweetMTL: perf %s worst %.1fms items %u (sum %.1f):", what, sm_worst_ns / 1e6, n, sum / 1000.0);
+		int lines = 0;
+		for (uint32_t i = 0; i < n && lines < 2; i++) {
+			L += snprintf(ln + L, sizeof ln - L, " %c%ux%u/%u w%u j%u", t[i].kind, t[i].w, t[i].h, t[i].n, t[i].wall_us, t[i].job_us);
+			if (L > 120 || i + 1 == n || i == 9) { slog("%s", ln); lines++; L = snprintf(ln, sizeof ln, "SweetMTL: perf %s worst+:", what); }
+		}
 	}
 	(void)now;
 }
@@ -3272,14 +3297,23 @@ static void sm_app_tour(void)
 		{ "Phone", 310, 2238 }, { "Safari", 542, 2238 }, { "Messages", 836, 2238 },
 	};
 	for (unsigned i = 0; i < sizeof(A) / sizeof(A[0]); i++) {
-		uint32_t c0 = sm_commits;
-		kern_return_t k = sm_tap(A[i].x, A[i].y);
-		sleep(12);
-		uint32_t c1 = sm_commits;
-		slog("SweetMTL: app %s tap kr=%x commits +%u", A[i].n, k, c1 - c0);
-		sm_drag(540, 2392, 540, 1000, 24);
-		sleep(4);
-		slog("SweetMTL: app %s home commits +%u", A[i].n, sm_commits - c1);
+		/* Settings, Safari, Messages: measured open, close, warm reopen, close (the user's "leave the app and come back") */
+		bool meas = !strcmp(A[i].n, "Settings") || !strcmp(A[i].n, "Safari") || !strcmp(A[i].n, "Messages");
+		char w[32];
+		for (int round = 0; round < (meas ? 2 : 1); round++) {
+			uint32_t c0 = sm_commits;
+			if (meas) sm_perf_reset();
+			kern_return_t k = sm_tap(A[i].x, A[i].y);
+			if (meas) { sleep(3); snprintf(w, sizeof w, "%s-%s", round ? "reopen" : "open", A[i].n); sm_perf_report(w, 0); }
+			sleep(meas ? 6 : 12);
+			uint32_t c1 = sm_commits;
+			slog("SweetMTL: app %s tap kr=%x commits +%u", A[i].n, k, c1 - c0);
+			if (meas) sm_perf_reset();
+			sm_drag(540, 2392, 540, 1000, 24);
+			if (meas) { sleep(3); snprintf(w, sizeof w, "close%d-%s", round + 1, A[i].n); sm_perf_report(w, 0); sleep(1); }
+			else sleep(4);
+			slog("SweetMTL: app %s home commits +%u", A[i].n, sm_commits - c1);
+		}
 	}
 }
 static void *sm_watchdog(void *arg)
