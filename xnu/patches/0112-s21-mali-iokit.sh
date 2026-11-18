@@ -71,7 +71,7 @@ enum {
 	kSMSubmitRange = 12,    /* submit, cache-flushing listed (va, len, pre/post) ranges only; returns flush/job times */
 	kSMFlushRange = 13,     /* clean+invalidate listed (va, len) ranges now (before a CPU read of GPU-written memory) */
 	kSMFence = 14,          /* GPU fence tickets of this task for the present gate: op 0 issue -> ticket, 1 done(ticket), 2 query */
-	kSMFBStats = 15,        /* framebuffer pacing counters (SweetFramebuffer.cpp sweet_fb_stats), 8 scalars */
+	kSMFBStats = 15,        /* framebuffer pacing counters (SweetFramebuffer.cpp sweet_fb_stats), 16 scalars */
 };
 
 /*
@@ -86,7 +86,7 @@ static struct { task_t task; uint32_t gen, refs; uint64_t issued, done; } sm_fen
 static IOSimpleLock *sm_fence_lk;
 static uint32_t sm_fence_gen;
 extern "C" void sweet_fb_gpu_kick(void);
-extern "C" void sweet_fb_stats(uint64_t out[8]);
+extern "C" void sweet_fb_stats(uint64_t out[16]);
 extern "C" int sweet_gpu_fence_snapshot(task_t t, uint32_t *slot, uint32_t *gen, uint64_t *ticket);
 extern "C" int sweet_gpu_fence_ready(uint32_t slot, uint32_t gen, uint64_t ticket);
 
@@ -683,12 +683,12 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		return kIOReturnSuccess;
 	}
 	if (selector == kSMFBStats) {
-		uint64_t st[8];
+		uint64_t st[16];
 		sweet_fb_stats(st);
-		for (uint32_t i = 0; i < outs && i < 8; i++) {
+		for (uint32_t i = 0; i < outs && i < 16; i++) {
 			args->scalarOutput[i] = st[i];
 		}
-		args->scalarOutputCount = outs < 8 ? outs : 8;
+		args->scalarOutputCount = outs < 16 ? outs : 16;
 		return kIOReturnSuccess;
 	}
 	uint64_t lk0 = mach_absolute_time();

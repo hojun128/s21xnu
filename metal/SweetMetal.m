@@ -3217,11 +3217,11 @@ static void sm_drag(int x0, int y0, int x1, int y1, int n)
 	for (int i = 1; i <= n; i++) { usleep(12000); sm_touch(1, x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n); }
 	usleep(20000); sm_touch(0, x1, y1);
 }
-static uint64_t sm_fbst0[8];
-static void sm_fbstats(uint64_t o[8])
+static uint64_t sm_fbst0[16];
+static void sm_fbstats(uint64_t o[16])
 {
-	memset(o, 0, 8 * sizeof *o);
-	uint32_t oc = 8;
+	memset(o, 0, 16 * sizeof *o);
+	uint32_t oc = 16;
 	if (sm_conn) IOConnectCallMethod(sm_conn, 15, NULL, 0, NULL, 0, o, &oc, NULL, NULL);
 }
 static void sm_perf_reset(void)
@@ -3239,8 +3239,11 @@ static void sm_perf_report(const char *what, long now)
 	    (double)sm_pf_draws / n, sm_pf_gap[0], sm_pf_gap[1], sm_pf_gap[2], sm_pf_gap[3]);
 	slog("SweetMTL: perf %s kernel: flush-before %.1fms job %.1fms flush-after %.1fms lock-wait %.1fms per commit", what, sm_pf_pre_ns / 1e6 / n, sm_pf_job_ns / 1e6 / n, sm_pf_post_ns / 1e6 / n, sm_pf_lock_ns / 1e6 / n);
 	{
-		uint64_t f[8]; sm_fbstats(f);
-		uint64_t d[7]; for (int i = 0; i < 7; i++) d[i] = f[i] - sm_fbst0[i];
+		uint64_t f[16]; sm_fbstats(f);
+		uint64_t d[16]; for (int i = 0; i < 16; i++) d[i] = f[i] - sm_fbst0[i];
+		/* swap-to-swap intervals in vsync periods (1/2/3/more) and vsync-to-swap render time (avg, max since boot) */
+		slog("SweetMTL: perf %s pace: swap gaps 1v %llu 2v %llu 3v %llu more %llu | vsync->swap avg %.2f ms max %.1f ms", what,
+		    d[8], d[9], d[10], d[11], d[14] ? d[12] / 1000.0 / d[14] : 0.0, f[13] / 1000.0);
 		/* panel = frames that really reached the glass (kernel AppleCLCD counters, patch 0137) */
 		slog("SweetMTL: perf %s panel: %.1f presents/s (swaps %llu presents %llu dropped %llu gated %llu timeout %llu kick %llu vsync %llu mode %llu) async %d full %u texwait %u drain %u merged %u hoisted %u",
 		    what, win ? d[1] * 1e9 / win : 0.0, d[0], d[1], d[6], d[2], d[3], d[4], d[5], f[7], sm_async, sm_q_full, sm_q_texwaits, sm_q_drains, sm_merge_saved, sm_merge_hoisted);
