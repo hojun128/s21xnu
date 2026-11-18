@@ -221,5 +221,4 @@ sweet_s21_battery_start(void)
 #endif /* ARM64_BOARD_CONFIG_SWEET */
 EOF_SWEET_SRC
 
-grep -q 'iokit/Kernel/arm/S21Battery.cpp' iokit/conf/files.arm64 ||
-	printf 'iokit/Kernel/arm/S21Battery.cpp                                  optional iokitcpp\n' >> iokit/conf/files.arm64
+# build list entry: 0128-s21-battery-files.patch (appending here broke every later files.arm64 patch)
