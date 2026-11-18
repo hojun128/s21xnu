@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -1855,8 +1855,151 @@
+@@ -1855,9 +1855,226 @@
  		    ((proc_getcsflags(p) & CS_KILLED) ? "CS_KILLED" : ""),
  		    prefix_str, p->p_exit_reason->osr_namespace, p->p_exit_reason->osr_code,
  		    exit_reason_desc ? exit_reason_desc : "none", sweet_ufd);
@@ -98,6 +98,79 @@
 +	return n;
 +}
 +
++/* __TEXT range of a loaded image (in-memory start = load address) */
++static int
++sweet_image_text(user_addr_t mh, uint64_t *size)
++{
++	uint32_t h[8];
++	if (copyin(mh, h, sizeof(h)) || h[0] != 0xfeedfacfU || h[4] > 256) {
++		return 0;
++	}
++	user_addr_t lc = mh + 32;
++	for (uint32_t i = 0; i < h[4]; i++) {
++		struct sweet_seg64 sg;
++		if (copyin(lc, &sg, sizeof(sg)) || sg.cmdsize < 8) {
++			return 0;
++		}
++		if (sg.cmd == 0x19 && !strncmp(sg.segname, "__TEXT", 16)) {
++			*size = sg.vmsize;
++			return 1;
++		}
++		lc += sg.cmdsize;
++	}
++	return 0;
++}
++
++extern int sweet_crash_regs(uint64_t *r, int n);   /* osfmk/kern/exception.c (0136) */
++
++/* faults without a message: where? pc, lr and the frame-pointer chain as image+offset */
++static void
++sweet_crash_where(proc_t p, const struct user64_dyld_all_image_infos *ai, uint32_t cnt)
++{
++	uint64_t r[10];
++	int n = sweet_crash_regs(r, 10);
++	if (n < 3) {
++		return;
++	}
++	const char *what[10] = { "pc", "lr", "far" };
++	char line[184];
++	int L = snprintf(line, sizeof(line), "crash: %s at", p->p_comm);
++	for (int k = 0; k < n; k++) {
++		uint64_t a = r[k] & 0x0000007fffffffffULL;
++		char where[72];
++		snprintf(where, sizeof(where), "0x%llx", (unsigned long long)a);
++		if (k != 2 && ai->infoArray) {
++			for (uint32_t i = 0; i < cnt; i++) {
++				struct user64_dyld_image_info ii;
++				uint64_t tsz = 0;
++				if (copyin((user_addr_t)(ai->infoArray + (uint64_t)i * sizeof(ii)), &ii, sizeof(ii))) {
++					break;
++				}
++				if (a < ii.imageLoadAddress || a - ii.imageLoadAddress > 0x10000000ULL ||
++				    !sweet_image_text((user_addr_t)ii.imageLoadAddress, &tsz) || a - ii.imageLoadAddress >= tsz) {
++					continue;
++				}
++				char pb[256];
++				size_t done = 0;
++				bzero(pb, sizeof(pb));
++				(void)copyinstr((user_addr_t)ii.imageFilePath, pb, sizeof(pb) - 1, &done);
++				const char *b = strrchr(pb, '/');
++				snprintf(where, sizeof(where), "%.40s+0x%llx", b ? b + 1 : pb, (unsigned long long)(a - ii.imageLoadAddress));
++				break;
++			}
++		}
++		char one[96];
++		int m = snprintf(one, sizeof(one), " %s %s", k < 3 ? what[k] : "<", where);
++		if (L + m >= (int)sizeof(line) - 1) {
++			sweet_mali_log_str(line);
++			L = snprintf(line, sizeof(line), "crash: %s +", p->p_comm);
++		}
++		strlcpy(line + L, one, sizeof(line) - L);
++		L += m;
++	}
++	sweet_mali_log_str(line);
++}
++
 +static void
 +sweet_crash_messages(proc_t p)
 +{
@@ -120,15 +193,16 @@
 +			}
 +			found += sweet_crash_image(p->p_comm, (user_addr_t)ii.imageLoadAddress, (user_addr_t)ii.imageFilePath);
 +		}
-+	}
+ 	}
++	sweet_crash_where(p, &ai, cnt);
 +	if (!found) {
 +		char line[120];
 +		snprintf(line, sizeof(line), "crash: %s msg: none in %u images (dyld v%u, cache slide 0x%llx)", p->p_comm, cnt,
 +		    ai.version, (unsigned long long)ai.sharedCacheSlide);
 +		sweet_mali_log_str(line);
 +	}
-+}
-+
+ }
+ 
 +/* crash loops: log the first 2 deaths of each process name, then every 25th */
 +static int
 +sweet_exit_should_log(const char *name)
@@ -140,26 +214,25 @@
 +			uint32_t c = ++seen[i].c;
 +			return c <= 2 || (c % 25) == 0 ? (int)c : 0;
 +		}
- 	}
++	}
 +	if (nseen < 96) {
 +		strlcpy(seen[nseen].n, name, sizeof(seen[nseen].n));
 +		seen[nseen].c = 1;
 +		nseen++;
 +	}
 +	return 1;
- }
++}
 +#endif
- 
++
  void
  proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
-@@ -1873,7 +2016,38 @@
- 
- 	if (p->p_crash_behavior != 0 || p == initproc) {
+ {
+@@ -1875,7 +2094,38 @@
  		proc_handle_critical_exit(p, rv);
-+	}
-+
+ 	}
+ 
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+	/*
+ 	/*
 +	 * SWEET: every abnormal exit also goes to the SweetMali keep log ("crash:"), which survives the
 +	 * 128 KiB console ring and is replayed before a recovery reboot. Covers kills without a core
 +	 * signal too (SIGKILL from jetsam, launchd, code signing). Skips jetsam idle exits (namespace 1,
@@ -186,8 +259,10 @@
 +				sweet_crash_messages(p);
 +			}
 +		}
- 	}
++	}
 +#endif
- 
- 	/*
++
++	/*
  	 * Generate a corefile/crashlog if:
+ 	 *      The process doesn't have an exit reason that indicates no crash report should be created
+ 	 *      AND any of the following are true:

@@ -1,0 +1,41 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 1f31f23..89a7e41 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -833,6 +833,36 @@ exception_triage(
+  * (crashing) thread.
+  */
+ void sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode);
++
++/* pc, lr, far and up to n-3 return addresses of the frame-pointer chain of the current (crashing) thread, for the
++ * kernel's "crash:" keep log (bsd/kern/kern_exit.c, 0126). Returns the number of words filled. */
++int sweet_crash_regs(uint64_t *r, int n);
++int
++sweet_crash_regs(uint64_t *r, int n)
++{
++	arm_saved_state_t *ss = find_user_regs(current_thread());
++	if (ss == NULL || !is_saved_state64(ss) || n < 3) {
++		return 0;
++	}
++	r[0] = get_saved_state_pc(ss);
++	r[1] = get_saved_state_lr(ss);
++	r[2] = (uint64_t)saved_state64(ss)->far;
++	int k = 3;
++	uint64_t fp = get_saved_state_fp(ss);
++	while (k < n && fp != 0 && (fp & 7) == 0) {
++		uint64_t fr[2];
++		if (copyin((user_addr_t)fp, fr, sizeof(fr)) != 0 || fr[1] == 0) {
++			break;
++		}
++		r[k++] = fr[1];
++		if (fr[0] <= fp) {
++			break;
++		}
++		fp = fr[0];
++	}
++	return k;
++}
++
+ static void sweet_crash_strings(const char *name);
+ 
+ void
