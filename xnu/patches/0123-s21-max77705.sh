@@ -44,6 +44,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 void sweet_mali_log_str(const char *s);
 void sweet_thermal_src(int src, int on);         /* 0111: keep CPU/GPU clocks low (source bit 1 here) */
 void sweet_reboot_recovery_ext(const char *why); /* 0112: logged reset into TWRP */
+int sweet_tmu_hottest(void);                     /* 0140: hottest SoC zone, C, -1 unknown */
 /*
  * Thermal policy on the battery temperature (sampled with the 10 s poll), hysteresis 3 C:
  *   level 1 >= 43 C: charge current capped at 500 mA     level 2 >= 45 C: capped at 100 mA
@@ -52,6 +53,7 @@ void sweet_reboot_recovery_ext(const char *why); /* 0112: logged reset into TWRP
  */
 static int mx_tlevel, mx_thot;
 static uint32_t mx_therm_cc;   /* 0 = no cap */
+static uint32_t mx_soc_cc;     /* cap from the SoC temperature, 0 = none */
 
 #define MX_BANK_PA   0x10430020U   /* gpp1 */
 #define MX_CON       0x00U
@@ -343,7 +345,7 @@ mx_poll(void)
 	int raw = (cur & 0x8000) ? (int)cur - 65536 : (int)cur;
 	mx_info.soc_x10 = s > 1000 ? 1000 : s;
 	mx_info.mv = mv;
-	mx_info.ma = raw * 15625 * 2 / 100000;
+	mx_info.ma = -(raw * 15625 * 2 / 100000);   /* the register counts charge as negative here (run184: -1.2 A while SOC rose 31 -> 35 %) */
 	mx_info.valid = mv >= 2800 && mv <= 4600;
 	{
 		uint16_t tr = 0;
@@ -356,6 +358,21 @@ mx_poll(void)
 			}
 		}
 		mx_info.temp_x10 = t10;
+		/*
+		 * FG TEMP is not live here: Android's charger driver writes the thermistor reading into it, so under iOS it
+		 * keeps the last value (run184: 26.1 C for 9 minutes while charging). The charge current therefore also
+		 * follows the SoC's hottest zone (0140): >= 65 C 500 mA, >= 75 C 100 mA, released below 60 C.
+		 */
+		{
+			static uint32_t soc_cc;
+			int soc = sweet_tmu_hottest();
+			uint32_t want = soc >= 75 ? 100U : soc >= 65 ? 500U : (soc > 0 && soc < 60) || soc <= 0 ? 0U : soc_cc;
+			if (want != soc_cc) {
+				mx_log("chg: SoC %d C: charge cap %u mA", soc, want);
+				soc_cc = want;
+			}
+			mx_soc_cc = soc_cc;
+		}
 		if (t10 > -1000) {
 			int lv = mx_tlevel;
 			int up = t10 >= 460 ? 3 : t10 >= 450 ? 2 : t10 >= 430 ? 1 : 0;
@@ -371,6 +388,9 @@ mx_poll(void)
 				mx_tlevel = lv;
 			}
 			mx_therm_cc = lv >= 2 ? 100U : lv == 1 ? 500U : 0U;
+			if (mx_soc_cc && (!mx_therm_cc || mx_soc_cc < mx_therm_cc)) {
+				mx_therm_cc = mx_soc_cc;
+			}
 			sweet_thermal_src(1, lv >= 3);
 			mx_thot = t10 >= 550 ? mx_thot + 1 : 0;
 			if (mx_thot >= 2) {
