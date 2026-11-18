@@ -1,0 +1,34 @@
+--- a/bsd/kern/kern_exit.c	2026-11-18 13:35:43
++++ b/bsd/kern/kern_exit.c	2026-11-18 13:35:43
+@@ -1873,7 +1873,31 @@
+ 
+ 	if (p->p_crash_behavior != 0 || p == initproc) {
+ 		proc_handle_critical_exit(p, rv);
++	}
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET: every abnormal exit also goes to the SweetMali keep log ("crash:"), which survives the
++	 * 128 KiB console ring and is replayed before a recovery reboot. Covers kills without a core
++	 * signal too (SIGKILL from jetsam, launchd, code signing), which the CRASH lines above miss.
++	 */
++	if (WIFSIGNALED(rv) || PROC_HAS_EXITREASON(p)) {
++		static int sweet_exit_logs;
++		if (sweet_exit_logs < 48) {
++			extern void sweet_mali_log_str(const char *s);
++			char sl[184];
++			char *desc = PROC_HAS_EXITREASON(p) ? exit_reason_get_string_desc(p->p_exit_reason) : NULL;
++			sweet_exit_logs++;
++			snprintf(sl, sizeof(sl), "crash: %s[%d] sig %d exc %d code 0x%llx ns %u rc 0x%llx%s %s",
++			    p->p_comm, proc_getpid(p), WIFSIGNALED(rv) ? WTERMSIG(rv) : 0, ut->uu_exception,
++			    (unsigned long long)ut->uu_code,
++			    PROC_HAS_EXITREASON(p) ? p->p_exit_reason->osr_namespace : 0,
++			    PROC_HAS_EXITREASON(p) ? (unsigned long long)p->p_exit_reason->osr_code : 0ULL,
++			    (proc_getcsflags(p) & CS_KILLED) ? " CS_KILLED" : "", desc != NULL ? desc : "");
++			sweet_mali_log_str(sl);
++		}
+ 	}
++#endif
+ 
+ 	/*
+ 	 * Generate a corefile/crashlog if:

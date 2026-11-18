@@ -106,12 +106,14 @@ mali_log(const char *fmt, ...)
 	/* job failures/timeouts are also kept for the replay before a recovery reboot (sweet_mali_keep_dump) */
 	/* ... and the clock settings and present-copy timings, which the 128 KiB ring loses by the end of a run (run164) */
 	if (!strncmp(line, "job ", 4) || !strncmp(line, "fault", 5) || !strncmp(line, "recover", 7) ||
-	    !strncmp(line, "dvfs", 4) || !strncmp(line, "gpucomp:", 8) || !strncmp(line, "chg:", 4) || !strncmp(line, "keys:", 5)) {
-		size_t n = strlen(line);
-		if (mali_keep_len + n + 2 < sizeof(mali_keep)) {
-			memcpy(mali_keep + mali_keep_len, line, n);
-			mali_keep_len += (uint32_t)n;
-			mali_keep[mali_keep_len++] = '\n';
+	    !strncmp(line, "dvfs", 4) || !strncmp(line, "gpucomp:", 8) || !strncmp(line, "chg:", 4) || !strncmp(line, "keys:", 5) ||
+	    !strncmp(line, "crash:", 6)) {
+		/* several threads log (governor, charger, keys, exits): reserve the space atomically */
+		uint32_t n = (uint32_t)strlen(line);
+		uint32_t at = (uint32_t)OSAddAtomic((SInt32)(n + 1), (volatile SInt32 *)&mali_keep_len);
+		if (at + n + 1 <= sizeof(mali_keep)) {
+			memcpy(mali_keep + at, line, n);
+			mali_keep[at + n] = '\n';
 		}
 	}
 }
@@ -121,10 +123,10 @@ void
 sweet_mali_keep_dump(void)
 {
 	char ln[192];
-	uint32_t i = 0;
-	while (i < mali_keep_len) {
+	uint32_t i = 0, end = mali_keep_len < sizeof(mali_keep) ? mali_keep_len : (uint32_t)sizeof(mali_keep);
+	while (i < end) {
 		uint32_t n = 0;
-		while (i < mali_keep_len && mali_keep[i] != '\n' && n < sizeof(ln) - 4) {
+		while (i < end && mali_keep[i] != '\n' && n < sizeof(ln) - 4) {
 			ln[n++] = mali_keep[i++];
 		}
 		ln[n] = 0;

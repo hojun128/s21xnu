@@ -2995,6 +2995,25 @@ static void sm_swipe_up(void)
 	usleep(8000); sm_touch(0, 540, 2392 - 16 * 140);
 	slog("SweetMTL: swipe up sent kr=%x/%x", k0, k1);
 }
+/* boot-arg sweetapps=1: after the home shot open every app on the home screen and the dock (thumbnail run168), 12 s each,
+ * then back home; the kernel keeps a "crash:" line for every abnormal exit (user report: "apps crash when opened") */
+static void sm_app_tour(void)
+{
+	static const struct { const char *n; int x, y; } A[] = {
+		{ "Photos", 174, 296 }, { "AppStore", 433, 296 }, { "Settings", 174, 571 },
+		{ "Phone", 310, 2238 }, { "Safari", 542, 2238 }, { "Messages", 836, 2238 },
+	};
+	for (unsigned i = 0; i < sizeof(A) / sizeof(A[0]); i++) {
+		uint32_t c0 = sm_commits;
+		kern_return_t k = sm_tap(A[i].x, A[i].y);
+		sleep(12);
+		uint32_t c1 = sm_commits;
+		slog("SweetMTL: app %s tap kr=%x commits +%u", A[i].n, k, c1 - c0);
+		sm_drag(540, 2392, 540, 1000, 24);
+		sleep(4);
+		slog("SweetMTL: app %s home commits +%u", A[i].n, sm_commits - c1);
+	}
+}
 static void *sm_watchdog(void *arg)
 {
 	uint32_t last = 0; int dumps = 0;
@@ -3048,7 +3067,9 @@ static void *sm_watchdog(void *arg)
 				if (st == 0) { sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 16); sm_swipe_up(); sm_describe = 10; }   /* lock screen shot, unlock */
 				else if (st == 1) {
 					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | 22);   /* home screen (wallpaper), full rgb565 */
-					if (longrun) { kern_return_t k = sm_tap(174, 571); slog("SweetMTL: step tap Settings kr=%x", k); sm_describe = 4; } }
+					static int apps = -1; if (apps < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; apps = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetapps=1") ? 1 : 0; }
+					if (apps) { sm_app_tour(); step = 5; due = 0; }
+					else if (longrun) { kern_return_t k = sm_tap(174, 571); slog("SweetMTL: step tap Settings kr=%x", k); sm_describe = 4; } }
 				else if (st == 2) {
 					/* settings-open shot dropped: four deferred shots overflowed the pmsg ring (run113 lost the lock screen) */
 					/* scroll the Settings list: three flicks up, then two back down, measured on their own */
