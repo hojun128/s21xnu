@@ -78,7 +78,22 @@ extern void s21_plog(const char *line);
 
 /* page entry bits, Mali LPAE: table = pa|3, leaf = pa|1|AF|SH|R|W (leaf type is 1, not 3) */
 #define PTE_TABLE   3ULL
-#define PTE_LEAF    (1ULL | (1ULL << 6) | (1ULL << 7) | (1ULL << 10) | (3ULL << 8))
+#define PTE_LEAF    (1ULL | (1ULL << 6) | (1ULL << 7) | (1ULL << 10) | pte_share)
+/*
+ * GPU <-> CPU cache coherency (boot-arg sweetcoh; 0 = off as before). Samsung's Exynos 2100 GPU driver runs the
+ * Mali with full ACE coherency: SYSREG_G3D + 0x400 = ACELITE | ACE, COHERENCY_ENABLE = ACE, coherent memory mapped
+ * outer-shareable with the same impl-defined attribute (0x88). Then the GPU snoops the CPU caches and no CPU cache
+ * maintenance is needed around jobs (ours cost 1-2 ms per commit and 6-17 ms spikes in app transitions, run188).
+ * 1: coherency on, CPU cache maintenance kept (safety step); 2: maintenance skipped (0112 asks sweet_mali_coherent()).
+ */
+static int sm_coh;
+static uint64_t pte_share = 3ULL << 8;   /* inner shareable; 2 << 8 (outer) with sweetcoh */
+int sweet_mali_coherent(void);
+int
+sweet_mali_coherent(void)
+{
+	return sm_coh;
+}
 
 struct mali_ctx {
 	uint64_t pgd_pa;
@@ -350,6 +365,29 @@ mali_power(int on)
 	return r;
 }
 
+static void
+mali_coh_apply(void)
+{
+	static volatile uint32_t *sysreg;
+	if (!sm_coh) {
+		return;
+	}
+	if (sysreg == NULL) {
+		sysreg = (volatile uint32_t *)ml_io_map(0x18420000U, 0x1000);
+	}
+	uint32_t feat = rd(0x300U), before = sysreg ? sysreg[0x400 / 4] : 0xFFFFFFFFU;
+	if (sysreg) {
+		sysreg[0x400 / 4] = 0x3U;   /* ACELITE | ACE */
+		__asm__ volatile ("dsb sy" ::: "memory");
+	}
+	uint32_t mode = (feat & 2U) ? 1U : (feat & 1U) ? 0U : 31U;   /* ACE, ACE-Lite, none */
+	wr(0x304U, mode);
+	static int nl;
+	if (nl++ < 4) {
+		mali_log("coh: features %x sysreg %x -> %x enable %u (sweetcoh=%d)", feat, before, sysreg ? sysreg[0x400 / 4] : 0, rd(0x304U), sm_coh);
+	}
+}
+
 /* ---- recovery: a faulted job leaves the job manager wedged (every later job reports 0x5b), so soft-reset
  * the GPU and power it back up; the next submit re-programs the address space ---- */
 static int sweet_mali_one_core;   /* boot-arg mali_onecore=1: old single-core affinity */
@@ -376,6 +414,7 @@ mali_recover(const char *why)
 	wr(R_MMU_IRQ_CLEAR, 0xFFFFFFFFU);
 	mali.powered = 0;
 	int p = mali_power(1);
+	mali_coh_apply();   /* the soft reset cleared COHERENCY_ENABLE */
 	mali_log("recover after %s: reset %s, power %s", why, t == 0xFFFFFFFFU ? "timed out" : "ok", p ? "failed" : "ok");
 }
 
@@ -1206,10 +1245,15 @@ sweet_mali_boot(void)
 	mali_log("gpu %08x shaders %08x as %x js %x pool %u pages at %llx", mali.gpu_id, mali.shader_present,
 	    mali.as_present, mali.js_present, pages, scratch);
 	mali.up = 1;
+	PE_parse_boot_argn("sweetcoh", &sm_coh, sizeof(sm_coh));
+	if (sm_coh) {
+		pte_share = 2ULL << 8;   /* before any context maps a page */
+	}
 	if (mali_power(1)) {
 		mali_log("power on failed");
 		return;
 	}
+	mali_coh_apply();
 	mali_log("powered: shader=%x tiler=%x l2=%x", rd(R_SHADER_READY), rd(R_TILER_READY), rd(R_L2_READY));
 	mali_dvfs(1);
 	gov_start();

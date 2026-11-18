@@ -207,10 +207,14 @@ sm_civac_page(uint64_t pa)
 }
 static int sm_fastflush = 1;    /* boot-arg sweetfastflush=0: per-page flush_dcache64 as before */
 
+extern "C" int sweet_mali_coherent(void);   /* 0111: 2 = GPU snoops the CPU caches, no maintenance needed */
 /* clean+invalidate pages [p0, p1) of a buffer */
 static void
 sm_flush_md_range(IOMemoryDescriptor *md, uint32_t p0, uint32_t p1)
 {
+	if (sweet_mali_coherent() >= 2) {
+		return;
+	}
 	for (uint32_t k = p0; k < p1;) {
 		IOByteCount len = 0;
 		addr64_t pa = md->getPhysicalSegment((IOByteCount)k << 12, &len, kIOMemoryMapperNone);
