@@ -2376,18 +2376,24 @@ typedef struct {
  * running them at encode time read render targets before the passes that draw them had run (black copies). */
 @interface SweetMTLBlitEncoder : SweetMTLStubEncoder
 - (void)sm_run;
+- (NSArray *)sm_dsts;
 @end
-@implementation SweetMTLBlitEncoder { NSMutableArray *_ops; }
+@implementation SweetMTLBlitEncoder { NSMutableArray *_ops, *_dsts; }
 - (void)sm_add:(dispatch_block_t)op { if (!_ops) _ops = [NSMutableArray array]; [_ops addObject:[op copy]]; }
+/* texture destinations, for the surface tags of the present gate (commit) */
+- (void)sm_dst:(id)t { if (!t) return; if (!_dsts) _dsts = [NSMutableArray array]; if (![_dsts containsObject:t]) [_dsts addObject:t]; }
+- (NSArray *)sm_dsts { return _dsts; }
 - (void)sm_run { NSArray *ops = _ops; _ops = nil; for (dispatch_block_t op in ops) op(); }
 - (void)copyFromTexture:(id)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)sz
     toTexture:(id)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO
 {
+	[self sm_dst:dst];
 	[self sm_add:^{ [self sm_copyTex:src ss:ss sl:sl so:so sz:sz dst:dst ds:ds dl:dl dO:dO]; }];
 }
 - (void)copyFromBuffer:(id)b sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)sbpr sourceBytesPerImage:(NSUInteger)sbpi sourceSize:(MTLSize)sz
     toTexture:(id)t destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)o
 {
+	[self sm_dst:t];
 	{ static int nl; if (nl++ < 6) slog("SweetMTL: blit buffer->tex %lux%lu pf%lu bpr %lu level %lu", (unsigned long)sz.width, (unsigned long)sz.height,
 	    (unsigned long)[t pixelFormat], (unsigned long)sbpr, (unsigned long)dl); }
 	[self sm_add:^{
@@ -2399,6 +2405,7 @@ typedef struct {
 - (void)copyFromBuffer:(id)b sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)sbpr sourceBytesPerImage:(NSUInteger)sbpi sourceSize:(MTLSize)sz
     toTexture:(id)t destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)o options:(NSUInteger)opt
 {
+	[self sm_dst:t];
 	[self copyFromBuffer:b sourceOffset:so sourceBytesPerRow:sbpr sourceBytesPerImage:sbpi sourceSize:sz toTexture:t destinationSlice:ds destinationLevel:dl destinationOrigin:o];
 }
 - (void)copyFromTexture:(id)t sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)sz
@@ -2431,6 +2438,7 @@ typedef struct {
 }
 - (void)copyFromTexture:(id)src toTexture:(id)dst
 {
+	[self sm_dst:dst];
 	[self copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
 	    sourceSize:MTLSizeMake(MIN([src width], [dst width]), MIN([src height], [dst height]), 1)
 	    toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
@@ -2664,6 +2672,26 @@ static NSArray *sm_plan_passes(NSArray *passes, uint64_t desc_cap)
  * than one thread (display + snapshot renders in the app-to-home transition), which overwrote descriptors under a
  * running job (transient 0x58/0x59 faults that passed on replay, run105). One commit at a time. */
 static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+/* Present gate, surface tags (kernel 0137 sweetfb_surf=1): name the IOSurfaces this command buffer renders or copies
+ * into, with its fence ticket, so a swap of those surfaces waits for exactly this work (not for later commits). */
+static void sm_tag_add(uint64_t *in, uint32_t *n, id tx)
+{
+	if (![tx isKindOfClass:[SweetMTLTexture class]]) return;
+	IOSurfaceRef sf = [(SweetMTLTexture *)tx iosurface];
+	if (!sf) return;
+	uint32_t sid = IOSurfaceGetID(sf);
+	for (uint32_t k = 2; k < *n; k++) if (in[k] == sid) return;
+	if (*n < 12) in[(*n)++] = sid;
+}
+static void sm_tag_surfaces(NSArray *passes, uint64_t t)
+{
+	uint64_t in[12] = { 3, t }; uint32_t n = 2;
+	for (id e in passes) {
+		if ([e isKindOfClass:[SweetMTLBlitEncoder class]]) { for (id d in [(SweetMTLBlitEncoder *)e sm_dsts]) sm_tag_add(in, &n, d); }
+		else if ([e isKindOfClass:[SweetMTLRenderEncoder class]]) sm_tag_add(in, &n, ((SweetMTLRenderEncoder *)e).target);
+	}
+	if (n > 2 && sm_conn) IOConnectCallScalarMethod(sm_conn, 14, in, n, NULL, NULL);
+}
 - (void)commit
 {
 	if (sm_async < 0) {
@@ -2694,6 +2722,7 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 						for (id o in [(SweetMTLComputeEncoder *)e sm_kept]) sm_mark_use(o, seq);
 					}
 				}
+				sm_tag_surfaces(_passes, t);
 				[sm_q addObject:self]; sm_q_inflight++;
 				pthread_cond_broadcast(&sm_q_cv);
 				pthread_mutex_unlock(&sm_q_mx);
@@ -3399,8 +3428,9 @@ static void sm_perf_report(const char *what, long now)
 		slog("SweetMTL: perf %s pace: swap gaps 1v %llu 2v %llu 3v %llu more %llu | vsync->swap avg %.2f ms max %.1f ms", what,
 		    d[8], d[9], d[10], d[11], d[14] ? d[12] / 1000.0 / d[14] : 0.0, f[13] / 1000.0);
 		/* panel = frames that really reached the glass (kernel AppleCLCD counters, patch 0137) */
-		slog("SweetMTL: perf %s panel: %.1f presents/s (swaps %llu presents %llu dropped %llu gated %llu timeout %llu kick %llu vsync %llu mode %llu) async %d full %u texwait %u drain %u merged %u hoisted %u",
-		    what, win ? d[1] * 1e9 / win : 0.0, d[0], d[1], d[6], d[2], d[3], d[4], d[5], f[7], sm_async, sm_q_full, sm_q_texwaits, sm_q_drains, sm_merge_saved, sm_merge_hoisted);
+		/* surf = swaps gated on their own surfaces' tickets (kernel surface gate, sweetfb_surf=1) */
+		slog("SweetMTL: perf %s panel: %.1f presents/s (swaps %llu presents %llu dropped %llu gated %llu timeout %llu kick %llu surf %llu mode %llu) async %d full %u texwait %u drain %u merged %u hoisted %u",
+		    what, win ? d[1] * 1e9 / win : 0.0, d[0], d[1], d[6], d[2], d[3], d[4], d[15], f[7], sm_async, sm_q_full, sm_q_texwaits, sm_q_drains, sm_merge_saved, sm_merge_hoisted);
 	}
 	if (sm_worst_ns >= 30000000ULL && sm_worst_dn) {
 		/* where the slowest command buffer of the window spent its time (largest items first, up to two lines) */

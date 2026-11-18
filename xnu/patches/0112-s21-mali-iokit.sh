@@ -70,7 +70,8 @@ enum {
 	kSMSubmitList = 11,     /* submit, cache-flushing only the BOs holding the listed GPU addresses (and all small BOs) */
 	kSMSubmitRange = 12,    /* submit, cache-flushing listed (va, len, pre/post) ranges only; returns flush/job times */
 	kSMFlushRange = 13,     /* clean+invalidate listed (va, len) ranges now (before a CPU read of GPU-written memory) */
-	kSMFence = 14,          /* GPU fence tickets of this task for the present gate: op 0 issue -> ticket, 1 done(ticket), 2 query */
+	kSMFence = 14,          /* GPU fence tickets of this task for the present gate: op 0 issue -> ticket, 1 done(ticket), 2 query,
+	                         * 3 tag [ticket, IOSurface ids...] (surface gate) */
 	kSMFBStats = 15,        /* framebuffer pacing counters (SweetFramebuffer.cpp sweet_fb_stats), 16 scalars */
 };
 
@@ -89,6 +90,45 @@ extern "C" void sweet_fb_gpu_kick(void);
 extern "C" void sweet_fb_stats(uint64_t out[16]);
 extern "C" int sweet_gpu_fence_snapshot(task_t t, uint32_t *slot, uint32_t *gen, uint64_t *ticket);
 extern "C" int sweet_gpu_fence_ready(uint32_t slot, uint32_t gen, uint64_t ticket);
+extern "C" int sweet_gpu_fence_surfaces(const uint32_t *ids, int n, uint32_t *slot, uint32_t *gen, uint64_t *ticket);
+/* Surface tags (op 3): SweetMetal names, at commit, the IOSurfaces a command buffer renders into; the framebuffer's
+ * surface gate (0137, sweetfb_surf=1) then waits for exactly that work instead of the swapping task's latest ticket. */
+#define SM_SURF_TAGS 64
+static struct { uint32_t id, slot, gen; uint64_t ticket; } sm_surf[SM_SURF_TAGS];
+static uint32_t sm_surf_next;
+
+/* 2 = a tag of these surfaces whose work is still running (that one returned), 1 = tagged and all done, 0 = untagged */
+extern "C" int
+sweet_gpu_fence_surfaces(const uint32_t *ids, int n, uint32_t *slot, uint32_t *gen, uint64_t *ticket)
+{
+	int found = 0;
+	if (sm_fence_lk == NULL || ids == NULL) {
+		return 0;
+	}
+	IOSimpleLockLock(sm_fence_lk);
+	for (int k = 0; k < n && found < 2; k++) {
+		if (ids[k] == 0) {
+			continue;
+		}
+		for (uint32_t i = 0; i < SM_SURF_TAGS; i++) {
+			if (sm_surf[i].id != ids[k]) {
+				continue;
+			}
+			uint32_t s = sm_surf[i].slot;
+			bool running = s < SM_FENCE_SLOTS && sm_fence[s].task != NULL && sm_fence[s].gen == sm_surf[i].gen &&
+			    sm_fence[s].done < sm_surf[i].ticket;
+			if (found == 0 || running) {
+				*slot = s;
+				*gen = sm_surf[i].gen;
+				*ticket = sm_surf[i].ticket;
+				found = running ? 2 : 1;
+			}
+			break;
+		}
+	}
+	IOSimpleLockUnlock(sm_fence_lk);
+	return found;
+}
 
 extern "C" int
 sweet_gpu_fence_snapshot(task_t t, uint32_t *slot, uint32_t *gen, uint64_t *ticket)
@@ -673,6 +713,28 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		if (fFence >= 0) {
 			if (op == 0) {
 				o0 = ++sm_fence[fFence].issued;
+			} else if (op == 3 && ins >= 3) {
+				/* tag: input [3, ticket, surface id...]: these IOSurfaces are rendered by this task's ticket */
+				uint64_t t = args->scalarInput[1];
+				for (uint32_t k = 2; k < ins && t != 0 && t <= sm_fence[fFence].issued; k++) {
+					uint32_t id = (uint32_t)args->scalarInput[k], j = SM_SURF_TAGS;
+					if (id == 0) {
+						continue;
+					}
+					for (uint32_t i = 0; i < SM_SURF_TAGS; i++) {
+						if (sm_surf[i].id == id) {
+							j = i;
+							break;
+						}
+					}
+					if (j == SM_SURF_TAGS) {
+						j = sm_surf_next++ % SM_SURF_TAGS;
+					}
+					sm_surf[j].id = id;
+					sm_surf[j].slot = (uint32_t)fFence;
+					sm_surf[j].gen = sm_fence[fFence].gen;
+					sm_surf[j].ticket = t;
+				}
 			} else if (op == 1 && ins >= 2) {
 				uint64_t t = args->scalarInput[1];
 				if (t > sm_fence[fFence].done && t <= sm_fence[fFence].issued) {
