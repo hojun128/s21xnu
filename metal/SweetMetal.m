@@ -2734,7 +2734,7 @@ static void sm_tag_surfaces(NSArray *passes, uint64_t t)
 		if ([e isKindOfClass:[SweetMTLBlitEncoder class]]) { for (id d in [(SweetMTLBlitEncoder *)e sm_dsts]) sm_tag_add(in, &n, d); }
 		else if ([e isKindOfClass:[SweetMTLRenderEncoder class]]) sm_tag_add(in, &n, ((SweetMTLRenderEncoder *)e).target);
 	}
-	if (n > 2 && sm_conn) IOConnectCallScalarMethod(sm_conn, 14, in, n, NULL, NULL);
+	if (n > 2 && sm_conn) IOConnectCallMethod(sm_conn, 14, in, n, NULL, 0, NULL, NULL, NULL, NULL);
 }
 - (void)commit
 {
