@@ -1643,6 +1643,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (bool)sm_noflush;
 - (bool)sm_isShadowed;
 - (bool)sm_allZero;
+- (bool)sm_junk;
 - (void)sm_writeback;
 - (uint32_t)maliFormat;
 - (uint32_t)maliSwizzle;
@@ -1658,11 +1659,13 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	const uint8_t *_lazy; NSUInteger _lazyLen, _lazyBpr; uint64_t _lazySum; void (^_lazyDl)(void *, NSUInteger);   /* no-copy ASTC: client fills it later */
 	uint8_t _swz[4];            /* descriptor channel swizzle (MTLTextureSwizzle: 0 zero, 1 one, 2 R, 3 G, 4 B, 5 A) */
 	bool _allZero;              /* last full CPU upload was entirely zero (no content yet) */
+	bool _junk;                 /* ASTC whose blocks are mostly the magenta error colour (broken app snapshots) */
 	int8_t _wbOK;               /* shadow write-back target writable: -1 unknown, 0 no, 1 yes */
 	bool _priv, _cpuDirty;      /* MTLStorageModePrivate: only the GPU touches it, so no cache flush unless we wrote it on the CPU */
 }
 - (bool)sm_isShadowed { return _hasShadow; }
 - (bool)sm_allZero { return _allZero; }
+- (bool)sm_junk { return _junk; }
 /* GPU wrote this texture: copy an aligned shadow back to the memory it stands for (client buffer / IOSurface). Without it
  * snapshots rendered into 16-byte-pitch shared buffers stayed all zero for their readers (the home screen black
  * rectangle: an opaque snapshot image that came back empty, run131), and the next sm_sync overwrote the GPU's output. */
@@ -1926,6 +1929,15 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 			static int ns; if (nn && ns++ < 12) slog("SweetMTL: astc stats pf%lu %lux%lu (%lux%lu blocks %ux%u): mean rgb %llu %llu %llu, dark %llu%%", (unsigned long)_pixelFormat,
 			    (unsigned long)_width, (unsigned long)_height, (unsigned long)nbx, (unsigned long)nby, abw, abh, sr / nn, sg / nn, sb / nn, nd * 100 / nn);
 		}
+		{
+			/* app snapshots saved from our 10-bit XR targets (written as 8-bit) come back as ASTC that is mostly solid
+			 * magenta: the app open/close animation showed a magenta card (user video 2026-11-18). Such a texture is
+			 * not drawn (transparent) until the snapshots are fixed at the source. */
+			bool junk = ntot >= 64 && nerr * 4 >= ntot;
+			if (junk != _junk) { static int nj; if (nj++ < 8) slog("SweetMTL: astc %lux%lu %s: %lu/%lu magenta blocks", (unsigned long)_width, (unsigned long)_height,
+			    junk ? "is a broken snapshot, not drawn" : "recovered", (unsigned long)nerr, (unsigned long)ntot); }
+			_junk = junk;
+		}
 		{ static int nl; if (nerr && nl++ < 6) slog("SweetMTL: astc decode %lux%lu pf%lu: %lu/%lu error blocks, first at block %lu,%lu", (unsigned long)_width, (unsigned long)_height,
 		    (unsigned long)_pixelFormat, (unsigned long)nerr, (unsigned long)ntot, (unsigned long)ex, (unsigned long)ey); }
 		return;
@@ -2120,6 +2132,14 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 		r->has_scissor = 1; r->sc_x0 = x0; r->sc_y0 = y0; r->sc_x1 = x1 - 1; r->sc_y1 = y1 - 1;
 	}
 	if (_pipeline.fs && _pipeline.fs->bad) { _skipped++; return NULL; }
+	for (uint32_t k = 0; k < 8; k++) {
+		SweetMTLTexture *t = _tex[k];
+		if (t && [t isKindOfClass:[SweetMTLTexture class]]) [t sm_sync];   /* decode now so the flag is current */
+		if (t && [t isKindOfClass:[SweetMTLTexture class]] && [t sm_junk]) {
+			static int nl; if (nl++ < 4) slog("SweetMTL: skipped draw of broken snapshot %lux%lu", (unsigned long)t.width, (unsigned long)t.height);
+			_skipped++; return NULL;
+		}
+	}
 	static int skipz = -1; if (skipz < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; skipz = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetskipempty=0") ? 0 : 1; }   /* default on: source not found (runs 130-141) */
 	if (skipz && _pipeline.fs && strstr(_pipeline.fs->name, "Ixrg")) {
 		/* opaque-image draw (alpha ignored) of a texture whose content never arrived (all-zero upload): it would paint a solid
