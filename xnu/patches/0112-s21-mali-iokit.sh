@@ -126,6 +126,7 @@ sweet_gpu_fence_ready(uint32_t slot, uint32_t gen, uint64_t ticket)
 	return r;
 }
 extern "C" void sweet_hid_touch(int finger, int down, int x, int y);
+extern "C" void sweet_gov_touch(void);   /* 0111 load governor touch booster */
 static int sm_flush_ro = 1;     /* boot-arg sweetflushro=0 turns the read-only import flush off */
 
 extern "C" void sweet_mali_keep_dump(void);
@@ -631,6 +632,9 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		}
 		sweet_hid_touch((int)args->scalarInput[0], (int)args->scalarInput[1],
 		    (int)args->scalarInput[2], (int)args->scalarInput[3]);
+		if (args->scalarInput[1]) {
+			sweet_gov_touch();   /* synthetic touches boost like real ones */
+		}
 		return kIOReturnSuccess;
 	}
 	if (selector == kSMFence) {

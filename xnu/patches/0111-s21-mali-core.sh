@@ -22,6 +22,9 @@ cat > bsd/dev/sweet_mali.c <<'EOF_SWEET_SRC'
 #include <sys/systm.h>
 #include <kern/clock.h>
 #include <mach/mach_time.h>
+#include <mach/mach_types.h>
+#include <mach/machine.h>
+#include <mach/processor_info.h>
 #include <machine/machine_routines.h>
 #include <arm/caches_internal.h>
 #include <vm/pmap.h>
@@ -379,6 +382,7 @@ mali_recover(const char *why)
 int sweet_s21keys_start(void);
 int sweet_s21_battery_start(void);
 static inline void gov_job(void);   /* idle clock governor, below mali_dvfs() */
+static volatile uint64_t mali_busy_abs;   /* GPU job time since boot (start to completion), for the load governor */
 
 /* ---- job submission (polling) ---- */
 /* returns 0 on DONE, else the JS_STATUS exception code (or 0xFFFF on timeout) */
@@ -396,6 +400,7 @@ mali_submit_wait(struct mali_ctx *c, uint32_t slot, uint64_t jc_va, uint32_t tim
 	wr(R_JS(slot, 0x54), 0);
 	wr(R_JS(slot, 0x58), ((uint32_t)c->as) | (3U << 8) | (1U << 10) | (3U << 12) | (8U << 16));
 	wr(R_JS(slot, 0x60), JS_COMMAND_START);
+	uint64_t job_t0 = mach_absolute_time();
 	{
 		/* spin up to 30 ms first: most jobs finish well within that */
 		uint64_t end, now = mach_absolute_time();
@@ -427,6 +432,7 @@ mali_submit_wait(struct mali_ctx *c, uint32_t slot, uint64_t jc_va, uint32_t tim
 		return 0xFFFFU;
 	}
 	uint32_t js = rd(R_JS(slot, 0x24));
+	mali_busy_abs += mach_absolute_time() - job_t0;
 	wr(R_JOB_IRQ_CLEAR, 0xFFFFFFFFU);
 	if (raw & fail) {
 		uint32_t as = (uint32_t)c->as;
@@ -901,9 +907,169 @@ gov_set(int gpu, int lo)
 	}
 }
 
+/*
+ * Load governor (boot-arg sweetgov=2; idea and numbers from N1709/z3sios redwood_exynos_acpm.c, MIT). The idle
+ * governor above held every cluster and the GPU at their top clock whenever anything animated: 75-89 C in a ten
+ * minute test, then the thermal steps cut in (runs 185/186). Every 100 ms: the busiest core of each cluster and the
+ * GPU's busy time; a domain over 85 % (GPU 75 %) goes to its top rung at once, otherwise to the lowest rung that
+ * would make it ~60 % busy (GPU 50 %), coming down one rung per 300 ms. A finger landing holds every domain at
+ * least at its touch floor for 130 ms (head) and a lower one for 500 ms (tail): Samsung's input booster timing.
+ * Idle (no job, no touch for 1 s, every core under 15 %): lowest rungs and the tick stops until a job or touch.
+ * The thermal cap still forces the lowest rungs.
+ */
+extern processor_t processor_array[];
+extern unsigned int real_ncpus;
+extern kern_return_t processor_info(processor_t, processor_flavor_t, host_t *, processor_info_t, mach_msg_type_number_t *);
+#define G2_RUNGS 5
+static struct g2dom {
+	const char *name; unsigned di; unsigned first_cpu, ncpu;   /* ncpu 0: the GPU */
+	uint32_t rung[G2_RUNGS]; unsigned aim, jump, head, tail;   /* head/tail: touch floors (rung index) */
+	int cur; uint64_t down_ok;
+} g2[] = {
+	{ "cl0", 2, 0, 4, { 1066000, 1378000, 1794000, 0, 0 }, 60, 85, 1, 0, -1, 0 },
+	{ "cl1", 3, 4, 3, { 1040000, 1456000, 1768000, 2080000, 0 }, 60, 85, 2, 1, -1, 0 },
+	{ "cl2", 4, 7, 1, { 1040000, 1456000, 1872000, 2288000, 0 }, 60, 85, 2, 1, -1, 0 },
+	{ "g3d", 5, 0, 0, { 130000, 312000, 494000, 676000, 858000 }, 50, 75, 2, 1, -1, 0 },
+};
+#define G2_N (sizeof(g2) / sizeof(g2[0]))
+static uint32_t g2_ticks[8][2];
+static uint64_t g2_busy_last, g2_tick_last, g2_touch_abs, g2_changes;
+
+void sweet_gov_touch(void);
+void
+sweet_gov_touch(void)
+{
+	g2_touch_abs = mach_absolute_time();
+	if (gov_on == 2 && gov_tc && OSCompareAndSwap(0, 1, &gov_pending)) {
+		thread_call_enter(gov_tc);
+	}
+}
+
+static int
+g2_nrung(const struct g2dom *d)
+{
+	int n = 0;
+	while (n < G2_RUNGS && d->rung[n]) {
+		n++;
+	}
+	return n;
+}
+
+/* busiest core of a cluster since the last call, or the GPU's busy share of the last tick, in percent (-1: none) */
+static int
+g2_busy(struct g2dom *d, uint64_t tick_abs)
+{
+	if (d->ncpu == 0) {
+		uint64_t b = mali_busy_abs, db = b - g2_busy_last;
+		g2_busy_last = b;
+		return tick_abs ? (int)(db * 100 / tick_abs) : -1;
+	}
+	int worst = -1;
+	for (unsigned c = d->first_cpu; c < d->first_cpu + d->ncpu && c < 8 && c < real_ncpus; c++) {
+		processor_cpu_load_info_data_t load;
+		mach_msg_type_number_t count = PROCESSOR_CPU_LOAD_INFO_COUNT;
+		host_t host;
+		if (processor_array[c] == PROCESSOR_NULL ||
+		    processor_info(processor_array[c], PROCESSOR_CPU_LOAD_INFO, &host, (processor_info_t)&load, &count) != KERN_SUCCESS) {
+			continue;
+		}
+		uint32_t busy = load.cpu_ticks[CPU_STATE_USER] + load.cpu_ticks[CPU_STATE_SYSTEM] + load.cpu_ticks[CPU_STATE_NICE];
+		uint32_t all = busy + load.cpu_ticks[CPU_STATE_IDLE];
+		uint32_t db = busy - g2_ticks[c][0], da = all - g2_ticks[c][1];
+		g2_ticks[c][0] = busy;
+		g2_ticks[c][1] = all;
+		if (da) {
+			int pct = (int)(db * 100U / da);
+			if (pct > worst) {
+				worst = pct;
+			}
+		}
+	}
+	return worst;
+}
+
+static void
+gov2_run(void)
+{
+	uint64_t now = mach_absolute_time(), head = 0, tail = 0, ms100 = 0, ms300 = 0, idle_ns = 0;
+	uint64_t tick = g2_tick_last ? now - g2_tick_last : 0;
+	g2_tick_last = now;
+	nanoseconds_to_absolutetime(130ULL * NSEC_PER_MSEC, &head);
+	nanoseconds_to_absolutetime(500ULL * NSEC_PER_MSEC, &tail);
+	nanoseconds_to_absolutetime(100ULL * NSEC_PER_MSEC, &ms100);
+	nanoseconds_to_absolutetime(300ULL * NSEC_PER_MSEC, &ms300);
+	absolutetime_to_nanoseconds(now - gov_last_job, &idle_ns);
+	int touching_head = g2_touch_abs && now - g2_touch_abs < head;
+	int touching_tail = g2_touch_abs && now - g2_touch_abs < tail;
+	int maxbusy = 0, busy[G2_N], changed = 0;
+	for (unsigned i = 0; i < G2_N; i++) {
+		busy[i] = g2_busy(&g2[i], tick);
+		if (busy[i] > maxbusy && g2[i].ncpu) {
+			maxbusy = busy[i];
+		}
+	}
+	int idle = idle_ns >= 1000000000ULL && !(g2_touch_abs && now - g2_touch_abs < 2 * tail) && maxbusy < 15;
+	for (unsigned i = 0; i < G2_N; i++) {
+		struct g2dom *d = &g2[i];
+		int n = g2_nrung(d), want;
+		int cur = d->cur < 0 ? n - 1 : d->cur;
+		if (sweet_thermal_cap || idle) {
+			want = 0;
+		} else if (busy[i] >= (int)d->jump) {
+			want = n - 1;
+		} else {
+			uint64_t need = busy[i] > 0 ? (uint64_t)d->rung[cur] * (uint64_t)busy[i] / d->aim : 0;
+			want = 0;
+			while (want < n - 1 && d->rung[want] < need) {
+				want++;
+			}
+			if (touching_head && want < (int)d->head) {
+				want = (int)d->head;
+			} else if (touching_tail && want < (int)d->tail) {
+				want = (int)d->tail;
+			}
+			if (want < cur) {
+				want = now >= d->down_ok ? cur - 1 : cur;   /* down one rung at a time */
+			}
+		}
+		if (want != d->cur) {
+			if (want > cur || d->cur < 0) {
+				d->down_ok = now + ms300;
+			} else {
+				d->down_ok = now + ms300;
+			}
+			(void)acd_xfer(D[d->di].id, d->rung[want], 0, 20);
+			d->cur = want;
+			changed = 1;
+		}
+	}
+	if (changed && (++g2_changes <= 40 || (g2_changes % 500) == 0)) {
+		mali_log("dvfs gov2: cl0 %u cl1 %u cl2 %u g3d %u MHz | busy %d %d %d gpu %d%s%s%s (%llu)", g2[0].rung[g2[0].cur] / 1000,
+		    g2[1].rung[g2[1].cur] / 1000, g2[2].rung[g2[2].cur] / 1000, g2[3].rung[g2[3].cur] / 1000, busy[0], busy[1], busy[2], busy[3],
+		    touching_head ? " touch" : "", idle ? " idle" : "", sweet_thermal_cap ? " CAP" : "", g2_changes);
+	}
+	if (!idle || sweet_thermal_cap) {
+		thread_call_enter_delayed(gov_tc, mach_absolute_time() + ms100);
+	} else {
+		g2_tick_last = 0;   /* parked: the next job or touch wakes it */
+	}
+}
+
 static void
 gov_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
+	if (gov_on == 2) {
+		if (!OSCompareAndSwap(0, 1, &gov_busy)) {
+			uint64_t dl;
+			clock_interval_to_deadline(5, NSEC_PER_MSEC, &dl);
+			thread_call_enter_delayed(gov_tc, dl);
+			return;
+		}
+		gov_pending = 0;
+		gov2_run();
+		gov_busy = 0;
+		return;
+	}
 	if (!OSCompareAndSwap(0, 1, &gov_busy)) {
 		uint64_t dl;   /* another run is active: retry shortly so a pending wake-up is never lost */
 		clock_interval_to_deadline(5, NSEC_PER_MSEC, &dl);
@@ -953,6 +1119,12 @@ static inline void
 gov_job(void)
 {
 	gov_last_job = mach_absolute_time();
+	if (gov_on == 2) {
+		if (gov_tc && g2_tick_last == 0 && OSCompareAndSwap(0, 1, &gov_pending)) {
+			thread_call_enter(gov_tc);
+		}
+		return;
+	}
 	if (gov_tc && (gov_gpu_lo || gov_cpu_lo) && OSCompareAndSwap(0, 1, &gov_pending)) {
 		thread_call_enter(gov_tc);
 	}
@@ -977,8 +1149,12 @@ gov_start(void)
 	uint64_t dl;
 	clock_interval_to_deadline(250, NSEC_PER_MSEC, &dl);
 	thread_call_enter_delayed(gov_tc, dl);
-	mali_log("dvfs gov: on (gpu lo after %u ms, cpu lo after %u ms once up %u s)", gov_gpu_ms, gov_cpu_ms,
-	    gov_cpu_after);
+	if (gov_on == 2) {
+		mali_log("dvfs gov2: load governor on (100 ms tick, touch booster 130/500 ms)");
+	} else {
+		mali_log("dvfs gov: on (gpu lo after %u ms, cpu lo after %u ms once up %u s)", gov_gpu_ms, gov_cpu_ms,
+		    gov_cpu_after);
+	}
 }
 
 void sweet_mali_boot(void);
