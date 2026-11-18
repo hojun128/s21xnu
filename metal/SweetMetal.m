@@ -1975,6 +1975,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 	uint64_t _fbuf[31], _fbufBase[31];
 	MTLScissorRect _scissor;
 	BOOL _hasScissor;
+	uint32_t _mOff, _mN;   /* pass merge (sweetmerge=1): this pass draws sm_mbuf[_mOff.._mOff+_mN) instead of its own */
 }
 - (instancetype)init { self = [super init]; _keep = [NSMutableArray array]; return self; }
 - (void)endEncoding {}
@@ -2482,6 +2483,99 @@ static void *sm_q_main(void *arg)
 }
 static void sm_mark_use(id o, uint64_t seq) { if ([o isKindOfClass:[SweetMTLTexture class]]) ((SweetMTLTexture *)o).smLastUse = seq; }
 
+/* ------------------------------------------------------------------ pass merging (boot-arg sweetmerge=1)
+ * CoreAnimation ends its screen pass whenever it renders a small offscreen layer (icon, text run, shadow mask) and then
+ * resumes the screen with loadAction=Load. On this tile GPU every resumed full-screen pass re-reads and re-writes the
+ * whole 1125x2436 target (~0.9 ms each): one scrolling frame had 8 screen passes = 7.9 of its 9.7 GPU ms (run179).
+ * Plan per command buffer: offscreen passes that neither read the screen nor are read by the screen draws gathered so far
+ * run first (their order kept), and consecutive screen passes become one pass. Anything else (blit/compute encoders,
+ * a screen pass that clears, a dependency either way) ends the gathered screen pass at that point, so every texture is
+ * read with the same content as in the original order.
+ */
+static sm_drawrec sm_mbuf[128];
+static bool sm_tex_alias(SweetMTLTexture *a, SweetMTLTexture *b)
+{
+	if (!a || !b) return false;
+	if (a == b) return true;
+	if (a.iosurface && a.iosurface == b.iosurface) return true;
+	sm_bo *x = a.bo, *y = b.bo;
+	return x && y && x->gpu && y->gpu && x->gpu < y->gpu + y->size && y->gpu < x->gpu + x->size;
+}
+static bool sm_enc_reads(SweetMTLRenderEncoder *e, SweetMTLTexture *t)
+{
+	for (id o in e.keep) if ([o isKindOfClass:[SweetMTLTexture class]] && sm_tex_alias(o, t)) return true;
+	for (uint32_t i = 0; i < e->_ndraw; i++) for (uint32_t k = 0; k < e->_draws[i].ntex && k < 8; k++) {
+		uint64_t va = e->_draws[i].tex[k].va; sm_bo *b = t.bo;
+		if (va && b && b->gpu && va >= b->gpu && va < b->gpu + b->size) return true;
+	}
+	return false;
+}
+static uint32_t sm_slot_bytes(const sm_drawrec *r)
+{
+	uint32_t vsz = r->vs ? r->vs->size : 0, fsz = r->fs ? r->fs->size : 0x100;
+	return (0x1000 + ((vsz + 127) & ~127u) + fsz + 127 + 0xFFF) & ~0xFFFu;
+}
+static bool sm_enc_generic(SweetMTLRenderEncoder *e)
+{
+	if (!e->_ndraw) return false;
+	for (uint32_t i = 0; i < e->_ndraw; i++) if (!e->_draws[i].vs) return false;
+	return true;
+}
+static uint32_t sm_merge_saved, sm_merge_hoisted;
+/* returns the execution order; merged-away passes are left out, their draws appended to the head's _mOff/_mN */
+static NSArray *sm_plan_passes(NSArray *passes, uint64_t desc_cap)
+{
+	SweetMTLTexture *X = nil; uint64_t best = 0;
+	for (id o in passes) {
+		if (![o isKindOfClass:[SweetMTLRenderEncoder class]] || [o isKindOfClass:[SweetMTLComputeEncoder class]] || [o isKindOfClass:[SweetMTLBlitEncoder class]]) continue;
+		SweetMTLRenderEncoder *e = o; SweetMTLTexture *t = e.target;
+		if (!t || !sm_enc_generic(e)) continue;
+		uint64_t a = (uint64_t)t.width * t.height;
+		if (a > best) { best = a; X = t; }
+	}
+	for (id o in passes) if ([o isKindOfClass:[SweetMTLRenderEncoder class]] && ![o isKindOfClass:[SweetMTLComputeEncoder class]] && ![o isKindOfClass:[SweetMTLBlitEncoder class]]) { ((SweetMTLRenderEncoder *)o)->_mN = 0; }
+	if (!X) return passes;
+	NSMutableArray *order = [NSMutableArray arrayWithCapacity:passes.count];
+	NSMutableArray *pend = [NSMutableArray array];   /* screen passes gathered into the head (first element) */
+	__block uint32_t mo = 0, mc = 0; __block uint64_t bytes = 0;
+	void (^flush)(void) = ^{
+		if (!pend.count) return;
+		SweetMTLRenderEncoder *h = pend[0];
+		if (pend.count > 1) { h->_mOff = mo; h->_mN = mc; sm_merge_saved += (uint32_t)pend.count - 1; }
+		[order addObject:h];
+		mo += mc; mc = 0; bytes = 0;
+		[pend removeAllObjects];
+	};
+	for (id o in passes) {
+		bool render = [o isKindOfClass:[SweetMTLRenderEncoder class]] && ![o isKindOfClass:[SweetMTLComputeEncoder class]] && ![o isKindOfClass:[SweetMTLBlitEncoder class]];
+		if (!render) { flush(); [order addObject:o]; continue; }
+		SweetMTLRenderEncoder *e = o;
+		if (e.target == X && sm_enc_generic(e) && !sm_enc_reads(e, X)) {
+			uint64_t b = 0; for (uint32_t i = 0; i < e->_ndraw; i++) b += sm_slot_bytes(&e->_draws[i]);
+			bool fits = mo + mc + e->_ndraw <= 128 && mc + e->_ndraw <= 96 && bytes + b + 0x10000 <= desc_cap;
+			if (pend.count && e.load && fits) {
+				memcpy(&sm_mbuf[mo + mc], e->_draws, e->_ndraw * sizeof(sm_drawrec)); mc += e->_ndraw; bytes += b;
+				[pend addObject:e];
+				continue;
+			}
+			flush();
+			if (mo + e->_ndraw <= 128) {
+				memcpy(&sm_mbuf[mo], e->_draws, e->_ndraw * sizeof(sm_drawrec)); mc = e->_ndraw; bytes = b;
+				[pend addObject:e];
+			} else [order addObject:e];
+			continue;
+		}
+		if (e.target == X || !pend.count) { flush(); [order addObject:e]; continue; }
+		/* offscreen pass while screen draws are gathered: run it now if independent */
+		bool dep = sm_enc_reads(e, X) || sm_tex_alias(e.target, X);
+		for (SweetMTLRenderEncoder *q in pend) if (!dep && sm_enc_reads(q, e.target)) dep = true;
+		if (dep) { flush(); [order addObject:e]; continue; }
+		[order addObject:e]; sm_merge_hoisted++;
+	}
+	flush();
+	return order;
+}
+
 @implementation SweetMTLCommandBuffer
 - (instancetype)init { self = [super init]; _passes = [NSMutableArray array]; _scheduled = [NSMutableArray array]; _completed = [NSMutableArray array]; return self; }
 - (void)addScheduledHandler:(void (^)(id))h { if (h) [_scheduled addObject:[h copy]]; }
@@ -2587,7 +2681,10 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 	uint64_t pf_t0 = sm_ns();
 	if (sm_pf_last) { uint64_t g = (pf_t0 - sm_pf_last) / 1000000; sm_pf_gap[g < 20 ? 0 : g < 40 ? 1 : g < 100 ? 2 : 3]++; }
 	for (SweetMTLRenderEncoder *e in _passes) if ([e isKindOfClass:[SweetMTLRenderEncoder class]] && ![e isKindOfClass:[SweetMTLComputeEncoder class]]) sm_pf_draws += e->_ndraw;
-	for (SweetMTLRenderEncoder *e in _passes) {
+	static int merge = -1;
+	if (merge < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; merge = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetmerge=1") ? 1 : 0; }
+	NSArray *order = merge && have && !sm_is_poster(getprogname()) ? sm_plan_passes(_passes, desc.size) : _passes;
+	for (SweetMTLRenderEncoder *e in order) {
 		if ([e isKindOfClass:[SweetMTLBlitEncoder class]]) { [(SweetMTLBlitEncoder *)e sm_run]; sm_cf_reset(); continue; }
 		if ([e isKindOfClass:[SweetMTLComputeEncoder class]]) { if (!sm_gpu_off) [(SweetMTLComputeEncoder *)e sm_run]; continue; }
 		if (!have || !e.target) { _status = 5; continue; }
@@ -2627,10 +2724,11 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 					save = malloc((size_t)bpr * H); if (save) memcpy(save, e.target.bo->cpu, (size_t)bpr * H);
 				}
 				uint64_t dj0 = sm_pf_job_ns, dp0 = sm_pf_pre_ns, dw0 = sm_ns();
+				const sm_drawrec *pdr = e->_mN ? &sm_mbuf[e->_mOff] : e->_draws; uint32_t pnd = e->_mN ? e->_mN : e->_ndraw;
 				_lastJobStatus = sm_pass(&desc, &heap, e.target.bo->gpu, (uint32_t)e.target.width, (uint32_t)e.target.height,
-				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, e->_draws, e->_ndraw, &vs, e.load);
+				    (uint32_t)e.target.bytesPerRow, e.packed, bgra, pdr, pnd, &vs, e.load);
 				if (sm_pf_detail == 1 && sm_pf_dn < 48) {
-					sm_pf_d[sm_pf_dn].w = (uint16_t)W; sm_pf_d[sm_pf_dn].h = (uint16_t)H; sm_pf_d[sm_pf_dn].n = (uint16_t)e->_ndraw; sm_pf_d[sm_pf_dn].load = e.load;
+					sm_pf_d[sm_pf_dn].w = (uint16_t)W; sm_pf_d[sm_pf_dn].h = (uint16_t)H; sm_pf_d[sm_pf_dn].n = (uint16_t)pnd; sm_pf_d[sm_pf_dn].load = e.load;
 					sm_pf_d[sm_pf_dn].job_us = (uint32_t)((sm_pf_job_ns - dj0) / 1000); sm_pf_d[sm_pf_dn].pre_us = (uint32_t)((sm_pf_pre_ns - dp0) / 1000);
 					sm_pf_d[sm_pf_dn].wall_us = (uint32_t)((sm_ns() - dw0) / 1000); sm_pf_dn++;
 				}
@@ -3128,7 +3226,7 @@ static void sm_fbstats(uint64_t o[8])
 }
 static void sm_perf_reset(void)
 {
-	sm_fbstats(sm_fbst0); sm_q_full = sm_q_texwaits = sm_q_drains = 0;
+	sm_fbstats(sm_fbst0); sm_q_full = sm_q_texwaits = sm_q_drains = 0; sm_merge_saved = sm_merge_hoisted = 0;
 	sm_pf_ns = sm_pf_gpu_ns = sm_pf_max_ns = 0; sm_pf_n = sm_pf_jobs = sm_pf_draws = 0;
 	memset((void *)sm_pf_gap, 0, sizeof sm_pf_gap); sm_pf_win = sm_ns();
 	sm_pf_pre_ns = sm_pf_job_ns = sm_pf_post_ns = sm_pf_lock_ns = 0;
@@ -3144,8 +3242,8 @@ static void sm_perf_report(const char *what, long now)
 		uint64_t f[8]; sm_fbstats(f);
 		uint64_t d[7]; for (int i = 0; i < 7; i++) d[i] = f[i] - sm_fbst0[i];
 		/* panel = frames that really reached the glass (kernel AppleCLCD counters, patch 0137) */
-		slog("SweetMTL: perf %s panel: %.1f presents/s (swaps %llu presents %llu dropped %llu gated %llu timeout %llu kick %llu vsync %llu mode %llu) async %d full %u texwait %u drain %u",
-		    what, win ? d[1] * 1e9 / win : 0.0, d[0], d[1], d[6], d[2], d[3], d[4], d[5], f[7], sm_async, sm_q_full, sm_q_texwaits, sm_q_drains);
+		slog("SweetMTL: perf %s panel: %.1f presents/s (swaps %llu presents %llu dropped %llu gated %llu timeout %llu kick %llu vsync %llu mode %llu) async %d full %u texwait %u drain %u merged %u hoisted %u",
+		    what, win ? d[1] * 1e9 / win : 0.0, d[0], d[1], d[6], d[2], d[3], d[4], d[5], f[7], sm_async, sm_q_full, sm_q_texwaits, sm_q_drains, sm_merge_saved, sm_merge_hoisted);
 	}
 	(void)now;
 }
