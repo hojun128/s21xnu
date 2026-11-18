@@ -1,6 +1,158 @@
---- a/bsd/kern/kern_exit.c	2026-11-18 13:35:43
-+++ b/bsd/kern/kern_exit.c	2026-11-18 13:35:43
-@@ -1873,7 +1873,34 @@
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1855,8 +1855,151 @@
+ 		    ((proc_getcsflags(p) & CS_KILLED) ? "CS_KILLED" : ""),
+ 		    prefix_str, p->p_exit_reason->osr_namespace, p->p_exit_reason->osr_code,
+ 		    exit_reason_desc ? exit_reason_desc : "none", sweet_ufd);
++	}
++}
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: why did it die? abort()/fatalError()/objc_fatal/uncaught NSException messages live in the
++ * crashreporter annotations (__DATA*,__crash_info section, crashreporter_annotations_t) of the image that
++ * reported them (libsystem_c, libswiftCore, libobjc, CoreFoundation, libdispatch, ...). Walk dyld's image
++ * list of the dying process (we run on its own thread, so copyin works) and log every non-empty message.
++ */
++extern void sweet_mali_log_str(const char *s);
++struct sweet_lc { uint32_t cmd, cmdsize; };
++struct sweet_seg64 { uint32_t cmd, cmdsize; char segname[16]; uint64_t vmaddr, vmsize, fileoff, filesize; uint32_t maxprot, initprot, nsects, flags; };
++struct sweet_sect64 { char sectname[16], segname[16]; uint64_t addr, size; uint32_t offset, align, reloff, nreloc, flags, r1, r2, r3; };
++struct sweet_cr_annot { uint64_t version, message, signature_string, backtrace, message2, thread, dialog_mode, abort_cause; };
++
++static int
++sweet_crash_image(const char *who, user_addr_t mh, user_addr_t path)
++{
++	uint32_t h[8];
++	if (copyin(mh, h, sizeof(h)) || h[0] != 0xfeedfacfU || h[4] > 256 || h[5] > 65536) {
++		return 0;
++	}
++	uint64_t text = (uint64_t)-1;
++	user_addr_t lc = mh + 32, end = lc + h[5];
++	user_addr_t ci_addr = 0;
++	for (uint32_t i = 0; i < h[4] && lc + 8 <= end; i++) {
++		struct sweet_lc c;
++		if (copyin(lc, &c, sizeof(c)) || c.cmdsize < 8) {
++			return 0;
++		}
++		if (c.cmd == 0x19 /* LC_SEGMENT_64 */ && c.cmdsize >= sizeof(struct sweet_seg64)) {
++			struct sweet_seg64 sg;
++			if (copyin(lc, &sg, sizeof(sg))) {
++				return 0;
++			}
++			if (!strncmp(sg.segname, "__TEXT", 16)) {
++				text = sg.vmaddr;
++			} else if ((!strncmp(sg.segname, "__DATA", 6) || !strncmp(sg.segname, "__AUTH", 6)) && sg.nsects < 64) {
++				for (uint32_t k = 0; k < sg.nsects; k++) {
++					struct sweet_sect64 sc;
++					if (copyin(lc + sizeof(sg) + k * sizeof(sc), &sc, sizeof(sc))) {
++						break;
++					}
++					if (!strncmp(sc.sectname, "__crash_info", 16) && sc.size >= 16) {
++						ci_addr = (user_addr_t)sc.addr;
++					}
++				}
++			}
++		}
++		lc += c.cmdsize;
++	}
++	if (!ci_addr || text == (uint64_t)-1) {
++		return 0;
++	}
++	struct sweet_cr_annot an;
++	bzero(&an, sizeof(an));
++	if (copyin(ci_addr + (mh - text), &an, sizeof(an)) || an.version == 0 || an.version > 16) {
++		return 0;
++	}
++	int n = 0;
++	uint64_t msgs[2] = { an.message, an.message2 };
++	for (int m = 0; m < 2; m++) {
++		if (!msgs[m]) {
++			continue;
++		}
++		char txt[150], img[64] = "?", line[184];
++		size_t done = 0;
++		bzero(txt, sizeof(txt));
++		(void)copyinstr((user_addr_t)msgs[m], txt, sizeof(txt) - 1, &done);
++		txt[sizeof(txt) - 1] = 0;
++		for (char *q = txt; *q; q++) {
++			if (*q == '\n' || *q == '\r') {
++				*q = ' ';
++			}
++		}
++		if (!txt[0]) {
++			continue;
++		}
++		if (path) {
++			char pb[256];
++			bzero(pb, sizeof(pb));
++			(void)copyinstr(path, pb, sizeof(pb) - 1, &done);
++			pb[sizeof(pb) - 1] = 0;
++			const char *b = strrchr(pb, '/');
++			strlcpy(img, b ? b + 1 : pb, sizeof(img));
++		}
++		snprintf(line, sizeof(line), "crash: %s msg[%s]: %s", who, img, txt);
++		sweet_mali_log_str(line);
++		n++;
++	}
++	return n;
++}
++
++static void
++sweet_crash_messages(proc_t p)
++{
++	task_t task = proc_task(p);
++	if (task == NULL || !proc_is64bit(p)) {
++		return;
++	}
++	user_addr_t aii = (user_addr_t)task_get_all_image_info_addr(task);
++	struct user64_dyld_all_image_infos ai;
++	if (!aii || copyin(aii, &ai, __builtin_offsetof(struct user64_dyld_all_image_infos, sharedCacheUUID))) {
++		return;
++	}
++	uint32_t cnt = ai.infoArrayCount > 1500 ? 1500 : ai.infoArrayCount;
++	int found = 0;
++	if (ai.infoArray) {
++		for (uint32_t i = 0; i < cnt && found < 4; i++) {
++			struct user64_dyld_image_info ii;
++			if (copyin((user_addr_t)(ai.infoArray + (uint64_t)i * sizeof(ii)), &ii, sizeof(ii))) {
++				break;
++			}
++			found += sweet_crash_image(p->p_comm, (user_addr_t)ii.imageLoadAddress, (user_addr_t)ii.imageFilePath);
++		}
++	}
++	if (!found) {
++		char line[120];
++		snprintf(line, sizeof(line), "crash: %s msg: none in %u images (dyld v%u, cache slide 0x%llx)", p->p_comm, cnt,
++		    ai.version, (unsigned long long)ai.sharedCacheSlide);
++		sweet_mali_log_str(line);
++	}
++}
++
++/* crash loops: log the first 2 deaths of each process name, then every 25th */
++static int
++sweet_exit_should_log(const char *name)
++{
++	static struct { char n[17]; uint32_t c; } seen[96];
++	static uint32_t nseen;
++	for (uint32_t i = 0; i < nseen; i++) {
++		if (!strncmp(seen[i].n, name, 16)) {
++			uint32_t c = ++seen[i].c;
++			return c <= 2 || (c % 25) == 0 ? (int)c : 0;
++		}
+ 	}
++	if (nseen < 96) {
++		strlcpy(seen[nseen].n, name, sizeof(seen[nseen].n));
++		seen[nseen].c = 1;
++		nseen++;
++	}
++	return 1;
+ }
++#endif
+ 
+ void
+ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+@@ -1873,7 +2016,38 @@
  
  	if (p->p_crash_behavior != 0 || p == initproc) {
  		proc_handle_critical_exit(p, rv);
@@ -10,25 +162,29 @@
 +	/*
 +	 * SWEET: every abnormal exit also goes to the SweetMali keep log ("crash:"), which survives the
 +	 * 128 KiB console ring and is replayed before a recovery reboot. Covers kills without a core
-+	 * signal too (SIGKILL from jetsam, launchd, code signing), which the CRASH lines above miss.
++	 * signal too (SIGKILL from jetsam, launchd, code signing). Skips jetsam idle exits (namespace 1,
++	 * code 9) and SIGHUP; crash loops are thinned per process name.
 +	 */
-+	/* skip jetsam idle exits (namespace 1 JETSAM, code 9 IDLE_EXIT) and early-boot launchd children (SIGHUP) */
 +	if ((WIFSIGNALED(rv) || PROC_HAS_EXITREASON(p)) &&
 +	    !(PROC_HAS_EXITREASON(p) && p->p_exit_reason->osr_namespace == 1 && p->p_exit_reason->osr_code == 9) &&
 +	    !(WIFSIGNALED(rv) && WTERMSIG(rv) == SIGHUP)) {
 +		static int sweet_exit_logs;
-+		if (sweet_exit_logs < 200) {
-+			extern void sweet_mali_log_str(const char *s);
++		int nth = sweet_exit_should_log(p->p_comm);
++		if (nth && sweet_exit_logs < 300) {
 +			char sl[184];
 +			char *desc = PROC_HAS_EXITREASON(p) ? exit_reason_get_string_desc(p->p_exit_reason) : NULL;
 +			sweet_exit_logs++;
-+			snprintf(sl, sizeof(sl), "crash: %s[%d] sig %d exc %d code 0x%llx ns %u rc 0x%llx%s %s",
-+			    p->p_comm, proc_getpid(p), WIFSIGNALED(rv) ? WTERMSIG(rv) : 0, ut->uu_exception,
++			snprintf(sl, sizeof(sl), "crash: %s[%d] #%d sig %d exc %d code 0x%llx ns %u rc 0x%llx%s %s",
++			    p->p_comm, proc_getpid(p), nth, WIFSIGNALED(rv) ? WTERMSIG(rv) : 0, ut->uu_exception,
 +			    (unsigned long long)ut->uu_code,
 +			    PROC_HAS_EXITREASON(p) ? p->p_exit_reason->osr_namespace : 0,
 +			    PROC_HAS_EXITREASON(p) ? (unsigned long long)p->p_exit_reason->osr_code : 0ULL,
 +			    (proc_getcsflags(p) & CS_KILLED) ? " CS_KILLED" : "", desc != NULL ? desc : "");
 +			sweet_mali_log_str(sl);
++			/* the reason text, for the first death of each name (we are on the dying thread) */
++			if (nth == 1 && p == current_proc() && WIFSIGNALED(rv) && WTERMSIG(rv) != SIGKILL) {
++				sweet_crash_messages(p);
++			}
 +		}
  	}
 +#endif
