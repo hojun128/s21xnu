@@ -3373,7 +3373,7 @@ static void *sm_watchdog(void *arg)
 					if (apps) { sm_app_tour(); step = 5; due = 0; }
 					else if (longrun) { kern_return_t k = sm_tap(174, 571); slog("SweetMTL: step tap Settings kr=%x", k); sm_describe = 4; } }
 				else if (st == 2) {
-					/* settings-open shot dropped: four deferred shots overflowed the pmsg ring (run113 lost the lock screen) */
+					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 18);   /* Settings as opened (small) */
 					/* scroll the Settings list: three flicks up, then two back down, measured on their own */
 					sm_perf_reset();
 					sm_pf_detail = 2;   /* describe the passes of one commit during the first flick */
@@ -3381,7 +3381,7 @@ static void *sm_watchdog(void *arg)
 					usleep(1500000);
 					sm_perf_report("scrolling", ts.tv_sec);
 				} else if (st == 3) {
-					/* settings-scrolled shot dropped (ring space) */
+					sm_thumb(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 19);   /* Settings after the scroll (small) */
 					sm_describe = 8;   /* the app-to-home transition faulted in run101/102: list its draws */
 					sm_drag(540, 2392, 540, 1000, 24);   /* home indicator: back to the home screen */
 					slog("SweetMTL: step home swipe");

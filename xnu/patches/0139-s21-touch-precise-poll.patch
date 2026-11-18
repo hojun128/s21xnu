@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 231bf58..bc3b8b6 100644
+index 231bf58..fcedda8 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -423,10 +423,31 @@ static uint32_t ts_g_poll_us;
+@@ -423,10 +423,52 @@ static uint32_t ts_g_poll_us;
  static int ts_g_ev;
  static int ts_g_burst = 32; /* 0098: events drained per poll; touch_burst=1 = old behaviour */
  
@@ -14,6 +14,27 @@ index 231bf58..bc3b8b6 100644
 + */
 +static uint32_t ts_g_active_us = 4000;
 +static uint64_t ts_g_last_ev_abs;
++/* touch statistics every 10 s with events (kept log line "keys: touch ..."): tells real use from ghost touches */
++extern void sweet_mali_log_str(const char *s);
++static uint32_t ts_st_ev, ts_st_down, ts_st_ids, ts_st_lines; static int ts_st_x, ts_st_y; static uint64_t ts_st_t0;
++static void
++ts_stat(const struct ts_touch *t)
++{
++	uint64_t now = mach_absolute_time(), win = 0;
++	ts_st_ev++; ts_st_down += t->down ? 1 : 0; ts_st_ids |= 1u << (t->id & 15); ts_st_x = t->x; ts_st_y = t->y;
++	nanoseconds_to_absolutetime(10ULL * NSEC_PER_SEC, &win);
++	if (!ts_st_t0) {
++		ts_st_t0 = now;
++	} else if (now - ts_st_t0 >= win) {
++		if (ts_st_lines++ < 120) {
++			char ln[112];
++			snprintf(ln, sizeof(ln), "keys: touch 10s ev %u down %u ids %x last %d,%d z %d", ts_st_ev, ts_st_down, ts_st_ids,
++			    (ts_st_x * 1080) >> 12, (ts_st_y * 2400) >> 12, t->z);
++			sweet_mali_log_str(ln);
++		}
++		ts_st_ev = ts_st_down = ts_st_ids = 0; ts_st_t0 = now;
++	}
++}
 +
  static void
  ts_block_us(uint32_t us)
@@ -35,15 +56,16 @@ index 231bf58..bc3b8b6 100644
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
-@@ -454,6 +475,7 @@ sweet_touch_poll(void *arg, wait_result_t w)
+@@ -454,6 +496,8 @@ sweet_touch_poll(void *arg, wait_result_t w)
  				}
  				if (decode_event(ev, &t)) {
  					dec++;
 +					ts_g_last_ev_abs = mach_absolute_time();
++					ts_stat(&t);
  					if ((uint32_t)t.x > maxx) { maxx = (uint32_t)t.x; }
  					if ((uint32_t)t.y > maxy) { maxy = (uint32_t)t.y; }
  					sweet_touch_post(&t, (uint32_t)ts_g_flip);
-@@ -907,6 +929,7 @@ sweet_touch_init(void)
+@@ -907,6 +951,7 @@ sweet_touch_init(void)
  	PE_parse_boot_argn("touch_flip", &touch_flip, sizeof(touch_flip));
  	PE_parse_boot_argn("touch_trace", &touch_trace, sizeof(touch_trace));
  	PE_parse_boot_argn("touch_poll_us", &touch_poll_us, sizeof(touch_poll_us));

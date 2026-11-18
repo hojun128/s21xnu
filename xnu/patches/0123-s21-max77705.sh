@@ -380,7 +380,7 @@ mx_poll(void)
 		}
 	}
 	mx_charger_service(first);
-	if (first || (mx_polls % 30) == 0) {
+	if (first || (mx_polls % 6) == 0) {   /* once a minute: temperature and current over time */
 		mx_log("chg: soc %u.%u%% %u mV %d mA chgin %d dtls01 %02x mode %u errs %u temp %d", mx_info.soc_x10 / 10,
 		    mx_info.soc_x10 % 10, mv, mx_info.ma, mx_info.chgin, mx_info.dtls01, mx_info.mode, mx_errs, mx_info.temp_x10);
 	}
