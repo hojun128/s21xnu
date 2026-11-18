@@ -9,6 +9,9 @@
 - launchd jobs removed (crash loops, not needed on this port):
     com.apple.remotemanagementd  NSFileManager createDirectoryAtURL: nil (no system group container), every few s
     com.apple.progressd          "BUG IN CLIENT OF LIBPLATFORM: Trying to recursively lock an os_unfair_lock"
+- time zone Asia/Seoul (/private/var/db/timezone/localtime pointed at US/Pacific: the clock read 5:11 at 22:36 KST).
+- /private/var/mobile/Library/Health/Client made in advance (healthappd: "Error creating core data store directory",
+  NSPOSIXErrorDomain 5 creating it at run time).
 - Safari "Fraudulent Website Warning" off: the SafeBrowsing XPC service dereferences a null
   Backend::Google::DeviceIdentificationTokenFetcher (SafariSafeBrowsing+0x519d0, far 0x78) in handleGetDatabases.
 """
@@ -27,6 +30,22 @@ def main(root):
     except PermissionError:
         pass
     print('tmp:', oct(os.stat(t).st_mode & 0o7777), os.stat(t).st_uid)
+    tz = os.path.join(root, 'private/var/db/timezone/localtime')
+    want = '/var/db/timezone/zoneinfo/Asia/Seoul'
+    if os.path.islink(tz) and os.readlink(tz) != want:
+        os.unlink(tz)
+        os.symlink(want, tz)
+        print('timezone ->', want)
+    h = root
+    for part in ('private/var/mobile/Library/Health', 'private/var/mobile/Library/Health/Client'):
+        d = os.path.join(root, part)
+        os.makedirs(d, exist_ok=True)
+        os.chmod(d, 0o755)
+        try:
+            os.chown(d, MOBILE, MOBILE)
+        except PermissionError:
+            pass
+    print('health dirs ready')
     path = os.path.join(root, 'System/Library/xpc/launchd.plist')
     with open(path, 'rb') as f:
         pl = plistlib.load(f)
