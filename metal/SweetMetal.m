@@ -1398,7 +1398,7 @@ static NSString *sm_match_variant(NSString *base, NSDictionary *cv)
 	if (bestMiss > 0) {
 		/* no exact specialization: dump the non-zero constants so the variant can be built offline */
 		static int nm;
-		if (nm++ < 10) {
+		if (nm++ < 40) {
 			char b[132]; int L = snprintf(b, sizeof b, "nomatch%d %s:", nm, base.UTF8String);
 			NSMutableArray *ks0 = [NSMutableArray array];
 			for (id k in cv) if ([k isKindOfClass:[NSString class]]) [ks0 addObject:k];
