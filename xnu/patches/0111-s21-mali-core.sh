@@ -1260,7 +1260,9 @@ sweet_mali_boot(void)
 	swd_start();
 	{
 		extern int sweet_tmu_start(void);   /* 0140 */
+		extern int sweet_cputop_start(void);   /* 0141 */
 		(void)sweet_tmu_start();
+		(void)sweet_cputop_start();
 	}
 	(void)sweet_s21keys_start();   /* S21 side keys (0125) */
 	(void)sweet_s21_battery_start();   /* iOS battery from the MAX77705 gauge (0127), sweetbattery=2 */
