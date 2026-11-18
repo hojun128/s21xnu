@@ -39,7 +39,7 @@ static volatile int sm_describe;   /* >0: describe the draws of the next passes 
 static char sm_rep[12288]; static size_t sm_rep_len;
 static const char *const sm_rep_keys[] = { " fd", "  t", "  fb ", "quarantined", "fails:", "buffer texture", "stub ", "skipped",
 	"GPU off", "SIGNAL", "EXCEPTION", "unimplemented", "NOT in pack", "(missing)", "failed", "compute", "present", "in AegirPoster",
-	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "blend split", "blend fallback", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto ", "texmem ", "sharer", "bootdiag", "tolerated", "sampler wrap" };
+	"poster draw", "draw type", "nomatch", "fpass", "  rt", "near ", "lazy bytes", "late ", "hang bisect", "iosurface", "pass ", "layer ", "getBytes", "astc ", "blit ", "perf ", "step ", "fault replay", "collision", "astc bad", "clock set", "holds a ", "texture view", "poster tex", "astc stats", "blit buffer", "blit tex", "tstat", "upload ", "bisect2", "blend split", "blend fallback", "pass desc", "refused device", "empty opaque", "empty upload", "ebt ", "shadow writeback", "SB ", "heap ", "proto ", "texmem ", "sharer", "bootdiag", "tolerated", "sampler wrap", "hog " };
 static void slog(const char *fmt, ...)
 {
 	char b[150];
@@ -54,7 +54,9 @@ static void slog(const char *fmt, ...)
 			static int nk, nkp; char kb[176];
 			/* perf / bisect lines get their own budget: the first 300 kept lines are mostly pass descriptions (run164) */
 			bool imp = strstr(b, "perf ") || strstr(b, "bisect2");
-			if (imp ? nkp++ < 120 : nk++ < 300) {
+			bool hog = strstr(b, "hog ") != NULL;   /* CPU hog samples (sweethog=): a budget of their own */
+			static int nkh;
+			if (hog ? nkh++ < 90 : imp ? nkp++ < 120 : nk++ < 300) {
 				const char *pn = getprogname();
 				int L = snprintf(kb, sizeof kb, "K %.5s %s", pn ? pn : "?", strncmp(b, "SweetMTL: ", 10) ? b : b + 10);
 				IOConnectCallMethod(sm_conn, 9, NULL, 0, kb, (size_t)(L < (int)sizeof kb ? L : (int)sizeof kb - 1), NULL, NULL, NULL, NULL);
@@ -3200,6 +3202,115 @@ static void sm_remote_stack(int pid, const char *nm, int nthreads)
 		}
 	}
 }
+/* CPU hog sampler (boot-arg sweethog=name,name; backboardd only). The kernel's cputop names launchd at ~66 % and
+ * mediaserverd at ~50 % of a core with the home screen idle (run192). Three rounds (240, 300, 360 s): the threads of
+ * those processes using >= 5 % of a core (top 3 by decayed cpu_usage) are suspended 3 times, 40 ms apart, and their
+ * pc/lr + frame chain logged: dsc frames as symbol+off or image+off (off from the image's mach header; resolve with
+ * nm on the extracted dsc), the process's own executable as main+off (off from its mach header, from TASK_DYLD_INFO). */
+extern const void *_dyld_get_shared_cache_range(size_t *length);
+static char sm_hog_names[96];
+static bool sm_hog_wanted(const char *nm)
+{
+	size_t n = strlen(nm);
+	for (const char *t = sm_hog_names; *t;) {
+		const char *e = strchr(t, ',');
+		size_t tl = e ? (size_t)(e - t) : strlen(t);
+		if (tl == n && n && !strncmp(t, nm, n)) return true;
+		if (!e) break;
+		t = e + 1;
+	}
+	return false;
+}
+static void sm_hog_sym(uint64_t a, uint64_t mh, uint64_t cs, size_t cl, char *buf, size_t n)
+{
+	if (cs && a >= cs && a < cs + cl) {
+		Dl_info di; memset(&di, 0, sizeof di);
+		if (dladdr((void *)a, &di) && di.dli_fname) {
+			const char *im = strrchr(di.dli_fname, '/'); im = im ? im + 1 : di.dli_fname;
+			if (!strncmp(im, "libsystem_", 10)) im += 10; else if (!strncmp(im, "lib", 3)) im += 3;
+			char sh[16]; snprintf(sh, sizeof sh, "%.12s", im); char *d = strchr(sh, '.'); if (d) *d = 0;
+			if (di.dli_sname && strcmp(di.dli_sname, "<redacted>"))
+				snprintf(buf, n, "%.18s+%lx", di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr));
+			else snprintf(buf, n, "%s+%lx", sh, (unsigned long)(a - (uint64_t)di.dli_fbase));
+			return;
+		}
+	}
+	if (mh && a >= mh && a < mh + 0x8000000ULL) { snprintf(buf, n, "main+%llx", (unsigned long long)(a - mh)); return; }
+	snprintf(buf, n, "%llx", (unsigned long long)a);
+}
+static void sm_hog_proc(int pid, const char *nm, uint64_t cs, size_t cl)
+{
+	mach_port_name_t t = 0;
+	if (task_for_pid(mach_task_self(), pid, &t) || !t) { slog("SweetMTL: hog %s pid %d: no task port", nm, pid); return; }
+	uint64_t mh = 0;
+	{
+		struct task_dyld_info di; mach_msg_type_number_t c = TASK_DYLD_INFO_COUNT;
+		if (task_info(t, TASK_DYLD_INFO, (task_info_t)&di, &c) == KERN_SUCCESS && di.all_image_info_addr) {
+			struct { uint32_t version, count; uint64_t array; } aii; vm_size_t got = 0;
+			if (!vm_read_overwrite(t, (vm_address_t)di.all_image_info_addr, sizeof aii, (vm_address_t)&aii, &got) && got == sizeof aii &&
+			    aii.count && aii.array) {
+				uint64_t e[3] = { 0, 0, 0 }; got = 0;
+				if (!vm_read_overwrite(t, (vm_address_t)aii.array, sizeof e, (vm_address_t)e, &got) && got == sizeof e) mh = e[0];
+			}
+		}
+	}
+	thread_act_array_t th = NULL; mach_msg_type_number_t nt = 0;
+	if (task_threads(t, &th, &nt)) { mach_port_deallocate(mach_task_self(), t); return; }
+	int hot[3] = { -1, -1, -1 }, hu[3] = { 0, 0, 0 }, tot = 0;
+	for (mach_msg_type_number_t i = 0; i < nt; i++) {
+		thread_basic_info_data_t bi; mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+		if (thread_info(th[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &c)) continue;
+		int u = bi.cpu_usage; tot += u;
+		for (int k = 0; k < 3; k++)
+			if (u > hu[k]) { for (int m = 2; m > k; m--) { hu[m] = hu[m - 1]; hot[m] = hot[m - 1]; } hu[k] = u; hot[k] = (int)i; break; }
+	}
+	slog("SweetMTL: hog %s pid %d main 0x%llx threads %u cpu %d%% top %d/%d/%d%%", nm, pid, (unsigned long long)mh, nt, tot / 10,
+	    hu[0] / 10, hu[1] / 10, hu[2] / 10);
+	for (int k = 0; k < 3; k++) {
+		if (hot[k] < 0 || hu[k] < 50) continue;
+		thread_act_t a = th[hot[k]];
+		char tn[24] = "";
+		{
+			thread_extended_info_data_t xi; mach_msg_type_number_t c = THREAD_EXTENDED_INFO_COUNT;
+			if (!thread_info(a, THREAD_EXTENDED_INFO, (thread_info_t)&xi, &c)) snprintf(tn, sizeof tn, "%.16s", xi.pth_name);
+		}
+		for (int s = 0; s < 3; s++) {
+			if (s) usleep(40000);
+			if (thread_suspend(a) != KERN_SUCCESS) break;
+			arm_thread_state64_t st; mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
+			uint64_t pcs[10]; int np = 0;
+			if (thread_get_state(a, ARM_THREAD_STATE64, (thread_state_t)&st, &c) == KERN_SUCCESS) {
+				pcs[np++] = (uint64_t)arm_thread_state64_get_pc(st) & 0xFFFFFFFFFULL;
+				pcs[np++] = (uint64_t)arm_thread_state64_get_lr(st) & 0xFFFFFFFFFULL;
+				uint64_t fp = (uint64_t)arm_thread_state64_get_fp(st);
+				for (int m = 0; m < 8 && fp && !(fp & 7) && np < 10; m++) {
+					uint64_t fr[2] = { 0, 0 }; vm_size_t got = 0;
+					if (vm_read_overwrite(t, (vm_address_t)fp, 16, (vm_address_t)fr, &got) || got != 16) break;
+					pcs[np++] = fr[1] & 0xFFFFFFFFFULL; fp = fr[0];
+				}
+			}
+			thread_resume(a);
+			char line[140]; int L = snprintf(line, sizeof line, "hog %.12s T%d %d%% %s s%d:", nm, hot[k], hu[k] / 10, tn, s);
+			for (int m = 0; m < np && L < (int)sizeof line - 20; m++) {
+				char f[40]; sm_hog_sym(pcs[m], mh, cs, cl, f, sizeof f);
+				L += snprintf(line + L, sizeof line - L, "%s%s", m ? "<" : " ", f);
+			}
+			slog("SweetMTL: %s", line);
+		}
+	}
+	for (mach_msg_type_number_t i = 0; i < nt; i++) mach_port_deallocate(mach_task_self(), th[i]);
+	vm_deallocate(mach_task_self(), (vm_address_t)th, nt * sizeof(thread_act_t));
+	mach_port_deallocate(mach_task_self(), t);
+}
+static void sm_hog_round(void)
+{
+	static int pids[1024]; int n = proc_listallpids(pids, sizeof pids); if (n > 1024) n = 1024;
+	size_t cl = 0; const void *cs = _dyld_get_shared_cache_range(&cl);
+	for (int i = 0; i < n; i++) {
+		char nm[40] = "?"; proc_name(pids[i], nm, sizeof nm);
+		if (sm_hog_wanted(nm)) sm_hog_proc(pids[i], nm, (uint64_t)cs, cl);
+	}
+}
 static void sm_boot_diag(long sec)
 {
 	static int pids[1024]; int n = proc_listallpids(pids, sizeof pids) ; if (n > 1024) n = 1024;
@@ -3357,6 +3468,21 @@ static void *sm_watchdog(void *arg)
 				struct timespec bt; clock_gettime(CLOCK_MONOTONIC, &bt);
 				if ((nd == 0 && bt.tv_sec >= 140) || (nd == 1 && bt.tv_sec >= 200) || (nd == 2 && bt.tv_sec >= 260)) { nd++; sm_boot_diag(bt.tv_sec); }
 				else if (nd == 3 && bt.tv_sec >= 270) { nd++; slog("SweetMTL: bootdiag done, rebooting to recovery"); IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL); }
+			}
+		}
+		{
+			static int hg = -1, nh;
+			if (hg < 0) {
+				char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; hg = 0;
+				if (sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && !strcmp(getprogname(), "backboardd")) {
+					const char *p = strstr(ba, "sweethog=");
+					if (p) { p += 9; size_t k = strcspn(p, " "); if (k >= sizeof sm_hog_names) k = sizeof sm_hog_names - 1;
+						memcpy(sm_hog_names, p, k); sm_hog_names[k] = 0; hg = k > 0; }
+				}
+			}
+			if (hg && nh < 3) {
+				struct timespec bt; clock_gettime(CLOCK_MONOTONIC, &bt);
+				if (bt.tv_sec >= 240 + 60 * nh) { nh++; sm_hog_round(); }
 			}
 		}
 		if (t % (sm_is_poster(getprogname()) ? 30 : 3) == 0) {

@@ -81,7 +81,27 @@ def main(root):
         for k in [k for k, j in jobs.items() if isinstance(j, dict) and j.get('Label') in REMOVE]:
             removed.append(jobs[k].get('Label'))
             del jobs[k]
-    if removed:
+    # S21_CA_VSYNC=1: CA_FORCE_TIMER=1 in backboardd's job (as PixOS and z3sios). Despite the name, QuartzCore then
+    # follows the display's vsync notifications (IOMobileFramebufferEnableVSyncNotifications, selector 72, type 5)
+    # instead of its own CADisplayTimer, which on every iOS 16 chip id runs out of phase with the panel.
+    # S21_CA_VSYNC=0 takes it out again; unset leaves the job as it is.
+    cav = os.environ.get('S21_CA_VSYNC')
+    changed = bool(removed)
+    if cav in ('0', '1'):
+        for j in pl.get('LaunchDaemons', {}).values():
+            if not (isinstance(j, dict) and j.get('Label') == 'com.apple.backboardd'):
+                continue
+            env = j.setdefault('EnvironmentVariables', {})
+            if cav == '1' and env.get('CA_FORCE_TIMER') != '1':
+                env['CA_FORCE_TIMER'] = '1'
+                changed = True
+            elif cav == '0' and 'CA_FORCE_TIMER' in env:
+                del env['CA_FORCE_TIMER']
+                if not env:
+                    del j['EnvironmentVariables']
+                changed = True
+            print('backboardd CA_FORCE_TIMER:', j.get('EnvironmentVariables', {}).get('CA_FORCE_TIMER'))
+    if changed:
         st = os.stat(path)
         with open(path, 'wb') as f:
             plistlib.dump(pl, f, fmt=plistlib.FMT_BINARY)
