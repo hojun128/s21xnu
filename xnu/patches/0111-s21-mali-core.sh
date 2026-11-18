@@ -30,6 +30,7 @@ cat > bsd/dev/sweet_mali.c <<'EOF_SWEET_SRC'
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include <kern/thread_call.h>
+#include <kern/timer_call.h>
 #include <libkern/OSAtomic.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
@@ -763,6 +764,127 @@ static volatile uint64_t gov_last_job;
 static volatile int gov_gpu_lo, gov_cpu_lo;
 static volatile UInt32 gov_busy, gov_pending;
 static thread_call_t gov_tc;
+
+/*
+ * Thermal cap (set by the MAX77705 battery-temperature policy, 0123): while on, the governor keeps the CPU and GPU at
+ * their "lo" levels whatever the load. iOS had no thermal management at all: a hung test run (run181) heated the
+ * phone to ~71 C on full clocks.
+ */
+static volatile int sweet_thermal_cap;
+void sweet_thermal_set(int cap);
+void
+sweet_thermal_set(int cap)
+{
+	if (sweet_thermal_cap == cap) {
+		return;
+	}
+	sweet_thermal_cap = cap;
+	mali_log("dvfs thermal: clocks %s", cap ? "capped low" : "released");
+	if (gov_tc) {
+		thread_call_enter(gov_tc);
+	}
+}
+
+/*
+ * Software watchdog + hard reset (boot-arg sweetswdog=<s>, default 90; 0 off). A thread call stamps a heartbeat every
+ * 2 s; a timer call (interrupt context, no locks) checks it every 5 s and, if no heartbeat came for that long (threads
+ * starved or deadlocked, as in run181 where even the autorec thread call never ran), writes the recovery reset reason
+ * and resets the SoC straight into TWRP. sweet_hard_reset_at(s) arms the same reset unconditionally (autorec backstop).
+ * A hang with interrupts off on every core is not covered (the hardware watchdog clock is gated, run41).
+ */
+static volatile uint32_t *swd_pmu;
+static timer_call_data_t swd_tc, swd_hard_tc;
+static thread_call_t swd_hb_tc;
+static volatile uint64_t swd_beat;
+static uint64_t swd_limit_abs, swd_check_abs, swd_hb_abs;
+
+static void
+swd_reset_now(void)
+{
+	volatile uint32_t *r = swd_pmu;
+	if (r == NULL) {
+		return;
+	}
+	r[0x808 / 4] = (r[0x808 / 4] & ~0x00FF0000U) | 0x004E0000U;   /* normal reboot magic */
+	r[0x80c / 4] = 0x12345604U;                                  /* reset reason: recovery */
+	r[0x810 / 4] = 0xFFU;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	r[0x3c00 / 4] = 0x2U;                                        /* SWRESET */
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (;;) {
+		__asm__ volatile ("wfe");
+	}
+}
+
+static void
+swd_hb(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t now = mach_absolute_time();
+	swd_beat = now;
+	thread_call_enter_delayed(swd_hb_tc, now + swd_hb_abs);
+}
+
+static void
+swd_check(__unused timer_call_param_t p0, __unused timer_call_param_t p1)
+{
+	uint64_t now = mach_absolute_time();
+	if (swd_beat && now > swd_beat && now - swd_beat > swd_limit_abs) {
+		swd_reset_now();
+	}
+	timer_call_enter(&swd_tc, now + swd_check_abs, TIMER_CALL_SYS_CRITICAL);
+}
+
+static void
+swd_hard(__unused timer_call_param_t p0, __unused timer_call_param_t p1)
+{
+	swd_reset_now();
+}
+
+static int
+swd_map(void)
+{
+	if (swd_pmu == NULL) {
+		swd_pmu = (volatile uint32_t *)ml_io_map(0x15860000U, 0x4000);
+	}
+	return swd_pmu != NULL;
+}
+
+static void
+swd_start(void)
+{
+	uint32_t secs = 90;
+	PE_parse_boot_argn("sweetswdog", &secs, sizeof(secs));
+	if (!secs || !swd_map()) {
+		mali_log("dvfs swdog: off");
+		return;
+	}
+	nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &swd_limit_abs);
+	nanoseconds_to_absolutetime(5ULL * NSEC_PER_SEC, &swd_check_abs);
+	nanoseconds_to_absolutetime(2ULL * NSEC_PER_SEC, &swd_hb_abs);
+	swd_hb_tc = thread_call_allocate_with_priority(swd_hb, NULL, THREAD_CALL_PRIORITY_HIGH);
+	if (swd_hb_tc == NULL) {
+		return;
+	}
+	swd_beat = mach_absolute_time();
+	thread_call_enter(swd_hb_tc);
+	timer_call_setup(&swd_tc, swd_check, NULL);
+	timer_call_enter(&swd_tc, mach_absolute_time() + swd_check_abs, TIMER_CALL_SYS_CRITICAL);
+	mali_log("dvfs swdog: on, reset to recovery after %u s without a heartbeat", secs);
+}
+
+void sweet_hard_reset_at(uint32_t secs);
+void
+sweet_hard_reset_at(uint32_t secs)
+{
+	uint64_t d = 0;
+	if (!secs || !swd_map()) {
+		return;
+	}
+	nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &d);
+	timer_call_setup(&swd_hard_tc, swd_hard, NULL);
+	timer_call_enter(&swd_hard_tc, mach_absolute_time() + d, TIMER_CALL_SYS_CRITICAL);
+	mali_log("dvfs swdog: hard reset backstop in %u s", secs);
+}
 static uint32_t gov_switches;
 
 static void
@@ -792,8 +914,8 @@ gov_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	absolutetime_to_nanoseconds(now - gov_last_job, &idle_ns);
 	absolutetime_to_nanoseconds(now, &up_ns);
 	uint32_t idle_ms = (uint32_t)(idle_ns / 1000000ULL);
-	int want_gpu_lo = idle_ms >= gov_gpu_ms;
-	int want_cpu_lo = idle_ms >= gov_cpu_ms && up_ns / 1000000000ULL >= gov_cpu_after;
+	int want_gpu_lo = idle_ms >= gov_gpu_ms || sweet_thermal_cap;
+	int want_cpu_lo = (idle_ms >= gov_cpu_ms && up_ns / 1000000000ULL >= gov_cpu_after) || sweet_thermal_cap;
 	if (!want_cpu_lo && gov_cpu_lo) {
 		gov_set(0, 0);
 		gov_cpu_lo = 0;
@@ -914,6 +1036,7 @@ sweet_mali_boot(void)
 	mali_log("powered: shader=%x tiler=%x l2=%x", rd(R_SHADER_READY), rd(R_TILER_READY), rd(R_L2_READY));
 	mali_dvfs(1);
 	gov_start();
+	swd_start();
 	(void)sweet_s21keys_start();   /* S21 side keys (0125) */
 	(void)sweet_s21_battery_start();   /* iOS battery from the MAX77705 gauge (0127), sweetbattery=2 */
 	mali_selftest();

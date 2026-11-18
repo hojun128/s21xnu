@@ -279,6 +279,14 @@ sm_reboot_recovery(const char *why)
 	}
 }
 
+extern "C" void sweet_reboot_recovery_ext(const char *why);
+extern "C" void
+sweet_reboot_recovery_ext(const char *why)
+{
+	sm_reboot_recovery(why);
+}
+extern "C" void sweet_hard_reset_at(uint32_t secs);   /* 0111: interrupt-context reset, no locks */
+
 static void
 sm_autorec_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
@@ -473,6 +481,7 @@ SweetMali::start(IOService *provider)
 			if (tc != NULL) {
 				thread_call_enter_delayed(tc, deadline);
 				sm_log("service: sweetautorec armed %llu s", secs, 0, 0);
+				sweet_hard_reset_at(secs + 90);   /* if the logged reset never runs (run181), reset anyway */
 			}
 		}
 	}

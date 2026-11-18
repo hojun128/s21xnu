@@ -34,6 +34,7 @@ struct sweet_batt_info {
 	int      charging;
 	int      full;
 	unsigned dtls01, mode;
+	int      temp_x10;     /* 0.1 C, -1000 = unknown (0123) */
 };
 extern "C" int sweet_max77705_start(void);
 extern "C" void sweet_max77705_get(struct sweet_batt_info *o);
@@ -121,7 +122,7 @@ S21Battery::poll(void)
 	putNumber("DesignCapacity", S21_BATT_MAH);
 	putNumber("NominalChargeCapacity", S21_BATT_MAH);
 	putNumber("InstantAmperage", (UInt32)ma);
-	putNumber("Temperature", 2500);
+	putNumber("Temperature", (UInt32)(b.valid && b.temp_x10 > -1000 ? b.temp_x10 * 10 : 2500));   /* 0.01 C */
 	putBool("S21BatteryMeasured", b.valid != 0);
 	OSDictionary *legacy = OSDictionary::withCapacity(7);
 	if (legacy) {

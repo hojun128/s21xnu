@@ -42,6 +42,16 @@ cat > bsd/dev/sweet_max77705.c <<'EOF_SWEET_SRC'
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 void sweet_mali_log_str(const char *s);
+void sweet_thermal_set(int cap);                 /* 0111: keep CPU/GPU clocks low */
+void sweet_reboot_recovery_ext(const char *why); /* 0112: logged reset into TWRP */
+/*
+ * Thermal policy on the battery temperature (sampled with the 10 s poll), hysteresis 3 C:
+ *   level 1 >= 43 C: charge current capped at 500 mA     level 2 >= 45 C: capped at 100 mA
+ *   level 3 >= 46 C: + CPU/GPU clocks held at their low levels
+ *   >= 55 C on two samples in a row: logged reset into the recovery (its Android kernel manages the heat)
+ */
+static int mx_tlevel, mx_thot;
+static uint32_t mx_therm_cc;   /* 0 = no cap */
 
 #define MX_BANK_PA   0x10430020U   /* gpp1 */
 #define MX_CON       0x00U
@@ -60,6 +70,7 @@ struct sweet_batt_info {
 	int      charging;
 	int      full;
 	unsigned dtls01, mode;
+	int      temp_x10;     /* battery temperature, 0.1 C (FG TEMP 0x08: matches Android's battery temp), -1000 = unknown */
 };
 
 int sweet_max77705_start(void);
@@ -283,11 +294,18 @@ mx_charger_service(int first)
 		if (mode != 5 && mode != 6 && mode != 7) {
 			changed |= mx_update(0xB7, 0x05, 0x0F) > 0;     /* buck + charger on */
 		}
-		if (mx_cc_ma && (c2 & 0x3F) * 50U < mx_cc_ma) {
-			changed |= mx_update(0xB9, (uint8_t)(mx_cc_ma / 50U), 0x3F) > 0;
-		}
-		if (mx_ilim_ma >= 100 && ((c9 & 0x7F) + 1U) * 25U < mx_ilim_ma) {
-			changed |= mx_update(0xC0, (uint8_t)(mx_ilim_ma / 25U - 1U), 0x7F) > 0;
+		if (mx_therm_cc) {
+			/* thermal cap: lower the charge current (never raise it while hot) */
+			if ((c2 & 0x3F) * 50U > mx_therm_cc) {
+				changed |= mx_update(0xB9, (uint8_t)(mx_therm_cc / 50U), 0x3F) > 0;
+			}
+		} else {
+			if (mx_cc_ma && (c2 & 0x3F) * 50U < mx_cc_ma) {
+				changed |= mx_update(0xB9, (uint8_t)(mx_cc_ma / 50U), 0x3F) > 0;
+			}
+			if (mx_ilim_ma >= 100 && ((c9 & 0x7F) + 1U) * 25U < mx_ilim_ma) {
+				changed |= mx_update(0xC0, (uint8_t)(mx_ilim_ma / 25U - 1U), 0x7F) > 0;
+			}
 		}
 		if (changed) {
 			uint8_t n0 = 0, n2 = 0, n9 = 0;
@@ -327,10 +345,44 @@ mx_poll(void)
 	mx_info.mv = mv;
 	mx_info.ma = raw * 15625 * 2 / 100000;
 	mx_info.valid = mv >= 2800 && mv <= 4600;
+	{
+		uint16_t tr = 0;
+		int t10 = -1000;
+		if (!mx_r16(MX_ADDR_FG, 0x08, &tr)) {
+			int raw16 = (tr & 0x8000) ? (int)tr - 65536 : (int)tr;
+			t10 = raw16 * 10 / 256;
+			if (t10 < -300 || t10 > 1000) {
+				t10 = -1000;
+			}
+		}
+		mx_info.temp_x10 = t10;
+		if (t10 > -1000) {
+			int lv = mx_tlevel;
+			int up = t10 >= 460 ? 3 : t10 >= 450 ? 2 : t10 >= 430 ? 1 : 0;
+			if (up > lv) {
+				lv = up;
+			} else {
+				while (lv > 0 && t10 < (lv == 3 ? 430 : lv == 2 ? 420 : 400)) {
+					lv--;
+				}
+			}
+			if (lv != mx_tlevel || first) {
+				mx_log("chg: temp %d.%d C thermal level %d -> %d", t10 / 10, (t10 < 0 ? -t10 : t10) % 10, mx_tlevel, lv);
+				mx_tlevel = lv;
+			}
+			mx_therm_cc = lv >= 2 ? 100U : lv == 1 ? 500U : 0U;
+			sweet_thermal_set(lv >= 3);
+			mx_thot = t10 >= 550 ? mx_thot + 1 : 0;
+			if (mx_thot >= 2) {
+				mx_log("chg: battery %d.%d C twice: reset into the recovery", t10 / 10, t10 % 10);
+				sweet_reboot_recovery_ext("battery over 55 C");
+			}
+		}
+	}
 	mx_charger_service(first);
 	if (first || (mx_polls % 30) == 0) {
-		mx_log("chg: soc %u.%u%% %u mV %d mA chgin %d dtls01 %02x mode %u errs %u", mx_info.soc_x10 / 10,
-		    mx_info.soc_x10 % 10, mv, mx_info.ma, mx_info.chgin, mx_info.dtls01, mx_info.mode, mx_errs);
+		mx_log("chg: soc %u.%u%% %u mV %d mA chgin %d dtls01 %02x mode %u errs %u temp %d", mx_info.soc_x10 / 10,
+		    mx_info.soc_x10 % 10, mv, mx_info.ma, mx_info.chgin, mx_info.dtls01, mx_info.mode, mx_errs, mx_info.temp_x10);
 	}
 }
 
