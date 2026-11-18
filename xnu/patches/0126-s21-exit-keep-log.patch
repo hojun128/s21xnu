@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -1855,9 +1855,226 @@
+@@ -1855,9 +1855,234 @@
  		    ((proc_getcsflags(p) & CS_KILLED) ? "CS_KILLED" : ""),
  		    prefix_str, p->p_exit_reason->osr_namespace, p->p_exit_reason->osr_code,
  		    exit_reason_desc ? exit_reason_desc : "none", sweet_ufd);
@@ -70,7 +70,7 @@
 +		if (!msgs[m]) {
 +			continue;
 +		}
-+		char txt[150], img[64] = "?", line[184];
++		char txt[400], img[64] = "?", line[184];
 +		size_t done = 0;
 +		bzero(txt, sizeof(txt));
 +		(void)copyinstr((user_addr_t)msgs[m], txt, sizeof(txt) - 1, &done);
@@ -91,8 +91,16 @@
 +			const char *b = strrchr(pb, '/');
 +			strlcpy(img, b ? b + 1 : pb, sizeof(img));
 +		}
-+		snprintf(line, sizeof(line), "crash: %s msg[%s]: %s", who, img, txt);
-+		sweet_mali_log_str(line);
++		/* long messages (NSError descriptions) in up to three lines */
++		size_t tl = strlen(txt);
++		for (size_t off = 0, part = 0; off < tl && part < 3; off += 120, part++) {
++			if (part) {
++				snprintf(line, sizeof(line), "crash: %s msg+: %.120s", who, txt + off);
++			} else {
++				snprintf(line, sizeof(line), "crash: %s msg[%s]: %.120s", who, img, txt);
++			}
++			sweet_mali_log_str(line);
++		}
 +		n++;
 +	}
 +	return n;
@@ -131,7 +139,7 @@
 +	int n = sweet_crash_regs(r, 10);
 +	if (n < 3) {
 +		return;
-+	}
+ 	}
 +	const char *what[10] = { "pc", "lr", "far" };
 +	char line[184];
 +	int L = snprintf(line, sizeof(line), "crash: %s at", p->p_comm);
@@ -169,8 +177,8 @@
 +		L += m;
 +	}
 +	sweet_mali_log_str(line);
-+}
-+
+ }
+ 
 +static void
 +sweet_crash_messages(proc_t p)
 +{
@@ -193,7 +201,7 @@
 +			}
 +			found += sweet_crash_image(p->p_comm, (user_addr_t)ii.imageLoadAddress, (user_addr_t)ii.imageFilePath);
 +		}
- 	}
++	}
 +	sweet_crash_where(p, &ai, cnt);
 +	if (!found) {
 +		char line[120];
@@ -201,8 +209,8 @@
 +		    ai.version, (unsigned long long)ai.sharedCacheSlide);
 +		sweet_mali_log_str(line);
 +	}
- }
- 
++}
++
 +/* crash loops: log the first 2 deaths of each process name, then every 25th */
 +static int
 +sweet_exit_should_log(const char *name)
@@ -227,7 +235,7 @@
  void
  proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
  {
-@@ -1875,7 +2094,38 @@
+@@ -1875,7 +2100,38 @@
  		proc_handle_critical_exit(p, rv);
  	}
  

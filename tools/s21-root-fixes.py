@@ -9,6 +9,8 @@
 - launchd jobs removed (crash loops, not needed on this port):
     com.apple.remotemanagementd  NSFileManager createDirectoryAtURL: nil (no system group container), every few s
     com.apple.progressd          "BUG IN CLIENT OF LIBPLATFORM: Trying to recursively lock an os_unfair_lock"
+- Safari "Fraudulent Website Warning" off: the SafeBrowsing XPC service dereferences a null
+  Backend::Google::DeviceIdentificationTokenFetcher (SafariSafeBrowsing+0x519d0, far 0x78) in handleGetDatabases.
 """
 import os, plistlib, sys
 
@@ -40,6 +42,22 @@ def main(root):
             plistlib.dump(pl, f, fmt=plistlib.FMT_BINARY)
         os.chmod(path, st.st_mode & 0o7777)
     print('launchd.plist removed:', removed or 'nothing (already done)')
+    pref = os.path.join(root, 'private/var/mobile/Library/Preferences/com.apple.mobilesafari.plist')
+    d = {}
+    if os.path.exists(pref):
+        with open(pref, 'rb') as f:
+            d = plistlib.load(f)
+    if d.get('WarnAboutFraudulentWebsites') is not False:
+        d['WarnAboutFraudulentWebsites'] = False
+        os.makedirs(os.path.dirname(pref), exist_ok=True)
+        with open(pref, 'wb') as f:
+            plistlib.dump(d, f, fmt=plistlib.FMT_BINARY)
+        os.chmod(pref, 0o600)
+        try:
+            os.chown(pref, MOBILE, MOBILE)
+        except PermissionError:
+            pass
+        print('safari: fraudulent website warning off')
 
 
 if __name__ == '__main__':
