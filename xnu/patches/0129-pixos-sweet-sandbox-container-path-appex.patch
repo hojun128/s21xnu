@@ -1,0 +1,76 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -28,6 +28,7 @@
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
++#include <sys/kauth.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+@@ -285,8 +286,56 @@
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++/*
++ * Operation 4: container path of a pid. Request block is five 64-bit words:
++ * [0] pid, [2] user destination buffer, [3] its size. Only app-extension
++ * processes (uid 501, executable path containing ".appex/") get a container
++ * (the mobile home); everything else keeps ENOENT.
++ */
++#define SWEET_MOBILE_UID        501
++#define SWEET_MOBILE_HOME       "/private/var/mobile"
++
++static int
++sweet_appex_container_path(user_addr_t arg)
++{
++	uint64_t req[5];
++	char path[MAXPATHLEN];
++	int error, len;
++	proc_t target;
++	kauth_cred_t cred;
++	vnode_t vp;
++	uid_t uid;
++	bool ok;
++
++	if (copyin(arg, req, sizeof(req)) != 0 || req[2] == 0 ||
++	    req[3] < sizeof(SWEET_MOBILE_HOME)) {
++		return ENOENT;
++	}
++	target = proc_find((int)req[0]);
++	if (target == NULL) {
++		return ESRCH;
++	}
++	cred = kauth_cred_proc_ref(target);
++	uid = kauth_cred_getuid(cred);
++	kauth_cred_unref(&cred);
++	vp = proc_getexecutablevnode(target);
++	proc_rele(target);
++	if (vp == NULLVP) {
++		return ENOENT;
++	}
++	len = MAXPATHLEN;
++	ok = uid == SWEET_MOBILE_UID && vn_getpath(vp, path, &len) == 0 &&
++	    strnstr(path, ".appex/", MAXPATHLEN) != NULL;
++	vnode_put(vp);
++	if (!ok) {
++		return ENOENT;
++	}
++	error = copyout(SWEET_MOBILE_HOME, (user_addr_t)req[2], sizeof(SWEET_MOBILE_HOME));
++	return error;
++}
++
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -296,6 +345,7 @@
+ 	}
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
++		return sweet_appex_container_path(arg);
+ 	case 5:         /* extension issue */
+ 	case 6:         /* extension consume */
+ 	case 0x43:      /* container expected */

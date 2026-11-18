@@ -1,0 +1,25 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 159e1c2..dbee0f9 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -82,6 +82,20 @@ SweetPlatformExpert::start(IOService *provider)
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
++	{
++		/*
++		 * IORTC (idea and analysis: PixOS-Project pixelios-kernel patch 0123, MIT): there is no RTC driver, so
++		 * IOKitInitializeTime's waitForService(resourceMatching("IORTC"), 30 s) always timed out. Publishing the
++		 * resource ends that wait at once; the calendar stays 1970 + uptime until userland sets it (as before).
++		 * Boot-arg sweetiortc=0 keeps the old 30 s wait.
++		 */
++		uint32_t iortc = 1;
++		(void)PE_parse_boot_argn("sweetiortc", &iortc, sizeof(iortc));
++		if (iortc != 0) {
++			publishResource("IORTC");
++			IOLog("SWEET RTC: published IORTC resource (no time source)\n");
++		}
++	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
