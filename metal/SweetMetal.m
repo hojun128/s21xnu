@@ -2552,7 +2552,9 @@ static NSArray *sm_plan_passes(NSArray *passes, uint64_t desc_cap)
 		SweetMTLRenderEncoder *e = o;
 		if (e.target == X && sm_enc_generic(e) && !sm_enc_reads(e, X)) {
 			uint64_t b = 0; for (uint32_t i = 0; i < e->_ndraw; i++) b += sm_slot_bytes(&e->_draws[i]);
-			bool fits = mo + mc + e->_ndraw <= 128 && mc + e->_ndraw <= 96 && bytes + b + 0x10000 <= desc_cap;
+			/* at most 32 draws per merged pass: the per-pass envelope every other limit was proven with (flush ranges,
+			 * job lists, descriptor slots). run181 merged up to 96 and the phone hung. */
+			bool fits = mo + mc + e->_ndraw <= 128 && mc + e->_ndraw <= 32 && bytes + b + 0x10000 <= desc_cap;
 			if (pend.count && e.load && fits) {
 				memcpy(&sm_mbuf[mo + mc], e->_draws, e->_ndraw * sizeof(sm_drawrec)); mc += e->_ndraw; bytes += b;
 				[pend addObject:e];
