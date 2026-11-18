@@ -4,6 +4,9 @@ The patches named `01xx-pixos-*.patch` are unchanged copies of patches from
 https://github.com/PixOS-Project/pixelios-kernel (`xnu/patches/`), which share
 this tree's sweet base (0025/0035/0036/0050 are byte-identical). Patch 0135
 re-implements the idea of their 0123 (publish IORTC) for this tree.
+Patch 0137 (frame pacing) re-implements ideas of their 0101 (vsync period),
+0149 (absolute vsync deadlines) and 0343 (present gate) for this tree's
+SweetMetal fences; patch 0138 re-implements their 0270/0344 (recommended cores).
 
 | here | PixOS original |
 |------|----------------|

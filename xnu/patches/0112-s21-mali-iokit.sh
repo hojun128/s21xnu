@@ -70,7 +70,61 @@ enum {
 	kSMSubmitList = 11,     /* submit, cache-flushing only the BOs holding the listed GPU addresses (and all small BOs) */
 	kSMSubmitRange = 12,    /* submit, cache-flushing listed (va, len, pre/post) ranges only; returns flush/job times */
 	kSMFlushRange = 13,     /* clean+invalidate listed (va, len) ranges now (before a CPU read of GPU-written memory) */
+	kSMFence = 14,          /* GPU fence tickets of this task for the present gate: op 0 issue -> ticket, 1 done(ticket), 2 query */
+	kSMFBStats = 15,        /* framebuffer pacing counters (SweetFramebuffer.cpp sweet_fb_stats), 8 scalars */
 };
+
+/*
+ * GPU fences for the framebuffer present gate (patch 0137). A process that commits GPU work asynchronously takes a
+ * ticket at commit (op 0) and completes it when the work is done (op 1, in order). AppleCLCD::swap() snapshots the
+ * swapping task's last issued ticket and shows the frame once done >= that ticket. Never under sm_lock: lock-free for
+ * the submitter, one IOSimpleLock for the table. A task's slot is invalidated (gen bump) when its last client closes,
+ * so a dead renderer never holds the panel.
+ */
+#define SM_FENCE_SLOTS 32
+static struct { task_t task; uint32_t gen, refs; uint64_t issued, done; } sm_fence[SM_FENCE_SLOTS];
+static IOSimpleLock *sm_fence_lk;
+static uint32_t sm_fence_gen;
+extern "C" void sweet_fb_gpu_kick(void);
+extern "C" void sweet_fb_stats(uint64_t out[8]);
+extern "C" int sweet_gpu_fence_snapshot(task_t t, uint32_t *slot, uint32_t *gen, uint64_t *ticket);
+extern "C" int sweet_gpu_fence_ready(uint32_t slot, uint32_t gen, uint64_t ticket);
+
+extern "C" int
+sweet_gpu_fence_snapshot(task_t t, uint32_t *slot, uint32_t *gen, uint64_t *ticket)
+{
+	int r = -1;
+	if (sm_fence_lk == NULL || t == NULL) {
+		return -1;
+	}
+	IOSimpleLockLock(sm_fence_lk);
+	for (uint32_t i = 0; i < SM_FENCE_SLOTS; i++) {
+		if (sm_fence[i].task == t) {
+			*slot = i;
+			*gen = sm_fence[i].gen;
+			*ticket = sm_fence[i].issued;
+			r = 0;
+			break;
+		}
+	}
+	IOSimpleLockUnlock(sm_fence_lk);
+	return r;
+}
+
+extern "C" int
+sweet_gpu_fence_ready(uint32_t slot, uint32_t gen, uint64_t ticket)
+{
+	int r = 1;
+	if (sm_fence_lk == NULL || slot >= SM_FENCE_SLOTS) {
+		return 1;
+	}
+	IOSimpleLockLock(sm_fence_lk);
+	if (sm_fence[slot].task != NULL && sm_fence[slot].gen == gen && sm_fence[slot].done < ticket) {
+		r = 0;
+	}
+	IOSimpleLockUnlock(sm_fence_lk);
+	return r;
+}
 extern "C" void sweet_hid_touch(int finger, int down, int x, int y);
 static int sm_flush_ro = 1;     /* boot-arg sweetflushro=0 turns the read-only import flush off */
 
@@ -388,6 +442,9 @@ SweetMali::start(IOService *provider)
 		return false;
 	}
 	sm_lock = IOLockAlloc();
+	if (sm_fence_lk == NULL) {
+		sm_fence_lk = IOSimpleLockAlloc();
+	}
 	sweet_mali_boot();
 	if (sm_lock == NULL || !sweet_mali_up()) {
 		sweet_mali_log_str("service: GPU core is not up, not registering");
@@ -458,6 +515,7 @@ class SweetMaliUserClient : public IOUserClient {
 
 	task_t fTask;
 	int    fCtx;
+	int    fFence;      /* sm_fence slot of fTask, -1 = none yet */
 	SMBo   fBo[SM_MAX_BO];
 
 	void   freeBo(uint32_t i);
@@ -481,6 +539,7 @@ SweetMaliUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 ty
 	}
 	fTask = owningTask;
 	fCtx = -1;
+	fFence = -1;
 	bzero(fBo, sizeof(fBo));
 	return true;
 }
@@ -509,6 +568,17 @@ SweetMaliUserClient::freeBo(uint32_t i)
 IOReturn
 SweetMaliUserClient::clientClose(void)
 {
+	if (fFence >= 0 && sm_fence_lk != NULL) {
+		IOSimpleLockLock(sm_fence_lk);
+		if (sm_fence[fFence].refs > 0 && --sm_fence[fFence].refs == 0) {
+			sm_fence[fFence].task = NULL;
+			sm_fence[fFence].gen = ++sm_fence_gen;
+			sm_fence[fFence].issued = sm_fence[fFence].done = 0;
+		}
+		IOSimpleLockUnlock(sm_fence_lk);
+		fFence = -1;
+		sweet_fb_gpu_kick();   /* a frame gated on this task is free to show */
+	}
 	IOLockLock(sm_lock);
 	for (uint32_t i = 0; i < SM_MAX_BO; i++) {
 		freeBo(i);
@@ -552,6 +622,73 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		}
 		sweet_hid_touch((int)args->scalarInput[0], (int)args->scalarInput[1],
 		    (int)args->scalarInput[2], (int)args->scalarInput[3]);
+		return kIOReturnSuccess;
+	}
+	if (selector == kSMFence) {
+		if (ins < 1 || sm_fence_lk == NULL) {
+			return kIOReturnBadArgument;
+		}
+		uint64_t op = args->scalarInput[0], o0 = 0, o1 = 0;
+		bool kick = false;
+		IOSimpleLockLock(sm_fence_lk);
+		if (fFence < 0 || sm_fence[fFence].task != fTask) {
+			int fr = -1;
+			fFence = -1;
+			for (int i = 0; i < SM_FENCE_SLOTS; i++) {
+				if (sm_fence[i].task == fTask) {
+					fFence = i;
+					break;
+				}
+				if (fr < 0 && sm_fence[i].task == NULL) {
+					fr = i;
+				}
+			}
+			if (fFence >= 0) {
+				sm_fence[fFence].refs++;
+			} else if (fr >= 0) {
+				fFence = fr;
+				sm_fence[fr].task = fTask;
+				sm_fence[fr].gen = ++sm_fence_gen;
+				sm_fence[fr].refs = 1;
+				sm_fence[fr].issued = sm_fence[fr].done = 0;
+			}
+		}
+		if (fFence >= 0) {
+			if (op == 0) {
+				o0 = ++sm_fence[fFence].issued;
+			} else if (op == 1 && ins >= 2) {
+				uint64_t t = args->scalarInput[1];
+				if (t > sm_fence[fFence].done && t <= sm_fence[fFence].issued) {
+					sm_fence[fFence].done = t;
+					kick = true;
+				}
+			}
+			o0 = op == 2 ? sm_fence[fFence].issued : o0;
+			o1 = sm_fence[fFence].done;
+		}
+		IOSimpleLockUnlock(sm_fence_lk);
+		if (kick) {
+			sweet_fb_gpu_kick();
+		}
+		if (fFence < 0) {
+			return kIOReturnNoResources;
+		}
+		if (outs >= 1) {
+			args->scalarOutput[0] = o0;
+		}
+		if (outs >= 2) {
+			args->scalarOutput[1] = o1;
+		}
+		args->scalarOutputCount = outs < 2 ? outs : 2;
+		return kIOReturnSuccess;
+	}
+	if (selector == kSMFBStats) {
+		uint64_t st[8];
+		sweet_fb_stats(st);
+		for (uint32_t i = 0; i < outs && i < 8; i++) {
+			args->scalarOutput[i] = st[i];
+		}
+		args->scalarOutputCount = outs < 8 ? outs : 8;
 		return kIOReturnSuccess;
 	}
 	uint64_t lk0 = mach_absolute_time();

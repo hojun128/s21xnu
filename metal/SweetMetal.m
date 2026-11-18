@@ -1,5 +1,6 @@
 #include <dlfcn.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <objc/message.h>
 /*
  * SweetMetal.bundle: Metal driver plugin for the S21 Mali-G78 (phase 1 skeleton).
@@ -108,6 +109,9 @@ static uint64_t sm_infra_len[16];     /* bytes to flush from the BO start (0 = t
 static uint64_t sm_desc_va, sm_desc_span = 0;   /* the pass descriptor BO: only the part the current pass wrote */
 static volatile uint64_t sm_pf_pre_ns, sm_pf_job_ns, sm_pf_post_ns, sm_pf_lock_ns;
 static void sm_ring_take(uint64_t *va, uint64_t *len);
+static void sm_q_drain(void);   /* asynchronous commits, below SweetMTLCommandBuffer */
+@class SweetMTLTexture;
+static void sm_tex_wait(SweetMTLTexture *t);
 static int sm_listmode = -1;   /* -1 unknown, 0 off (boot-arg sweetflushall or old kernel), 1 on */
 static void sm_infra_add(const sm_bo *b) { if (b && b->gpu && sm_ninfra < 16) sm_infra[sm_ninfra++] = b->gpu; }
 static void sm_always_add(const sm_bo *b) { sm_infra_add(b); if (b && b->gpu && sm_nalways < 4) sm_always[sm_nalways++] = b->gpu; }
@@ -1631,6 +1635,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (uint32_t)maliFormat;
 - (uint32_t)maliSwizzle;
 - (uint32_t)bpp;
+@property (atomic) uint64_t smLastUse;   /* async commits: sequence number of the last queued command buffer that uses it */
 @end
 @implementation SweetMTLTexture {
 	sm_bo _store; IOSurfaceRef _surface;
@@ -1834,6 +1839,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 - (uint8_t *)sm_cpu { _cpuDirty = true; return _store.cpu; }
 - (void)getBytes:(void *)dst bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl
 {
+	sm_q_drain();   /* async commits: the GPU result must be there */
 	if (_surface && _store.gpu) sm_flush_now(_store.gpu, (uint64_t)_bytesPerRow * _height);
 	{
 		static int nl;
@@ -1852,6 +1858,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)lvl withBytes:(const void *)src bytesPerRow:(NSUInteger)bpr
 {
+	sm_tex_wait(self);   /* async commits: a queued command buffer still reads the old content */
 	_cpuDirty = true;
 	if (src && !sm_astc(_pixelFormat, NULL, NULL) && r.origin.x == 0 && r.origin.y == 0 && r.size.width == _width && r.size.height == _height) {
 		/* whole-image upload: remember whether it carried any content (sampled every 7th byte of every 4th row) */
@@ -1942,6 +1949,8 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 @property (nonatomic) uint32_t lastJobStatus;
 @property (nonatomic, weak) id commandQueue;
 @property (nonatomic, strong) NSMutableArray *scheduled, *completed, *toPresent;
+@property (nonatomic) uint64_t smSeq, smTicket;   /* async commits: queue sequence number, kernel fence ticket */
+- (void)sm_execute;
 @end
 
 @interface SweetMTLRenderEncoder : SweetMTLObject
@@ -2186,6 +2195,7 @@ static uint32_t sm_astc_dim(uint32_t d) { return d == 4 ? 0 : d == 5 ? 1 : d == 
 @end
 @interface SweetMTLComputeEncoder : SweetMTLObject
 - (void)sm_run;
+- (NSArray *)sm_kept;
 @end
 /* One recorded dispatch: everything the job needs, snapshotted because the encoder state changes between dispatches */
 typedef struct {
@@ -2203,6 +2213,7 @@ typedef struct {
 	NSMutableArray *_keep;
 }
 - (instancetype)init { self = [super init]; _keep = [NSMutableArray array]; return self; }
+- (NSArray *)sm_kept { return _keep; }
 - (void)endEncoding {}
 - (void)setComputePipelineState:(id)ps { _ps = [ps isKindOfClass:[SweetMTLComputePipelineState class]] ? ps : nil; if (ps) [_keep addObject:ps]; }
 - (void)setTexture:(id)t atIndex:(NSUInteger)i
@@ -2394,6 +2405,80 @@ typedef struct {
 @interface SweetMTLCommandQueue : SweetMTLObject
 @property (nonatomic, strong) dispatch_queue_t submissionQueue, completionQueue;
 @end
+/* ------------------------------------------------------------------ asynchronous commits
+ * Boot-arg sweetasync=1 (needs kernel patch 0137): commit returns at once and a per-process GPU thread runs the
+ * command buffers in commit order. The render server used to sit in commit for the whole GPU time (13 ms of a
+ * scrolling frame), so CPU and GPU work of consecutive frames added up and most frames missed the vsync (35/s).
+ * The kernel shows an IOMFB swap only once the fence ticket taken here at commit time is completed by the GPU
+ * thread (present gate), so the panel never shows a half-drawn frame. At most two command buffers are in flight
+ * per process. CPU reads of GPU results (getBytes) wait for the queue, CPU uploads into a texture still used by a
+ * queued buffer wait for that buffer (counted in the perf line).
+ */
+static int sm_async = -1;
+static pthread_mutex_t sm_q_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sm_q_cv = PTHREAD_COND_INITIALIZER;
+static NSMutableArray *sm_q;
+static uint32_t sm_q_inflight;
+static uint64_t sm_q_issued, sm_q_done;
+static pthread_t sm_q_thr; static bool sm_q_have_thr;
+static volatile uint32_t sm_q_full, sm_q_texwaits, sm_q_drains;
+static bool sm_on_worker(void) { return sm_q_have_thr && pthread_equal(pthread_self(), sm_q_thr); }
+static void sm_q_wait_seq(uint64_t seq)
+{
+	if (!seq || sm_on_worker()) return;
+	pthread_mutex_lock(&sm_q_mx);
+	while (sm_q_done < seq) pthread_cond_wait(&sm_q_cv, &sm_q_mx);
+	pthread_mutex_unlock(&sm_q_mx);
+}
+static void sm_q_drain(void)
+{
+	if (sm_async != 1 || sm_on_worker()) return;
+	pthread_mutex_lock(&sm_q_mx);
+	uint64_t seq = sm_q_issued; bool busy = sm_q_done < seq;
+	pthread_mutex_unlock(&sm_q_mx);
+	if (busy) { sm_q_drains++; sm_q_wait_seq(seq); }
+}
+static void sm_tex_wait(SweetMTLTexture *t)
+{
+	if (sm_async != 1 || !t || sm_on_worker()) return;
+	uint64_t u = t.smLastUse;
+	pthread_mutex_lock(&sm_q_mx); bool busy = u > sm_q_done; pthread_mutex_unlock(&sm_q_mx);
+	if (busy) { sm_q_texwaits++; sm_q_wait_seq(u); }
+}
+static uint64_t sm_fence_call(uint64_t op, uint64_t ticket)
+{
+	if (!sm_conn) {
+		io_service_t sv = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("SweetMali"));
+		if (sv) IOServiceOpen(sv, mach_task_self(), 0, &sm_conn);
+	}
+	if (!sm_conn) return 0;
+	uint64_t in[2] = { op, ticket }, out[2] = { 0, 0 }; uint32_t oc = 2;
+	kern_return_t kr = IOConnectCallMethod(sm_conn, 14, in, op == 1 ? 2 : 1, NULL, 0, out, &oc, NULL, NULL);
+	return kr ? 0 : (op == 1 ? 1 : out[0]);
+}
+static void *sm_q_main(void *arg)
+{
+	(void)arg;
+	pthread_setname_np("SweetMTL GPU");
+	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+	for (;;) {
+		SweetMTLCommandBuffer *cb;
+		pthread_mutex_lock(&sm_q_mx);
+		while (!sm_q.count) pthread_cond_wait(&sm_q_cv, &sm_q_mx);
+		cb = sm_q[0]; [sm_q removeObjectAtIndex:0];
+		pthread_mutex_unlock(&sm_q_mx);
+		uint64_t seq = cb.smSeq;
+		@autoreleasepool { [cb sm_execute]; }
+		cb = nil;
+		pthread_mutex_lock(&sm_q_mx);
+		sm_q_inflight--; if (seq > sm_q_done) sm_q_done = seq;
+		pthread_cond_broadcast(&sm_q_cv);
+		pthread_mutex_unlock(&sm_q_mx);
+	}
+	return NULL;
+}
+static void sm_mark_use(id o, uint64_t seq) { if ([o isKindOfClass:[SweetMTLTexture class]]) ((SweetMTLTexture *)o).smLastUse = seq; }
+
 @implementation SweetMTLCommandBuffer
 - (instancetype)init { self = [super init]; _passes = [NSMutableArray array]; _scheduled = [NSMutableArray array]; _completed = [NSMutableArray array]; return self; }
 - (void)addScheduledHandler:(void (^)(id))h { if (h) [_scheduled addObject:[h copy]]; }
@@ -2442,6 +2527,49 @@ typedef struct {
  * running job (transient 0x58/0x59 faults that passed on replay, run105). One commit at a time. */
 static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 - (void)commit
+{
+	if (sm_async < 0) {
+		char ba[1024] = {0}; size_t bl = sizeof(ba) - 1;
+		sm_async = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetasync=1") ? 1 : 0;
+	}
+	if (sm_async == 1 && !sm_on_worker()) {
+		pthread_mutex_lock(&sm_q_mx);
+		if (!sm_q) sm_q = [NSMutableArray array];
+		if (!sm_q_have_thr) {
+			pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+			sm_q_have_thr = pthread_create(&sm_q_thr, &at, sm_q_main, NULL) == 0;
+			pthread_attr_destroy(&at);
+		}
+		if (sm_q_have_thr) {
+			if (sm_q_inflight >= 2) sm_q_full++;
+			while (sm_q_inflight >= 2) pthread_cond_wait(&sm_q_cv, &sm_q_mx);
+			/* the ticket is taken under the queue lock: ticket order = queue order = completion order */
+			uint64_t t = sm_fence_call(0, 0);
+			if (t) {
+				uint64_t seq = ++sm_q_issued;
+				self.smSeq = seq; self.smTicket = t; _status = 2; /* MTLCommandBufferStatusCommitted */
+				for (id e in _passes) {
+					if ([e isKindOfClass:[SweetMTLRenderEncoder class]]) {
+						SweetMTLRenderEncoder *re = e; sm_mark_use(re.target, seq);
+						for (id o in re.keep) sm_mark_use(o, seq);
+					} else if ([e isKindOfClass:[SweetMTLComputeEncoder class]]) {
+						for (id o in [(SweetMTLComputeEncoder *)e sm_kept]) sm_mark_use(o, seq);
+					}
+				}
+				[sm_q addObject:self]; sm_q_inflight++;
+				pthread_cond_broadcast(&sm_q_cv);
+				pthread_mutex_unlock(&sm_q_mx);
+				static int nl; if (nl++ < 1) slog("SweetMTL: async commits on (GPU thread, fence ticket %llu)", t);
+				return;
+			}
+			sm_async = 0;   /* no fence in this kernel: without the present gate the panel could show half frames */
+			slog("SweetMTL: async commits off: kernel has no GPU fence (patch 0137)");
+		}
+		pthread_mutex_unlock(&sm_q_mx);
+	}
+	[self sm_execute];
+}
+- (void)sm_execute
 {
 	if (pthread_mutex_trylock(&sm_commit_mx) != 0) {
 		static int nl; if (nl++ < 4) slog("SweetMTL: commit collision: another thread is committing, waiting");
@@ -2707,10 +2835,12 @@ static pthread_mutex_t sm_commit_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 		if ([d respondsToSelector:@selector(present)]) [d present];
 	}
 	[_toPresent removeAllObjects];
+	if (_status == 2) _status = 4;
+	if (self.smTicket) sm_fence_call(1, self.smTicket);   /* the present gate may show this frame now */
 	{ uint64_t t1 = sm_ns(), d = t1 - pf_t0; sm_pf_ns += d; if (d > sm_pf_max_ns) sm_pf_max_ns = d; sm_pf_n++; sm_pf_last = t1; }
 	[self sm_runHandlers];
 }
-- (void)waitUntilCompleted {}
+- (void)waitUntilCompleted { if (self.smSeq) sm_q_wait_seq(self.smSeq); }
 - (void)commitAndWaitUntilSubmitted { [self commit]; }
 - (void)setProtectionOptions:(uint64_t)o {}
 - (uint64_t)protectionOptions { return 0; }
@@ -2969,8 +3099,16 @@ static void sm_drag(int x0, int y0, int x1, int y1, int n)
 	for (int i = 1; i <= n; i++) { usleep(12000); sm_touch(1, x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n); }
 	usleep(20000); sm_touch(0, x1, y1);
 }
+static uint64_t sm_fbst0[8];
+static void sm_fbstats(uint64_t o[8])
+{
+	memset(o, 0, 8 * sizeof *o);
+	uint32_t oc = 8;
+	if (sm_conn) IOConnectCallMethod(sm_conn, 15, NULL, 0, NULL, 0, o, &oc, NULL, NULL);
+}
 static void sm_perf_reset(void)
 {
+	sm_fbstats(sm_fbst0); sm_q_full = sm_q_texwaits = sm_q_drains = 0;
 	sm_pf_ns = sm_pf_gpu_ns = sm_pf_max_ns = 0; sm_pf_n = sm_pf_jobs = sm_pf_draws = 0;
 	memset((void *)sm_pf_gap, 0, sizeof sm_pf_gap); sm_pf_win = sm_ns();
 	sm_pf_pre_ns = sm_pf_job_ns = sm_pf_post_ns = sm_pf_lock_ns = 0;
@@ -2982,6 +3120,13 @@ static void sm_perf_report(const char *what, long now)
 	    what, win / 1e9, sm_pf_n, win ? sm_pf_n * 1e9 / win : 0.0, sm_pf_ns / 1e6 / n, sm_pf_max_ns / 1e6, sm_pf_gpu_ns / 1e6 / n, sm_pf_jobs,
 	    (double)sm_pf_draws / n, sm_pf_gap[0], sm_pf_gap[1], sm_pf_gap[2], sm_pf_gap[3]);
 	slog("SweetMTL: perf %s kernel: flush-before %.1fms job %.1fms flush-after %.1fms lock-wait %.1fms per commit", what, sm_pf_pre_ns / 1e6 / n, sm_pf_job_ns / 1e6 / n, sm_pf_post_ns / 1e6 / n, sm_pf_lock_ns / 1e6 / n);
+	{
+		uint64_t f[8]; sm_fbstats(f);
+		uint64_t d[7]; for (int i = 0; i < 7; i++) d[i] = f[i] - sm_fbst0[i];
+		/* panel = frames that really reached the glass (kernel AppleCLCD counters, patch 0137) */
+		slog("SweetMTL: perf %s panel: %.1f presents/s (swaps %llu presents %llu dropped %llu gated %llu timeout %llu kick %llu vsync %llu mode %llu) async %d full %u texwait %u drain %u",
+		    what, win ? d[1] * 1e9 / win : 0.0, d[0], d[1], d[6], d[2], d[3], d[4], d[5], f[7], sm_async, sm_q_full, sm_q_texwaits, sm_q_drains);
+	}
 	(void)now;
 }
 static void sm_swipe_up(void)

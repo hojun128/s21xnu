@@ -1,0 +1,270 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 31cb9e7..7a98870 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -46,6 +46,26 @@ static int sweet_fb_gpu = -1;           /* boot-arg sweetgpucomp=1 */
+ extern "C" void sweet_mali_log_str(const char *s);   /* bsd/dev/sweet_mali.c: line into the pmsg log */
+ static uint64_t sweet_fb_presents;
+ 
++/*
++ * S21 frame pacing (patch 0137; ideas from PixOS patches 0101, 0149, 0343, MIT, own code here):
++ *  - the vsync callback carries the refresh period (CA::WindowServer reads a2 + a3 as the next deadline; 0 = every
++ *    deadline already past), and the timer is armed on absolute deadlines (re-arming relative to the callback's end
++ *    added the panel copy to every period: ~20 ms, 50 Hz). Boot-arg sweetvsync_abs=0 restores the relative re-arm.
++ *  - present gate (boot-arg sweetfb_gate, default 1): a swap is copied to the panel only once the GPU work its process
++ *    committed before the swap has completed (fence tickets of SweetMali selector 14, issued by SweetMetal at commit
++ *    and completed by its GPU worker). A gated frame is shown as soon as its work completes (kick), at most 12 ticks
++ *    (200 ms) late; no ticket (synchronous commits) = shown at the next tick as before.
++ *  - the green/red "who copied" square is drawn only with boot-arg sweetfbmark=1.
++ */
++extern "C" int sweet_gpu_fence_snapshot(task_t t, uint32_t *slot, uint32_t *gen, uint64_t *ticket);
++extern "C" int sweet_gpu_fence_ready(uint32_t slot, uint32_t gen, uint64_t ticket);
++extern "C" void sweet_fb_gpu_kick(void);
++extern "C" void sweet_fb_stats(uint64_t out[8]);
++#define SWEET_FB_GATE_MAX_TICKS 12
++static int sweet_fb_abs = 1, sweet_fb_gate = 1, sweet_fb_mark;
++static volatile uint64_t sweet_fb_n_swaps, sweet_fb_n_presents, sweet_fb_n_defer, sweet_fb_n_timeout, sweet_fb_n_kick,
++    sweet_fb_n_vsync, sweet_fb_n_dropped;
++
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+@@ -106,6 +126,9 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	static void kickFired(OSObject *owner, IOTimerEventSource *sender);
++	void rearm(IOTimerEventSource *sender, uint64_t now);
++	uint8_t *takeFrame(bool tick, uint64_t count);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -124,15 +147,45 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	IOTimerEventSource *fKick;    /* patch 0137: shows a gated frame as soon as its GPU work completed */
++	uint64_t      fPeriod;        /* vsync period, absolute-time units */
++	uint64_t      fNextVsync;     /* next absolute vsync deadline (0 = none yet) */
++	uint64_t      fLastPresentAbs;
++	bool          fGateValid;     /* the pending swap has a fence ticket (fLock) */
++	uint32_t      fGateSlot, fGateGen, fGateTicks;
++	uint64_t      fGateTicket;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+-	void swap(const uint8_t *rec);
++	void swap(const uint8_t *rec, task_t task);
+ 	void present(const uint8_t *rec);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
++static AppleCLCD *sweet_fb_main;   /* patch 0137: the kick target */
++
++extern "C" void
++sweet_fb_gpu_kick(void)
++{
++	AppleCLCD *fb = sweet_fb_main;
++	if (fb != NULL && fb->fKick != NULL && fb->fGateValid) {
++		fb->fKick->setTimeoutUS(1);
++	}
++}
++
++extern "C" void
++sweet_fb_stats(uint64_t out[8])
++{
++	out[0] = sweet_fb_n_swaps;
++	out[1] = sweet_fb_n_presents;
++	out[2] = sweet_fb_n_defer;
++	out[3] = sweet_fb_n_timeout;
++	out[4] = sweet_fb_n_kick;
++	out[5] = sweet_fb_n_vsync;
++	out[6] = sweet_fb_n_dropped;
++	out[7] = (uint64_t)sweet_fb_gate | ((uint64_t)sweet_fb_abs << 1);
++}
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+@@ -203,6 +256,22 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	PE_parse_boot_argn("sweetvsync_abs", &sweet_fb_abs, sizeof(sweet_fb_abs));
++	PE_parse_boot_argn("sweetfb_gate", &sweet_fb_gate, sizeof(sweet_fb_gate));
++	PE_parse_boot_argn("sweetfbmark", &sweet_fb_mark, sizeof(sweet_fb_mark));
++	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000ULL, &fPeriod);
++	fKick = IOTimerEventSource::timerEventSource(this, &AppleCLCD::kickFired);
++	if (fKick != NULL && fWorkLoop->addEventSource(fKick) != kIOReturnSuccess) {
++		fKick->release();
++		fKick = NULL;
++	}
++	sweet_fb_main = this;
++	{
++		char ln[120];
++		snprintf(ln, sizeof(ln), "fb pacing: vsync %s period %u us, present gate %s, kick %s", sweet_fb_abs ? "absolute" : "relative",
++		    SWEET_FB_VSYNC_US, sweet_fb_gate ? "on" : "off", fKick ? "on" : "none");
++		sweet_mali_log_str(ln);
++	}
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -223,8 +292,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+-		0, 0,
++		(uint32_t)fb->fPeriod, (uint32_t)(fb->fPeriod >> 32),   /* a2 + a3 = next vsync (was 0: deadline always past) */
+ 	};
++	sweet_fb_n_vsync++;
+ 
+ 	IOLockLock(fb->fLock);
+ 	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+@@ -247,24 +317,93 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 			}
+ 		}
++		fb->rearm(sender, now);
++		return;
++	}
++	uint8_t *rec = fb->takeFrame(true, count);
++	IOLockUnlock(fb->fLock);
++	/* arm the next tick before the copy: the copy's time no longer stretches the period */
++	fb->rearm(sender, now);
++	if (rec != NULL) {
++		fb->present(rec);
++		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++	}
++}
++
++/* patch 0137: next vsync on an absolute deadline one period after the previous one (restart from now when late) */
++void
++AppleCLCD::rearm(IOTimerEventSource *sender, uint64_t now)
++{
++	if (!sweet_fb_abs || fPeriod == 0) {
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+-	uint8_t *rec = NULL;
+-	if (flush) {
+-		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+-		if (rec != NULL) {
+-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+-			fb->fDirty = false;
++	uint64_t next = fNextVsync ? fNextVsync + fPeriod : now + fPeriod;
++	if (next <= now) {
++		next = now + fPeriod;
++	}
++	fNextVsync = next;
++	sender->wakeAtTime(next);
++}
++
++/*
++ * fLock held. The pending swap, copied out for present(), when it may be shown now: on a tick every fFlushTicks
++ * (as before), or (kick) as soon as its GPU work completed. A gated swap whose work is still running stays pending
++ * (counted as a deferral) for at most SWEET_FB_GATE_MAX_TICKS ticks, then is shown anyway (timeout).
++ */
++uint8_t *
++AppleCLCD::takeFrame(bool tick, uint64_t count)
++{
++	if (!fDirty || fPowerOff) {
++		return NULL;
++	}
++	if (tick && (count % fFlushTicks) != 0 && fGateTicks == 0) {
++		return NULL;
++	}
++	if (fGateValid && !sweet_gpu_fence_ready(fGateSlot, fGateGen, fGateTicket)) {
++		if (!tick) {
++			return NULL;   /* kick before completion (another process's work): wait for the right one */
++		}
++		if (fGateTicks < SWEET_FB_GATE_MAX_TICKS) {
++			fGateTicks++;
++			sweet_fb_n_defer++;
++			return NULL;
++		}
++		sweet_fb_n_timeout++;
++		if (sweet_fb_n_timeout <= 8 || (sweet_fb_n_timeout % 100) == 0) {
++			char ln[96];
++			snprintf(ln, sizeof(ln), "fb gate timeout %llu: ticket %llu not done after %u ticks, shown anyway",
++			    sweet_fb_n_timeout, fGateTicket, fGateTicks);
++			sweet_mali_log_str(ln);
+ 		}
+ 	}
++	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++	if (rec == NULL) {
++		return NULL;
++	}
++	memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
++	fDirty = false;
++	fGateValid = false;
++	fGateTicks = 0;
++	fLastPresentAbs = mach_absolute_time();
++	sweet_fb_n_presents++;
++	if (!tick) {
++		sweet_fb_n_kick++;
++	}
++	return rec;
++}
++
++void
++AppleCLCD::kickFired(OSObject *owner, __unused IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	IOLockLock(fb->fLock);
++	uint8_t *rec = fb->takeFrame(false, 0);
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+ void
+@@ -305,12 +444,26 @@ static uint64_t sweet_fb_swap_count;
+  * default 10 Hz).
+  */
+ void
+-AppleCLCD::swap(const uint8_t *rec)
++AppleCLCD::swap(const uint8_t *rec, task_t task)
+ {
++	uint32_t slot = 0, gen = 0;
++	uint64_t ticket = 0;
++	bool gated = sweet_fb_gate && sweet_gpu_fence_snapshot(task, &slot, &gen, &ticket) == 0 && ticket != 0;
+ 	IOLockLock(fLock);
++	if (fDirty) {
++		sweet_fb_n_dropped++;   /* the previous swap was never shown (latest wins) */
++	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	fGateValid = gated;
++	fGateSlot = slot;
++	fGateGen = gen;
++	fGateTicket = ticket;
+ 	IOLockUnlock(fLock);
++	sweet_fb_n_swaps++;
++	if (gated && sweet_gpu_fence_ready(slot, gen, ticket)) {
++		sweet_fb_gpu_kick();   /* already complete: no need to wait for the tick */
++	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+@@ -430,7 +583,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		sweet_mali_log_str(line);
+ 	}
+ 	/* S21 GPU compositing marker: 16x16 top-left, green = GPU copied this frame, red = CPU */
+-	if (sweet_fb_gpu == 1 && (gpu_layers + cpu_layers) != 0) {
++	if (sweet_fb_mark && sweet_fb_gpu == 1 && (gpu_layers + cpu_layers) != 0) {
+ 		uint32_t c = cpu_layers == 0 ? 0xFF00FF00u : 0xFFFF0000u;
+ 		for (uint32_t y = 0; y < 16 && y < fHeight; y++) {
+ 			uint32_t *row = (uint32_t *)(fPixels + (uint64_t)(y + 120) * fRowBytes);
+@@ -539,7 +692,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			break;
+ 		}
+ 		memcpy(rec, args->structureInput, sizeof(rec));
+-		fFB->swap(rec);
++		fFB->swap(rec, fTask);
+ 		break;
+ 	}
+ 	case kSweetFBGetID:
