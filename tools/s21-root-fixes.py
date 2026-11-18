@@ -18,7 +18,13 @@
 import os, plistlib, sys
 
 MOBILE = 501
-REMOVE = {'com.apple.remotemanagementd', 'com.apple.progressd'}
+REMOVE = {'com.apple.remotemanagementd', 'com.apple.progressd',
+          # CPU hogs on this phone (kernel cputop, run190: vmd 96 %, launchd 95 %, mediaserverd 50 %, logd 20 % of a
+          # core with the home screen idle). Same set PixOS drops (sweet-root-tweaks.py DROPPED_JOBS): visual voicemail
+          # retries a missing telephony service forever; fairplayd relaunches forever; the crash/diagnostics daemons cost
+          # CPU on every crash (the kernel keeps its own crash log).
+          'com.apple.voicemail.vmd', 'com.apple.fairplayd.H2', 'com.apple.ReportCrash', 'com.apple.spindump',
+          'com.apple.tailspind', 'com.apple.aggregated', 'com.apple.aggregated.addaily'}
 
 
 def main(root):
@@ -46,6 +52,26 @@ def main(root):
         except PermissionError:
             pass
     print('health dirs ready')
+    # mediaserverd spun at ~50 % of a core: the virtual audio HAL plug-in cannot load without an audio device, and the
+    # MediaToolbox recorder server keeps retrying (as PixOS: plug-in moved aside, recorder server off)
+    import glob, shutil
+    hal = os.path.join(root, 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin')
+    if os.path.exists(hal):
+        dst = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled')
+        os.makedirs(dst, exist_ok=True)
+        shutil.move(hal, os.path.join(dst, 'VirtualAudio.plugin'))
+        print('VirtualAudio.plugin moved aside')
+    for cfg in glob.glob(os.path.join(root, 'System/Library/Frameworks/MediaToolbox.framework/*/SubServerConfiguration.plist')) + \
+            glob.glob(os.path.join(root, 'System/Library/Frameworks/MediaToolbox.framework/SubServerConfiguration.plist')):
+        with open(cfg, 'rb') as f:
+            pl = plistlib.load(f)
+        if pl.get('StartRecorderServer') is not False:
+            pl['StartRecorderServer'] = False
+            st = os.stat(cfg)
+            with open(cfg, 'wb') as f:
+                plistlib.dump(pl, f, fmt=plistlib.FMT_XML)
+            os.chmod(cfg, st.st_mode & 0o7777)
+            print('recorder server off:', os.path.relpath(cfg, root))
     path = os.path.join(root, 'System/Library/xpc/launchd.plist')
     with open(path, 'rb') as f:
         pl = plistlib.load(f)
