@@ -376,6 +376,7 @@ mali_recover(const char *why)
 }
 
 int sweet_s21keys_start(void);
+int sweet_s21_battery_start(void);
 static inline void gov_job(void);   /* idle clock governor, below mali_dvfs() */
 
 /* ---- job submission (polling) ---- */
@@ -914,6 +915,7 @@ sweet_mali_boot(void)
 	mali_dvfs(1);
 	gov_start();
 	(void)sweet_s21keys_start();   /* S21 side keys (0125) */
+	(void)sweet_s21_battery_start();   /* iOS battery from the MAX77705 gauge (0127), sweetbattery=2 */
 	mali_selftest();
 	mali_selftest_heap();
 	mali_log("ready, left powered (pool used %u of %u pages)", mali.pool_next, mali.pool_pages);
