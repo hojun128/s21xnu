@@ -3349,7 +3349,7 @@ static void sm_hog_proc(int pid, const char *nm, uint64_t cs, size_t cl)
 	}
 	slog("SweetMTL: hog %s pid %d main 0x%llx threads %u cpu %d%% top %d/%d/%d%%", nm, pid, (unsigned long long)mh, nt, tot / 10,
 	    hu[0] / 10, hu[1] / 10, hu[2] / 10);
-	for (int k = 0; k < 3; k++) {
+	for (int k = 0; k < 2; k++) {
 		if (hot[k] < 0 || hu[k] < 50) continue;
 		thread_act_t a = th[hot[k]];
 		char tn[24] = "";
@@ -3361,24 +3361,29 @@ static void sm_hog_proc(int pid, const char *nm, uint64_t cs, size_t cl)
 			if (s) usleep(40000);
 			if (thread_suspend(a) != KERN_SUCCESS) break;
 			arm_thread_state64_t st; mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
-			uint64_t pcs[10]; int np = 0;
+			uint64_t pcs[26]; int np = 0;
 			if (thread_get_state(a, ARM_THREAD_STATE64, (thread_state_t)&st, &c) == KERN_SUCCESS) {
 				pcs[np++] = (uint64_t)arm_thread_state64_get_pc(st) & 0xFFFFFFFFFULL;
 				pcs[np++] = (uint64_t)arm_thread_state64_get_lr(st) & 0xFFFFFFFFFULL;
 				uint64_t fp = (uint64_t)arm_thread_state64_get_fp(st);
-				for (int m = 0; m < 8 && fp && !(fp & 7) && np < 10; m++) {
+				for (int m = 0; m < 24 && fp && !(fp & 7) && np < 26; m++) {
 					uint64_t fr[2] = { 0, 0 }; vm_size_t got = 0;
 					if (vm_read_overwrite(t, (vm_address_t)fp, 16, (vm_address_t)fr, &got) || got != 16) break;
 					pcs[np++] = fr[1] & 0xFFFFFFFFFULL; fp = fr[0];
 				}
 			}
 			thread_resume(a);
-			char line[140]; int L = snprintf(line, sizeof line, "hog %.12s T%d %d%% %s s%d:", nm, hot[k], hu[k] / 10, tn, s);
-			for (int m = 0; m < np && L < (int)sizeof line - 20; m++) {
-				char f[40]; sm_hog_sym(pcs[m], mh, cs, cl, f, sizeof f);
-				L += snprintf(line + L, sizeof line - L, "%s%s", m ? "<" : " ", f);
+			/* first sample of a thread: the whole chain (continuation lines "sK+"), later samples: the top frames */
+			int m = 0, part = 0;
+			while (m < np && (s == 0 || part == 0)) {
+				char line[140]; int L = snprintf(line, sizeof line, "hog %.12s T%d %d%% %s s%d%s:", nm, hot[k], hu[k] / 10, part ? "" : tn, s, part ? "+" : "");
+				for (int q = 0; m < np && L < (int)sizeof line - 34; m++, q++) {
+					char f[40]; sm_hog_sym(pcs[m], mh, cs, cl, f, sizeof f);
+					L += snprintf(line + L, sizeof line - L, "%s%s", q ? "<" : " ", f);
+				}
+				slog("SweetMTL: %s", line);
+				part++;
 			}
-			slog("SweetMTL: %s", line);
 		}
 	}
 	for (mach_msg_type_number_t i = 0; i < nt; i++) mach_port_deallocate(mach_task_self(), th[i]);
@@ -3389,10 +3394,13 @@ static void sm_hog_round(void)
 {
 	static int pids[1024]; int n = proc_listallpids(pids, sizeof pids); if (n > 1024) n = 1024;
 	size_t cl = 0; const void *cs = _dyld_get_shared_cache_range(&cl);
+	int found = 0;
 	for (int i = 0; i < n; i++) {
 		char nm[40] = "?"; proc_name(pids[i], nm, sizeof nm);
-		if (sm_hog_wanted(nm)) sm_hog_proc(pids[i], nm, (uint64_t)cs, cl);
+		if (pids[i] == 1 && !nm[0]) strlcpy(nm, "launchd", sizeof nm);
+		if (sm_hog_wanted(nm)) { sm_hog_proc(pids[i], nm, (uint64_t)cs, cl); found++; }
 	}
+	slog("SweetMTL: hog round: %d pids, %d sampled (%s)", n, found, sm_hog_names);
 }
 static void sm_boot_diag(long sec)
 {
@@ -3564,7 +3572,7 @@ static void *sm_watchdog(void *arg)
 						memcpy(sm_hog_names, p, k); sm_hog_names[k] = 0; hg = k > 0; }
 				}
 			}
-			if (hg && nh < 3) {
+			if (hg && nh < 2) {
 				struct timespec bt; clock_gettime(CLOCK_MONOTONIC, &bt);
 				if (bt.tv_sec >= 240 + 60 * nh) { nh++; sm_hog_round(); }
 			}
