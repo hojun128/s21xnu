@@ -55,7 +55,7 @@ ct_visit(proc_t p, __unused void *arg)
 			ct[i].gen = ct_gen;
 			return PROC_RETURNED;
 		}
-		if (fr < 0 && ct[i].gen != ct_gen && ct[i].gen != ct_gen - 1) {
+		if (fr < 0 && (ct[i].gen == 0 || (ct[i].gen != ct_gen && ct[i].gen != ct_gen - 1))) {
 			fr = i;
 		}
 	}
