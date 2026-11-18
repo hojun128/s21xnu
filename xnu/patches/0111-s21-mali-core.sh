@@ -770,16 +770,17 @@ static thread_call_t gov_tc;
  * their "lo" levels whatever the load. iOS had no thermal management at all: a hung test run (run181) heated the
  * phone to ~71 C on full clocks.
  */
-static volatile int sweet_thermal_cap;
-void sweet_thermal_set(int cap);
+static volatile int sweet_thermal_cap;   /* bit 1 battery temperature (0123), bit 2 SoC temperature (0140) */
+void sweet_thermal_src(int src, int on);
 void
-sweet_thermal_set(int cap)
+sweet_thermal_src(int src, int on)
 {
+	int cap = on ? (sweet_thermal_cap | src) : (sweet_thermal_cap & ~src);
 	if (sweet_thermal_cap == cap) {
 		return;
 	}
 	sweet_thermal_cap = cap;
-	mali_log("dvfs thermal: clocks %s", cap ? "capped low" : "released");
+	mali_log("dvfs thermal: clocks %s (sources %x)", cap ? "capped low" : "released", cap);
 	if (gov_tc) {
 		thread_call_enter(gov_tc);
 	}
@@ -1037,6 +1038,10 @@ sweet_mali_boot(void)
 	mali_dvfs(1);
 	gov_start();
 	swd_start();
+	{
+		extern int sweet_tmu_start(void);   /* 0140 */
+		(void)sweet_tmu_start();
+	}
 	(void)sweet_s21keys_start();   /* S21 side keys (0125) */
 	(void)sweet_s21_battery_start();   /* iOS battery from the MAX77705 gauge (0127), sweetbattery=2 */
 	mali_selftest();

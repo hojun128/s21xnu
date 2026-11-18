@@ -42,7 +42,7 @@ cat > bsd/dev/sweet_max77705.c <<'EOF_SWEET_SRC'
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 void sweet_mali_log_str(const char *s);
-void sweet_thermal_set(int cap);                 /* 0111: keep CPU/GPU clocks low */
+void sweet_thermal_src(int src, int on);         /* 0111: keep CPU/GPU clocks low (source bit 1 here) */
 void sweet_reboot_recovery_ext(const char *why); /* 0112: logged reset into TWRP */
 /*
  * Thermal policy on the battery temperature (sampled with the 10 s poll), hysteresis 3 C:
@@ -371,7 +371,7 @@ mx_poll(void)
 				mx_tlevel = lv;
 			}
 			mx_therm_cc = lv >= 2 ? 100U : lv == 1 ? 500U : 0U;
-			sweet_thermal_set(lv >= 3);
+			sweet_thermal_src(1, lv >= 3);
 			mx_thot = t10 >= 550 ? mx_thot + 1 : 0;
 			if (mx_thot >= 2) {
 				mx_log("chg: battery %d.%d C twice: reset into the recovery", t10 / 10, t10 % 10);

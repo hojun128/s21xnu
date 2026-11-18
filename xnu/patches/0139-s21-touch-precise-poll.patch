@@ -1,8 +1,26 @@
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 231bf58..fcedda8 100644
+index 231bf58..858064f 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -423,10 +423,52 @@ static uint32_t ts_g_poll_us;
+@@ -407,6 +407,7 @@ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ #define S21_PANEL_MAXX 1079
+ #define S21_PANEL_MAXY 2399
+ 
++static struct { int down, x, y; } ts_fing[16];   /* fingers posted down (stuck-finger guard, 0139) */
+ static void
+ sweet_touch_post(struct ts_touch *t, uint32_t flip)
+ {
+@@ -414,6 +415,9 @@ sweet_touch_post(struct ts_touch *t, uint32_t flip)
+         if (flip & 1) { x = S21_PANEL_MAXX - x; }
+         if (flip & 2) { y = S21_PANEL_MAXY - y; }
+         sweet_hid_touch(t->id - 1, t->down ? 1 : 0, x, y);
++        if (t->id >= 1 && t->id <= 16) {
++                ts_fing[t->id - 1].down = t->down; ts_fing[t->id - 1].x = x; ts_fing[t->id - 1].y = y;
++        }
+ }
+ 
+ /* ------------------------------------------------------------------------ */
+@@ -423,13 +427,83 @@ static uint32_t ts_g_poll_us;
  static int ts_g_ev;
  static int ts_g_burst = 32; /* 0098: events drained per poll; touch_burst=1 = old behaviour */
  
@@ -56,7 +74,61 @@ index 231bf58..fcedda8 100644
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
-@@ -454,6 +496,8 @@ sweet_touch_poll(void *arg, wait_result_t w)
++/*
++ * Stuck-finger guard (patch 0139, idea from N1709/z3sios redwood_sec_ts.c, MIT): the controller answers an
++ * overflow or a lost state with an EMPTY event (eid 3) or keeps ATTN low with nothing to read; a finger whose
++ * release event was lost stayed "down" in iOS (run182: Settings redrawn 13 times a second for 80 s with nobody
++ * touching). Then: clear the controller's event stack and post a release for every finger still down.
++ * ATTN low 1 s with no event: the same; 5 s: sensing on again.
++ */
++static uint32_t ts_g_released;
++static void
++ts_release_all(const char *why)
++{
++	uint8_t c = SEC_TS_CMD_CLEAR_EVENT_STACK;
++	uint32_t n = 0;
++	i2c_write(&ts_i2c, SEC_TS_ADDR, &c, 1);
++	for (int i = 0; i < 16; i++) {
++		if (ts_fing[i].down) {
++			ts_fing[i].down = 0;
++			sweet_hid_touch(i, 0, ts_fing[i].x, ts_fing[i].y);
++			n++;
++		}
++	}
++	if (ts_g_released++ < 40) {
++		char ln[96];
++		snprintf(ln, sizeof(ln), "keys: touch reset (%s): %u finger(s) released", why, n);
++		sweet_mali_log_str(ln);
++	}
++}
++
+ static void
+ sweet_touch_poll(void *arg, wait_result_t w)
+ {
+@@ -440,6 +514,8 @@ sweet_touch_poll(void *arg, wait_result_t w)
+ 	note("TSPOLL thread start poll_us=%u", ts_g_poll_us);
+ 	for (;;) {
+ 		polls++;
++		static uint32_t stuck;
++		int got = 0, low = pin_get(attn_va, ATTN_BIT) == 0;
+ 		for (int burst = 0; burst < ts_g_burst && pin_get(attn_va, ATTN_BIT) == 0; burst++) {
+ 			uint8_t ev[8];
+ 			lows++;
+@@ -448,18 +524,42 @@ sweet_touch_poll(void *arg, wait_result_t w)
+ 				struct ts_touch t;
+ 				reads++;
+ 				memcpy(last, ev, 8);
++				if (ev[0] == 0) {
++					break;   /* nothing to read */
++				}
++				got++;
++				if ((ev[0] & 0x3) == 0x3) {
++					ts_release_all("empty event");
++					break;
++				}
+ 				if (ts_g_trace) {
+ 					note("raw %02x %02x %02x %02x %02x %02x %02x %02x",
+ 					    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
  				}
  				if (decode_event(ev, &t)) {
  					dec++;
@@ -65,7 +137,27 @@ index 231bf58..fcedda8 100644
  					if ((uint32_t)t.x > maxx) { maxx = (uint32_t)t.x; }
  					if ((uint32_t)t.y > maxy) { maxy = (uint32_t)t.y; }
  					sweet_touch_post(&t, (uint32_t)ts_g_flip);
-@@ -907,6 +951,7 @@ sweet_touch_init(void)
+ 				}
+ 			}
+ 		}
++		if (low && !got) {
++			uint32_t pu = ts_g_poll_us ? ts_g_poll_us : 8000U;
++			stuck++;
++			if (stuck == 1000000U / pu) {
++				ts_release_all("attn low 1 s, nothing to read");
++			} else if (stuck >= 5000000U / pu) {
++				uint8_t c = SEC_TS_CMD_SENSE_ON;
++				i2c_write(&ts_i2c, SEC_TS_ADDR, &c, 1);
++				ts_release_all("attn low 5 s: sense on again");
++				stuck = 0;
++			}
++		} else {
++			stuck = 0;
++		}
+ 		if (ts_g_trace >= 2 && polls == limit) {
+ 			panic("sweet_touch: TSPOLL polls=%u attn_low=%u reads=%u decoded=%u maxx=%u maxy=%u last=%02x %02x %02x %02x %02x %02x %02x %02x",
+ 			    polls, lows, reads, dec, maxx, maxy,
+@@ -907,6 +1007,7 @@ sweet_touch_init(void)
  	PE_parse_boot_argn("touch_flip", &touch_flip, sizeof(touch_flip));
  	PE_parse_boot_argn("touch_trace", &touch_trace, sizeof(touch_trace));
  	PE_parse_boot_argn("touch_poll_us", &touch_poll_us, sizeof(touch_poll_us));
