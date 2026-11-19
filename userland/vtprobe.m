@@ -51,10 +51,12 @@ static void vt_cb(void *ref, void *fref, OSStatus st, VTDecodeInfoFlags fl, CVIm
 	if (st == noErr && img) vt_frames++; else { vt_errs++; vt_last = st; }
 }
 
+static int vt_fmt;   /* 0: NV12 video range IOSurface, 1: no attributes, 2: BGRA IOSurface, 3: NV12 full range */
 static void vt_session(CMFormatDescriptionRef fd, AVAsset *asset, AVAssetTrack *tr, bool nohw)
 {
-	NSDictionary *dst = @{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-		(id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+	uint32_t pf = vt_fmt == 2 ? kCVPixelFormatType_32BGRA : vt_fmt == 3 ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+	NSDictionary *dst = vt_fmt == 1 ? nil : @{ (id)kCVPixelBufferPixelFormatTypeKey: @(pf), (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+	lg("session fmt %d", vt_fmt);
 	NSDictionary *spec = nohw ? @{ (id)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: @NO } : nil;
 	VTDecompressionOutputCallbackRecord cb = { vt_cb, NULL };
 	VTDecompressionSessionRef s = NULL;
@@ -74,7 +76,7 @@ static void vt_session(CMFormatDescriptionRef fd, AVAsset *asset, AVAssetTrack *
 	if (![rd startReading]) { lg("reader start failed: %ld", (long)rd.error.code); VTDecompressionSessionInvalidate(s); CFRelease(s); return; }
 	vt_frames = vt_errs = 0; vt_last = 0;
 	int fed = 0; OSStatus dst2 = 0; uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-	for (; fed < 60; fed++) {
+	for (; fed < 20; fed++) {
 		CMSampleBufferRef sb = [o copyNextSampleBuffer];
 		if (!sb) break;
 		VTDecodeInfoFlags inf = 0;
@@ -84,7 +86,7 @@ static void vt_session(CMFormatDescriptionRef fd, AVAsset *asset, AVAssetTrack *
 		CFRelease(sb);
 		if (dst2 != noErr) break;
 	}
-	VTDecompressionSessionWaitForAsynchronousFrames(s);
+	if (dst2 == noErr) VTDecompressionSessionWaitForAsynchronousFrames(s);   /* after an error it never returned (run221) */
 	uint64_t ms = (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1000000;
 	lg("session (%s): fed %d, decode %d, frames %d, errors %d (last %d), %llu ms", nohw ? "no hw" : "default", fed, (int)dst2,
 	    vt_frames, vt_errs, (int)vt_last, (unsigned long long)ms);
@@ -110,8 +112,8 @@ static void probe(void)
 	CMFormatDescriptionRef fd = (__bridge CMFormatDescriptionRef)fds[0];
 	CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(fd);
 	lg("video %s %dx%d, audio track %s", fcc(CMFormatDescriptionGetMediaSubType(fd), a), d.width, d.height, au ? "yes" : "no");
-	vt_session(fd, asset, tr, false);
-	vt_session(fd, asset, tr, true);
+	for (vt_fmt = 0; vt_fmt < 4; vt_fmt++) vt_session(fd, asset, tr, false);
+	vt_fmt = 1; vt_session(fd, asset, tr, true);
 	{
 		NSError *e = nil;
 		AVAssetReader *rd = [AVAssetReader assetReaderWithAsset:asset error:&e];
