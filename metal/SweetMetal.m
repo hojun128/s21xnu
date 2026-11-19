@@ -335,16 +335,25 @@ static void sm_capture(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, u
 
 /* Thumbnail through the log (the rootfs is a RAM overlay, so files do not survive): 1/12 scale, RGB332,
  * base64 in 112-char lines "THn <seq> <data>"; the Mac rebuilds a PNG from the pstore log. */
-static struct { uint8_t *px; uint32_t n, w, h, id; } sm_thdef[4]; static int sm_nthdef;
+#include <zlib.h>
+#define SM_THDEF_MAX 16
+static struct { uint8_t *px; uint32_t n, w, h, id; bool hi; } sm_thdef[SM_THDEF_MAX]; static int sm_nthdef;
 static void sm_thumb_emit(const uint8_t *px, uint32_t n, uint32_t w, uint32_t h, uint32_t id, bool hi);
+static void sm_thumb_ex(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uint32_t id, uint32_t S, bool hi);
 /* id | 0x100: compute now, print later with sm_thumb_flush() (early shots were pushed out of the pmsg ring, run112) */
 static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uint32_t id)
 {
-	if (!c) return;
+	uint32_t i = id & 0xFF;
+	/* 16-19: small progress shots; ids >= 20: RGB565 (2 bytes/pixel, no colour banding) */
+	sm_thumb_ex(c, W, H, bpr, id, (i >= 16 && i <= 19) ? 18 : 12, i >= 20);
+}
+static void sm_thumb_ex(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uint32_t id, uint32_t S, bool hi)
+{
+	if (!c || S < 7) return;
 	bool defer = (id & 0x100) != 0; id &= 0xFF;
-	const uint32_t S = (id >= 16 && id <= 19) ? 18 : 12, w = W / S, h = H / S;   /* 18/19: small progress shots */
-	bool hi = id >= 20;                       /* ids >= 20: RGB565 (2 bytes/pixel, no colour banding) */
+	const uint32_t w = W / S, h = H / S;
 	uint32_t n = w * h * (hi ? 2 : 1); uint8_t *px = malloc(n);
+	if (!px) return;
 	for (uint32_t y = 0; y < h; y++)
 		for (uint32_t x = 0; x < w; x++) {
 			uint32_t r = 0, g = 0, b = 0;
@@ -358,18 +367,30 @@ static void sm_thumb(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uin
 				px[2 * (y * w + x)] = (uint8_t)v; px[2 * (y * w + x) + 1] = (uint8_t)(v >> 8);
 			} else px[y * w + x] = (uint8_t)((r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6));
 		}
-	if (defer && sm_nthdef < 4) { sm_thdef[sm_nthdef].px = px; sm_thdef[sm_nthdef].n = n; sm_thdef[sm_nthdef].w = w; sm_thdef[sm_nthdef].h = h; sm_thdef[sm_nthdef++].id = id; return; }
+	if (defer && sm_nthdef < SM_THDEF_MAX) {
+		sm_thdef[sm_nthdef].px = px; sm_thdef[sm_nthdef].n = n; sm_thdef[sm_nthdef].w = w; sm_thdef[sm_nthdef].h = h;
+		sm_thdef[sm_nthdef].hi = hi; sm_thdef[sm_nthdef++].id = id; return;
+	}
 	sm_thumb_emit(px, n, w, h, id, hi);
 	free(px);
 }
 static void sm_thumb_flush(void)
 {
-	for (int i = 0; i < sm_nthdef; i++) { sm_thumb_emit(sm_thdef[i].px, sm_thdef[i].n, sm_thdef[i].w, sm_thdef[i].h, sm_thdef[i].id, sm_thdef[i].id >= 20); free(sm_thdef[i].px); }
+	for (int i = 0; i < sm_nthdef; i++) { sm_thumb_emit(sm_thdef[i].px, sm_thdef[i].n, sm_thdef[i].w, sm_thdef[i].h, sm_thdef[i].id, sm_thdef[i].hi); free(sm_thdef[i].px); }
 	sm_nthdef = 0;
 }
-static void sm_thumb_emit(const uint8_t *px, uint32_t n, uint32_t w, uint32_t h, uint32_t id, bool hi)
+static void sm_thumb_emit(const uint8_t *px0, uint32_t n0, uint32_t w, uint32_t h, uint32_t id, bool hi)
 {
-	slog("SweetMTL: THUMB %u %ux%u %s %u bytes", id, w, h, hi ? "rgb565" : "rgb332", n);
+	/* zlib-compressed when that is smaller (home shot 37.7 -> 13 KB, UI screens far less): the pmsg ring holds ~90 KB
+	 * of plugin lines, so uncompressed shots of every app would push each other out. thumbs.py reads both forms. */
+	const uint8_t *px = px0; uint32_t n = n0; uint8_t *z = NULL;
+	{
+		uLongf zl = compressBound(n0);
+		z = malloc(zl);
+		if (z && compress2(z, &zl, px0, n0, 9) == Z_OK && zl < n0) { px = z; n = (uint32_t)zl; }
+	}
+	if (px == z) slog("SweetMTL: THUMB %u %ux%u %sz %u bytes %u zbytes", id, w, h, hi ? "rgb565" : "rgb332", n0, n);
+	else slog("SweetMTL: THUMB %u %ux%u %s %u bytes", id, w, h, hi ? "rgb565" : "rgb332", n0);
 	static const char *B = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 	char line[140]; uint32_t seq = 0;
 	for (uint32_t o = 0; o < n; o += 84, seq++) {
@@ -381,6 +402,7 @@ static void sm_thumb_emit(const uint8_t *px, uint32_t n, uint32_t w, uint32_t h,
 		line[L] = 0;
 		slog("%s", line);
 	}
+	free(z);
 }
 
 static bool sm_gpu_off;   /* a job timed out (or the kernel fenced the GPU): no more GPU work this boot */
@@ -3558,6 +3580,14 @@ static void sm_swipe_up(void)
 }
 /* boot-arg sweetapps=1: after the home shot open every app on the home screen and the dock (thumbnail run168), 12 s each,
  * then back home; the kernel keeps a "crash:" line for every abnormal exit (user report: "apps crash when opened") */
+/* app tour shot: the current full-screen target, 1/12 RGB332 (zlib), printed with the last thumbnails */
+static void sm_tour_shot(uint32_t shot)
+{
+	SweetMTLTexture *tx = sm_last_target;
+	if (!tx || !tx.bo || !tx.bo->cpu) { slog("SweetMTL: tour shot %u: no target", shot); return; }
+	sm_flush_now(tx.bo->gpu, (uint64_t)tx.bytesPerRow * tx.height);   /* GPU-only target: invalidate before the CPU read */
+	sm_thumb_ex(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | shot, 12, false);
+}
 static void sm_app_tour(void)
 {
 	static const struct { const char *n; int x, y; } A[] = {
@@ -3572,8 +3602,13 @@ static void sm_app_tour(void)
 			uint32_t c0 = sm_commits;
 			if (meas) sm_perf_reset();
 			kern_return_t k = sm_tap(A[i].x, A[i].y);
-			if (meas) { sleep(3); snprintf(w, sizeof w, "%s-%s", round ? "reopen" : "open", A[i].n); sm_perf_report(w, 0); }
+			if (meas) {
+				/* mid-animation shot (the card zooming in: where a wrong shader or snapshot shows), ids 6x open, 5x reopen */
+				usleep(350000); sm_tour_shot((round ? 50 : 60) + i);
+				usleep(2650000); snprintf(w, sizeof w, "%s-%s", round ? "reopen" : "open", A[i].n); sm_perf_report(w, 0);
+			}
 			sleep(meas ? 6 : 12);
+			if (round == 0) sm_tour_shot(40 + i);   /* the app as opened, ids 40-45 */
 			uint32_t c1 = sm_commits;
 			slog("SweetMTL: app %s tap kr=%x commits +%u", A[i].n, k, c1 - c0);
 			if (meas) sm_perf_reset();
