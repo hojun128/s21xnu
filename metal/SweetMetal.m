@@ -92,6 +92,9 @@ static volatile uint32_t sm_commits;
 #include <mach/mach_time.h>
 static volatile uint64_t sm_pf_ns, sm_pf_gpu_ns, sm_pf_max_ns, sm_pf_last, sm_pf_win;
 static volatile uint32_t sm_pf_n, sm_pf_jobs, sm_pf_draws, sm_pf_gap[4];
+/* reopen stutter hunt: gaps >= 34 ms between commits in a perf window as " +offset:length" (ms), and the committing
+ * thread (sampled by sm_gapwatch while a gap is open) */
+static char sm_gap_tl[120]; static volatile uint32_t sm_gap_sampled; static volatile mach_port_t sm_commit_th;
 static uint64_t sm_ns(void)
 {
 	static mach_timebase_info_data_t tb;
@@ -952,6 +955,13 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
     uint32_t packed, bool bgra, const sm_drawrec *dr, uint32_t ndraw, uint32_t *vstatus, bool preload)
 {
 	if (preload) { const sm_shader *rs = sm_find(@"read_surf_frag"); if (!rs || rs->size > 0x300) preload = false; }
+	/* loadAction = Load: tile elimination as Mesa does it -- the preload runs only on tiles some draw touches
+	 * (INTERSECT), the tiles it reloads stay clean, and clean tiles are not written back, so a pass that draws a
+	 * small element over a full-screen target costs that element's tiles instead of 2 x 11 MB of memory traffic.
+	 * Clear passes keep clean-pixel writes (the clear colour must reach every tile). boot-arg sweettile=1 (test) */
+	static int tilekill = -1;
+	if (tilekill < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; tilekill = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweettile=1") ? 1 : 0; }
+	bool isect = preload && tilekill;
 	sm_jl_beginl(target_va, (uint64_t)stride * h);
 	sm_desc_span = 0x10000; uint32_t sm_slot_cur = 0x10000;
 	/* compact draw slots are opt-in (boot-arg sweetcompact=1): with them the dock blur and widget corners broke and a
@@ -979,7 +989,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	{ uint16_t *sp = (uint16_t *)(cpu + OFF_SAMP); for (int i = 0; i < 128; i++) sp[i] = 128; }
 	void *fbd = cpu + OFF_FBD;
 	pan_section_pack(fbd, FRAMEBUFFER, PARAMETERS, cfg) {
-		cfg.pre_frame_0 = preload ? MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS : MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
+		cfg.pre_frame_0 = !preload ? MALI_PRE_POST_FRAME_SHADER_MODE_NEVER : isect ? MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT : MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS;
 		if (preload) cfg.frame_shader_dcds = D + 0x1000;
 		cfg.pre_frame_1 = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
 		cfg.post_frame = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
@@ -991,7 +1001,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	}
 	pan_section_pack(fbd, FRAMEBUFFER, PADDING, padding) {}
 	pan_pack((uint8_t *)fbd + pan_size(FRAMEBUFFER), RENDER_TARGET, rt) {
-		rt.clean_pixel_write_enable = true;
+		rt.clean_pixel_write_enable = !isect;
 		rt.clear.color_0 = rt.clear.color_1 = rt.clear.color_2 = rt.clear.color_3 = packed;
 		rt.write_enable = true; rt.dithering_enable = true;
 		rt.internal_format = MALI_COLOR_BUFFER_INTERNAL_FORMAT_R8G8B8A8;
@@ -1049,6 +1059,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 				cfg.allow_forward_pixel_to_kill = true; cfg.allow_forward_pixel_to_be_killed = true;
 				cfg.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY; cfg.zs_update_operation = MALI_PIXEL_KILL_STRONG_EARLY;
 				cfg.sample_mask = 0xFFFF; cfg.maximum_z = 1.0f; cfg.depth_stencil = D + OFF_DS;
+				cfg.clean_fragment_write = isect;   /* reloaded tiles stay clean: no writeback unless a draw dirties them */
 				cfg.render_target_mask = 1; cfg.blend = QV + 0x2A0; cfg.blend_count = 1;
 				cfg.shader.resources = (QV + 0x1C0) | 6; cfg.shader.shader = QV + 0x180;
 				cfg.shader.thread_storage = D + OFF_TLS; cfg.shader.fau = QV + 0x300; cfg.shader.fau_count = 1;
@@ -2870,7 +2881,9 @@ static void sm_tag_surfaces(NSArray *passes, uint64_t t)
 	sm_cf_reset();
 	sm_cur_dn = 0;
 	uint64_t pf_t0 = sm_ns();
-	if (sm_pf_last) { uint64_t g = (pf_t0 - sm_pf_last) / 1000000; sm_pf_gap[g < 20 ? 0 : g < 40 ? 1 : g < 100 ? 2 : 3]++; }
+	if (sm_pf_last) { uint64_t g = (pf_t0 - sm_pf_last) / 1000000; sm_pf_gap[g < 20 ? 0 : g < 40 ? 1 : g < 100 ? 2 : 3]++;
+		if (g >= 34 && sm_pf_win && sm_pf_last > sm_pf_win) { size_t L = strlen(sm_gap_tl); if (L < sizeof sm_gap_tl - 14) snprintf(sm_gap_tl + L, sizeof sm_gap_tl - L, " +%llu:%llu", (unsigned long long)((sm_pf_last - sm_pf_win) / 1000000), (unsigned long long)g); } }
+	sm_commit_th = pthread_mach_thread_np(pthread_self());
 	for (SweetMTLRenderEncoder *e in _passes) if ([e isKindOfClass:[SweetMTLRenderEncoder class]] && ![e isKindOfClass:[SweetMTLComputeEncoder class]]) sm_pf_draws += e->_ndraw;
 	static int merge = -1;
 	if (merge < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; merge = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetmerge=1") ? 1 : 0; }
@@ -3578,8 +3591,63 @@ static void sm_fbstats(uint64_t o[16])
 	uint32_t oc = 16;
 	if (sm_conn) IOConnectCallMethod(sm_conn, 15, NULL, 0, NULL, 0, o, &oc, NULL, NULL);
 }
+/* While a perf window is open: when no command buffer has been committed for 50 ms, the thread that commits (CA's
+ * render thread) and SpringBoard's main thread are sampled once per gap (pc, lr, 8 frames; image+offset), at most 4
+ * gaps per window, so a reopen hitch shows what the renderer was waiting for. */
+static void sm_gap_line(const char *who, mach_port_name_t task, thread_act_t th, uint64_t ofs)
+{
+	arm_thread_state64_t st; mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
+	uint64_t pcs[10]; int np = 0;
+	/* registers and frame chain are read with the thread suspended (mach calls only); dladdr runs after the resume, so
+	 * the sampled thread can never be stopped holding a dyld/malloc lock this thread then wants */
+	if (thread_suspend(th)) return;
+	if (!thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, &c)) {
+		pcs[np++] = (uint64_t)arm_thread_state64_get_pc(st) & 0xFFFFFFFFFULL; pcs[np++] = (uint64_t)arm_thread_state64_get_lr(st) & 0xFFFFFFFFFULL;
+		uint64_t fp = (uint64_t)arm_thread_state64_get_fp(st);
+		for (int k = 0; k < 8 && fp && np < 10; k++) {
+			uint64_t fr[2] = { 0, 0 }; vm_size_t got = 0;
+			if (vm_read_overwrite(task, (vm_address_t)fp, 16, (vm_address_t)fr, &got) || got != 16) break;
+			pcs[np++] = fr[1] & 0xFFFFFFFFFULL; fp = fr[0];
+		}
+	}
+	thread_resume(th);
+	if (!np) return;
+	char ln[200]; int L = snprintf(ln, sizeof ln, "SweetMTL: perf gapstk +%llu %s:", (unsigned long long)ofs, who);
+	for (int k = 0; k < np && L < (int)sizeof ln - 40; k++) {
+		Dl_info di; memset(&di, 0, sizeof di); char b[40];
+		if (pcs[k] && dladdr((void *)pcs[k], &di) && di.dli_fname) { const char *im = strrchr(di.dli_fname, '/'); snprintf(b, sizeof b, "%.12s+%lx", im ? im + 1 : di.dli_fname, (unsigned long)(pcs[k] - (uint64_t)di.dli_fbase)); }
+		else snprintf(b, sizeof b, "%llx", (unsigned long long)pcs[k]);
+		L += snprintf(ln + L, sizeof ln - L, " %s", b);
+	}
+	slog("%s", ln);
+}
+static void *sm_gapwatch(void *arg)
+{
+	(void)arg; uint64_t done_for = 0; int sbpid = 0; mach_port_name_t sbt = 0;
+	for (;;) {
+		usleep(10000);
+		uint64_t last = sm_pf_last, win = sm_pf_win;
+		if (!win || !last || last < win || last == done_for || sm_gap_sampled >= 4 || !sm_commit_th) continue;
+		uint64_t now = sm_ns(); if (now - last < 50000000ULL || now - last > 400000000ULL) continue;
+		done_for = last; sm_gap_sampled++;
+		uint64_t ofs = (last - win) / 1000000;
+		sm_gap_line("bb", mach_task_self(), sm_commit_th, ofs);
+		if (!sbpid) {
+			static int pids[1024]; int n = proc_listallpids(pids, sizeof pids); if (n > 1024) n = 1024;
+			for (int i = 0; i < n && !sbpid; i++) { char nm[40] = "?"; proc_name(pids[i], nm, sizeof nm); if (!strcmp(nm, "SpringBoard")) sbpid = pids[i]; }
+			if (sbpid && task_for_pid(mach_task_self(), sbpid, &sbt)) sbt = 0;
+		}
+		if (sbt) { thread_act_array_t th = NULL; mach_msg_type_number_t tn = 0;
+			if (!task_threads(sbt, &th, &tn) && tn) { sm_gap_line("SB", sbt, th[0], ofs);
+				for (mach_msg_type_number_t i = 0; i < tn; i++) mach_port_deallocate(mach_task_self(), th[i]);
+				vm_deallocate(mach_task_self(), (vm_address_t)th, tn * sizeof *th); } }
+	}
+	return NULL;
+}
 static void sm_perf_reset(void)
 {
+	{ static bool started; if (!started) { started = true; pthread_t t; pthread_create(&t, NULL, sm_gapwatch, NULL); } }
+	sm_gap_tl[0] = 0; sm_gap_sampled = 0;
 	sm_fbstats(sm_fbst0); sm_q_full = sm_q_texwaits = sm_q_drains = 0; sm_merge_saved = sm_merge_hoisted = 0;
 	sm_worst_ns = 0; sm_worst_dn = 0;
 	sm_pf_ns = sm_pf_gpu_ns = sm_pf_max_ns = 0; sm_pf_n = sm_pf_jobs = sm_pf_draws = 0;
@@ -3593,6 +3661,7 @@ static void sm_perf_report(const char *what, long now)
 	    what, win / 1e9, sm_pf_n, win ? sm_pf_n * 1e9 / win : 0.0, sm_pf_ns / 1e6 / n, sm_pf_max_ns / 1e6, sm_pf_gpu_ns / 1e6 / n, sm_pf_jobs,
 	    (double)sm_pf_draws / n, sm_pf_gap[0], sm_pf_gap[1], sm_pf_gap[2], sm_pf_gap[3]);
 	slog("SweetMTL: perf %s kernel: flush-before %.1fms job %.1fms flush-after %.1fms lock-wait %.1fms per commit", what, sm_pf_pre_ns / 1e6 / n, sm_pf_job_ns / 1e6 / n, sm_pf_post_ns / 1e6 / n, sm_pf_lock_ns / 1e6 / n);
+	if (sm_gap_tl[0]) slog("SweetMTL: perf %s gaps:%s", what, sm_gap_tl);
 	{
 		uint64_t f[16]; sm_fbstats(f);
 		uint64_t d[16]; for (int i = 0; i < 16; i++) d[i] = f[i] - sm_fbst0[i];
