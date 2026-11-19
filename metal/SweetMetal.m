@@ -593,6 +593,7 @@ static uint32_t sm_clear(sm_bo *desc, uint64_t target_va, uint32_t w, uint32_t h
 
 /* Clear + one non-indexed triangle list with the fixed Mesa-compiled shaders (VS_TRI / FS_GREEN):
  * MALLOC_VERTEX (IDVS + tiler) job on slot 1, then the FRAGMENT job on slot 0. */
+static int sm_draw_lines;   /* line test (sm_line_test): LINES instead of TRIANGLES */
 static uint32_t sm_draw(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w, uint32_t h, uint32_t stride,
     uint32_t packed, bool bgra, uint32_t vcount, uint32_t *vstatus)
 {
@@ -696,10 +697,10 @@ static uint32_t sm_draw(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 
 	void *vj = cpu + OFF_VJOB;
 	pan_section_pack(vj, MALLOC_VERTEX_JOB, PRIMITIVE, cfg) {
-		cfg.draw_mode = MALI_DRAW_MODE_TRIANGLES;
+		cfg.draw_mode = sm_draw_lines ? MALI_DRAW_MODE_LINES : MALI_DRAW_MODE_TRIANGLES;
 		cfg.index_count = vcount;
 		cfg.base_vertex_offset = 0;
-		cfg.allow_rotating_primitives = true;
+		cfg.allow_rotating_primitives = !sm_draw_lines;
 	}
 	pan_section_pack(vj, MALLOC_VERTEX_JOB, INSTANCE_COUNT, cfg) { cfg.count = 1; }
 	pan_section_pack(vj, MALLOC_VERTEX_JOB, ALLOCATION, cfg) {
@@ -711,7 +712,7 @@ static uint32_t sm_draw(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		cfg.scissor_minimum_x = 0; cfg.scissor_minimum_y = 0;
 		cfg.scissor_maximum_x = w - 1; cfg.scissor_maximum_y = h - 1;
 	}
-	pan_section_pack(vj, MALLOC_VERTEX_JOB, PRIMITIVE_SIZE, cfg) {}
+	pan_section_pack(vj, MALLOC_VERTEX_JOB, PRIMITIVE_SIZE, cfg) { if (sm_draw_lines) cfg.constant = 1.0f; }
 	pan_section_pack(vj, MALLOC_VERTEX_JOB, INDICES, cfg) { cfg.address = 0; }
 	pan_section_pack(vj, MALLOC_VERTEX_JOB, DRAW, cfg) {
 		cfg.allow_forward_pixel_to_kill = true;
@@ -3780,8 +3781,28 @@ static void sm_tour_crop(uint32_t shot, uint32_t x0, uint32_t y0, uint32_t cw, u
 	if (sm_nthdef < SM_THDEF_MAX) { sm_thdef[sm_nthdef].px = px; sm_thdef[sm_nthdef].n = n; sm_thdef[sm_nthdef].w = cw; sm_thdef[sm_nthdef].h = ch; sm_thdef[sm_nthdef].hi = true; sm_thdef[sm_nthdef++].id = shot; }
 	else free(px);
 }
+/* Control Center glyphs are spans drawn as MTLPrimitiveTypeLine (run219 audit: the glyph passes are line lists of
+ * 162-1342 vertices) and none of them appears. Fixed shaders into a 64x64 target: VS_TRI's first two vertices as one
+ * line (4,4)-(60,4), then the triangle; FS_GREEN pixels counted. */
+static void sm_line_test(void)
+{
+	static sm_bo desc, heap, tgt;
+	if (!sm_bo_alloc(&desc, 0x10000) || !sm_bo_alloc(&heap, 1u << 20) || !sm_bo_alloc(&tgt, 64 * 64 * 4)) { slog("SweetMTL: perf linetest: alloc failed"); return; }
+	uint32_t res[2] = { 0, 0 }, st[2] = { 0, 0 };
+	for (int pass = 0; pass < 2; pass++) {
+		memset(tgt.cpu, 0, 64 * 64 * 4); sm_flush_now(tgt.gpu, 64 * 64 * 4);
+		sm_draw_lines = pass == 0;
+		uint32_t vs = 0;
+		st[pass] = sm_draw(&desc, &heap, tgt.gpu, 64, 64, 256, 0, false, pass == 0 ? 2 : 3, &vs);
+		sm_flush_now(tgt.gpu, 64 * 64 * 4);
+		for (int i = 0; i < 64 * 64; i++) if (tgt.cpu[i * 4 + 1] > 200) res[pass]++;
+	}
+	sm_draw_lines = 0;
+	slog("SweetMTL: perf linetest: line %u px (status %x), triangle %u px (status %x)", res[0], st[0], res[1], st[1]);
+}
 static void sm_app_tour(void)
 {
+	sm_line_test();
 	static const struct { const char *n; int x, y; } A[] = {
 		{ "Photos", 174, 296 }, { "AppStore", 433, 296 }, { "Settings", 174, 571 },
 		{ "Phone", 310, 2238 }, { "Safari", 542, 2238 }, { "Messages", 836, 2238 },
@@ -3839,7 +3860,19 @@ static void sm_app_tour(void)
 		int sr = posix_spawn(&vp, "/usr/local/bin/vtprobe", NULL, NULL, va, environ);
 		int st = 0, done = 0;
 		for (int i = 0; i < 120 && sr == 0 && !done; i++) { usleep(500000); if (waitpid(vp, &st, WNOHANG) == vp) done = 1; }
-		if (sr == 0 && !done) kill(vp, SIGKILL);
+		if (sr == 0 && !done) {
+			/* where it hangs: the first 8 threads' stacks (image+offset), then kill */
+			mach_port_name_t vt = 0;
+			if (!task_for_pid(mach_task_self(), vp, &vt) && vt) {
+				thread_act_array_t th = NULL; mach_msg_type_number_t tc = 0;
+				if (!task_threads(vt, &th, &tc)) {
+					for (mach_msg_type_number_t i = 0; i < tc && i < 8; i++) { char w[24]; snprintf(w, sizeof w, "vthang T%u", i); sm_gap_line(w, vt, th[i], 0); }
+					for (mach_msg_type_number_t i = 0; i < tc; i++) mach_port_deallocate(mach_task_self(), th[i]);
+					vm_deallocate(mach_task_self(), (vm_address_t)th, tc * sizeof *th);
+				}
+			}
+			kill(vp, SIGKILL);
+		}
 		slog("SweetMTL: perf vt spawn %d pid %d %s status %#x", sr, vp, done ? "exited" : "HUNG (killed after 60 s)", st);
 		FILE *f = fopen("/private/var/tmp/vtprobe.txt", "r");
 		char ln[200]; int nn = 0;

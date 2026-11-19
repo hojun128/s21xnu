@@ -61,10 +61,12 @@ static void vt_session(CMFormatDescriptionRef fd, AVAsset *asset, AVAssetTrack *
 	OSStatus st = VTDecompressionSessionCreate(NULL, fd, (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)dst, &cb, &s);
 	lg("session (%s): create %d", nohw ? "no hw" : "default", (int)st);
 	if (st != noErr || !s) return;
+	lg("session: property");
 	CFBooleanRef hw = NULL;
 	if (VTSessionCopyProperty(s, kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder, NULL, &hw) == noErr && hw) {
 		lg("session: hardware decoder %d", CFBooleanGetValue(hw)); CFRelease(hw);
 	}
+	lg("session: reader");
 	NSError *e = nil;
 	AVAssetReader *rd = [AVAssetReader assetReaderWithAsset:asset error:&e];
 	AVAssetReaderTrackOutput *o = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:tr outputSettings:nil];
@@ -76,7 +78,9 @@ static void vt_session(CMFormatDescriptionRef fd, AVAsset *asset, AVAssetTrack *
 		CMSampleBufferRef sb = [o copyNextSampleBuffer];
 		if (!sb) break;
 		VTDecodeInfoFlags inf = 0;
+		if (fed == 0) lg("session: first decode call");
 		dst2 = VTDecompressionSessionDecodeFrame(s, sb, 0, NULL, &inf);
+		if (fed == 0) lg("session: first decode returned %d, frames %d", (int)dst2, vt_frames);
 		CFRelease(sb);
 		if (dst2 != noErr) break;
 	}
