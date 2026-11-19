@@ -837,8 +837,13 @@ static void sm_shader_desc(void *dst, const sm_shader *s, uint32_t stage, uint64
 		sp.register_allocation = wr > 32 ? MALI_SHADER_REGISTER_ALLOCATION_64_PER_THREAD : MALI_SHADER_REGISTER_ALLOCATION_32_PER_THREAD;
 		sp.binary = bin_va;
 		sp.preload.r48_r63 = (uint32_t)(preload >> 48);
-		/* experiment (run73): keep helper threads alive in poster fragment shaders, whose derivatives (earth) hung the GPU */
-		if (stage == MALI_SHADER_STAGE_FRAGMENT && sm_is_poster(getprogname())) sp.requires_helper_threads = true;
+		/* helper threads for every fragment shader (posters since run73, whose derivatives hung the GPU without them):
+		 * CoreAnimation's materials sample mip levels with an LOD bias, and with the helpers gone the 2x2 quads on a
+		 * triangle edge got a wrong LOD: every mesh edge of the Control Center / widget platters showed as a light line
+		 * (outer box, corner diagonal, dashed corner arc; run209 1:1 crop). Boot-arg sweetnohelpers=1: posters only. */
+		static int nohelp = -1;
+		if (nohelp < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; nohelp = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetnohelpers=1") ? 1 : 0; }
+		if (stage == MALI_SHADER_STAGE_FRAGMENT && (!nohelp || sm_is_poster(getprogname()))) sp.requires_helper_threads = true;
 	}
 }
 
