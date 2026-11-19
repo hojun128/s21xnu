@@ -434,7 +434,8 @@ static uint32_t sm_submit(uint32_t slot, uint64_t jc)
 	kern_return_t kr = 1;
 	static int rangemode = -1;   /* kernel selector 12: byte ranges + pre/post flags + timings */
 	if (rangemode < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; rangemode = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetnorange") ? 0 : 1; }
-	if (sm_listmode == 1 && rangemode == 1 && !sm_jover) {
+	/* range list: at most ~250 ranges; a pass reading more buffers (big Control Center passes) takes the BO list below */
+	if (sm_listmode == 1 && rangemode == 1 && !sm_jover && sm_njr < 200) {
 		const uint64_t PRE = 1ULL << 62, POST = 1ULL << 63;
 		static uint64_t R[512]; uint32_t n = 0;
 #define ADD(va_, len_, f_) do { if ((va_) && n < 254) { R[2 * n] = (va_); R[2 * n + 1] = ((len_) & 0xFFFFFFFFFFULL) | (f_); n++; } } while (0)
@@ -949,7 +950,7 @@ static uint32_t sm_clump(NSUInteger pf);
 static NSUInteger sm_target_pf = 80;   /* pixel format of the target sm_pass draws into (set by the caller) */
 /* draws that were not drawn: pass over SM_MAX_DRAWS, descriptor buffer full, unsupported primitive type, instanced */
 static volatile uint32_t sm_drop_many, sm_drop_room, sm_drop_type, sm_drop_inst;
-#define SM_MAX_DRAWS 256
+#define SM_MAX_DRAWS 640   /* Control Center frames go over 256 (run217 "too many draws"): the last draws, the glyphs, were dropped */
 /* render-target writeback for 1/2-byte targets: the tile buffer stays RGBA8 (Mesa BFMT R8/RG8/A8) */
 static uint32_t sm_rt_writeback(NSUInteger pf) { return pf == 1 || pf == 10 || pf == 11 ? MALI_COLOR_FORMAT_R8 : pf == 30 ? MALI_COLOR_FORMAT_R8G8 : MALI_COLOR_FORMAT_R8G8B8A8; }
 static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w, uint32_t h, uint32_t stride,
@@ -2329,7 +2330,10 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 			{ uint32_t bh = 0; bool sr = false; uint32_t bw = sm_astc(t.pixelFormat, &bh, &sr); r->tex[k].astc = 0;   /* ASTC is decoded on the CPU */
 			  if (bw && sm_astcgpu()) r->tex[k].astc = bw | (bh << 8) | (sr ? 1u << 16 : 0);   /* ... or sampled by the GPU */
 			  if (bw && t.width >= 1000 && !sm_astc_shot_done) sm_astc_shot_pending = true;   /* one shot of a pass drawing an app snapshot */
-			  if (bw) { static int nl; if (nl++ < 6) { uint64_t b0 = 0, b1 = 0; if (t.bo->cpu) { memcpy(&b0, t.bo->cpu, 8); memcpy(&b1, t.bo->cpu + 4096, 8); }
+			  /* first block and block 256, read only inside the texture: an imported 4 KiB image ending at a page edge made
+			   * the read at +4096 fault and killed backboardd (run217) */
+			  if (bw) { static int nl; if (nl++ < 6) { uint64_t b0 = 0, b1 = 0; uint64_t tb = (uint64_t)t.bytesPerRow * ((t.height + bh - 1) / (bh ? bh : 1));
+			    if (t.bo->cpu && tb >= 8) memcpy(&b0, t.bo->cpu, 8); if (t.bo->cpu && tb >= 4096 + 8) memcpy(&b1, t.bo->cpu + 4096, 8);
 			    slog("SweetMTL: astc draw tex%u pf%lu va %llx cpu %p blk0 %016llx blk256 %016llx", k, (unsigned long)t.pixelFormat, t.bo->gpu, t.bo->cpu, b0, b1); } } }
 			r->ntex = k + 1;
 			{
@@ -2877,7 +2881,7 @@ static void sm_tag_surfaces(NSArray *passes, uint64_t t)
 		pthread_mutex_lock(&sm_commit_mx);
 	}
 	static sm_bo desc; static bool have;
-	if (!have) { have = sm_bo_alloc(&desc, 0x10000 + 32 * SM_DRAW_STRIDE); if (have) { sm_always_add(&desc); sm_desc_va = desc.gpu; } }
+	if (!have) { have = sm_bo_alloc(&desc, 0x10000 + 112 * SM_DRAW_STRIDE);   /* 7.4 MiB: compact slots for up to SM_MAX_DRAWS */ if (have) { sm_always_add(&desc); sm_desc_va = desc.gpu; } }
 	_status = 4; /* MTLCommandBufferStatusCompleted */
 	sm_commits++;
 	{ static uint32_t armed_at; if (sm_pf_detail >= 2) { if (!armed_at) armed_at = sm_commits; if (sm_commits - armed_at >= 30) { sm_pf_detail = 1; sm_pf_dn = 0; armed_at = 0; } } }
@@ -3798,6 +3802,7 @@ static void sm_app_tour(void)
 	/* thumbnail run208: module 1 spans x 89..544, y 380..820 of 1125x2436, the Focus module starts at y ~1132 */
 	sm_tour_crop(30, 60, 350, 180, 120);
 	sm_tour_crop(31, 80, 1095, 180, 100);
+	slog("SweetMTL: perf cc drops since boot: many %u room %u type %u instanced %u", sm_drop_many, sm_drop_room, sm_drop_type, sm_drop_inst);
 	sm_drag(540, 2392, 540, 1000, 24); sleep(3);
 }
 /* Wi-Fi (kernel sweetwifi=4): wifid looks for the radio's interface once, when it starts (z3sios: "en0 must exist

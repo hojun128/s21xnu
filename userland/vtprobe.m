@@ -27,13 +27,18 @@ extern kern_return_t IOConnectCallMethod(io_connect_t, uint32_t, const uint64_t 
     uint64_t *, uint32_t *, void *, size_t *);
 
 static io_connect_t gc;
+/* user lines are not in the kernel's kept set and the 128 KiB ring loses them by the end of a run (run217): every line is
+ * kept here and the whole set is said again every 20 s, so the last copy is near the end of the ring */
+static char lines[40][160]; static int nlines;
+static void say(const char *b) { if (gc) IOConnectCallMethod(gc, 5, NULL, 0, b, strlen(b), NULL, NULL, NULL, NULL); }
 static void lg(const char *fmt, ...) __printflike(1, 2);
 static void lg(const char *fmt, ...)
 {
-	char b[200] = "vt: ";
+	char b[160] = "vt: ";
 	va_list ap; va_start(ap, fmt); vsnprintf(b + 4, sizeof b - 4, fmt, ap); va_end(ap);
 	fprintf(stderr, "%s\n", b);
-	if (gc) IOConnectCallMethod(gc, 5, NULL, 0, b, strlen(b), NULL, NULL, NULL, NULL);
+	if (nlines < 40) strlcpy(lines[nlines++], b, sizeof lines[0]);
+	say(b);
 }
 static const char *fcc(uint32_t c, char *b) { b[0] = c >> 24; b[1] = c >> 16; b[2] = c >> 8; b[3] = c; b[4] = 0; return b; }
 
@@ -148,11 +153,11 @@ int main(void)
 			io_service_t s = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("SweetMali"));
 			if (s) IOServiceOpen(s, mach_task_self(), 0, &gc); else sleep(2);
 		}
-		sleep(100);
+		sleep(60);
 		lg("probe start");
 		probe();
 		lg("probe done");
 	}
-	for (;;) pause();
+	for (int r = 0;; r++) { sleep(20); if (r < 60) for (int i = 0; i < nlines; i++) say(lines[i]); }
 	return 0;
 }
