@@ -33,6 +33,16 @@ extern kern_return_t IOConnectCallMethod(io_connect_t, uint32_t, const uint64_t 
 static io_connect_t sm_conn;
 static id sm_dbg_tex[4];          /* textures to thumbnail at the end of the run (rgb332 ids 14..17) */
 static volatile int sm_describe;   /* >0: describe the draws of the next passes (set after the unlock swipe) */
+/* Control Center audit (tour): every pass and draw of the latest frame (a frame = commits less than 30 ms apart), dumped
+ * once CC has settled: which draws make the glyphs that do not appear (user photo: Wi-Fi/BT/torch/volume glyphs missing) */
+static volatile int sm_ccaudit; static char sm_cc_buf[48 * 1024]; static size_t sm_cc_len; static uint64_t sm_cc_last;
+static void sm_cc_add(const char *fmt, ...) __printflike(1, 2);
+static void sm_cc_add(const char *fmt, ...)
+{
+	if (sm_cc_len > sizeof sm_cc_buf - 200) return;
+	va_list ap; va_start(ap, fmt); int n = vsnprintf(sm_cc_buf + sm_cc_len, sizeof sm_cc_buf - sm_cc_len, fmt, ap); va_end(ap);
+	if (n > 0) { sm_cc_len += (size_t)n < sizeof sm_cc_buf - sm_cc_len ? (size_t)n : 0; sm_cc_buf[sm_cc_len++] = '\n'; sm_cc_buf[sm_cc_len] = 0; }
+}
 
 /* Lines worth keeping are also collected here and replayed at the end of a test run: the 128 KiB pmsg ring
  * otherwise loses them under the thumbnails (run53). */
@@ -2343,6 +2353,8 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 			if (sm_describe > 0 && t.bo->cpu && sm_pf_bpp(t.pixelFormat) == 4 && r->tex[k].w >= 300) {
 				/* content summary of the bound texture (CPU view): which layer inputs are black */
 				const uint8_t *c = t.bo->cpu; uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0, nd = 0, nn = 0; uint32_t W = r->tex[k].w, H = r->tex[k].h, bpr = r->tex[k].stride;
+				/* only inside the CPU mapping: the padded GPU size of an imported texture ran past it and killed backboardd (run218) */
+				if (H && ((uint64_t)(H - 1) * bpr + (uint64_t)W * 4 > t.bo->size || (uint64_t)W * 4 > bpr)) H = 0;
 				for (uint32_t y = 0; y < H; y += H / 16 + 1) for (uint32_t x = 0; x < W; x += W / 16 + 1) { const uint8_t *q = c + (uint64_t)y * bpr + x * 4; s0 += q[0]; s1 += q[1]; s2 += q[2]; s3 += q[3]; nn++; if (q[0] < 8 && q[1] < 8 && q[2] < 8) nd++; }
 				static int ns; if (nn && ns++ < 40) slog("SweetMTL:  tstat %ux%u pf%lu%s%s: mean %llu %llu %llu a%llu dark %llu%%", W, H, (unsigned long)t.pixelFormat, t.bo->imported ? " imp" : "",
 				    [t sm_isShadowed] ? " shadow" : "", s0 / nn, s1 / nn, s2 / nn, s3 / nn, nd * 100 / nn);
@@ -2888,6 +2900,7 @@ static void sm_tag_surfaces(NSArray *passes, uint64_t t)
 	sm_cf_reset();
 	sm_cur_dn = 0;
 	uint64_t pf_t0 = sm_ns();
+	if (sm_ccaudit) { if (pf_t0 - sm_cc_last > 30000000ULL) sm_cc_len = 0; sm_cc_last = pf_t0; }
 	if (sm_pf_last) { uint64_t g = (pf_t0 - sm_pf_last) / 1000000; sm_pf_gap[g < 20 ? 0 : g < 40 ? 1 : g < 100 ? 2 : 3]++;
 		if (g >= 34 && sm_pf_win && sm_pf_last > sm_pf_win) { size_t L = strlen(sm_gap_tl); if (L < sizeof sm_gap_tl - 14) snprintf(sm_gap_tl + L, sizeof sm_gap_tl - L, " +%llu:%llu", (unsigned long long)((sm_pf_last - sm_pf_win) / 1000000), (unsigned long long)g); } }
 	sm_commit_th = pthread_mach_thread_np(pthread_self());
@@ -2900,6 +2913,18 @@ static void sm_tag_surfaces(NSArray *passes, uint64_t t)
 		if ([e isKindOfClass:[SweetMTLComputeEncoder class]]) { uint64_t c0 = sm_ns(), j0 = sm_pf_job_ns; if (!sm_gpu_off) [(SweetMTLComputeEncoder *)e sm_run]; sm_wd_add('C', 0, 0, 0, sm_pf_job_ns - j0, sm_ns() - c0); continue; }
 		if (!have || !e.target) { _status = 5; continue; }
 		sm_target_pf = e.target.pixelFormat;
+		if (sm_ccaudit) {
+			sm_cc_add("perf ccp %lux%lu pf%lu n%u load%d clear%d", (unsigned long)e.target.width, (unsigned long)e.target.height,
+			    (unsigned long)e.target.pixelFormat, e->_ndraw, e.load, e.clear);
+			for (uint32_t i = 0; i < e->_ndraw; i++) {
+				const sm_drawrec *o = &e->_draws[i]; const char *fn = o->fs ? o->fs->name : "GREEN";
+				if (!strncmp(fn, "com.apple.coreanimation.frag.", 29)) fn += 29;
+				char tb[96] = ""; int tl = 0;
+				for (uint32_t k = 0; k < o->ntex && k < 4; k++) tl += snprintf(tb + tl, sizeof tb - tl, " t%u:%ux%u/%u", k, o->tex[k].w, o->tex[k].h, o->tex[k].pf);
+				sm_cc_add("perf ccd %u %.34s v%u s%u b%u %u/%u/%u/%u w%x sc%u%s", i, fn, o->vcount, o->strip, o->blend_on, o->rgb_sf, o->rgb_df,
+				    o->a_sf, o->a_df, o->wmask, o->has_scissor, tb);
+			}
+		}
 		{ static int nf = -1; if (nf < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; nf = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetiosflush=1") ? 0 : 1; }
 		  sm_target_noflush = nf && e.target.iosurface && e.target.bo && e.target.bo->imported; }
 		if (sm_pf_bpp(e.target.pixelFormat) != 4 && sm_rt_writeback(e.target.pixelFormat) == MALI_COLOR_FORMAT_R8G8B8A8) {
@@ -3212,6 +3237,8 @@ static void sm_tag_surfaces(NSArray *passes, uint64_t t)
 
 /* ------------------------------------------------------------------ crash diagnostics */
 #include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <execinfo.h>
 #include <dlfcn.h>
 #include <sys/ucontext.h>
@@ -3796,9 +3823,30 @@ static void sm_app_tour(void)
 	}
 	/* Control Center (dashed lines along the module edges, user photo): open from the top-right corner, describe the
 	 * passes of its frames, whole-screen shot (48) and a 1:1 crop of the first module's top-left edge (30) */
-	sm_describe = 4;
+	sm_describe = 4; sm_cc_len = 0; sm_ccaudit = 1;
 	sm_drag(1000, 8, 1000, 1300, 20); sleep(3);
+	sm_ccaudit = 0;
 	sm_tour_shot(48);
+	/* glyph areas 1:1: Wi-Fi button (module 1 row 2 left) and the torch tile (bottom row left) */
+	sm_tour_crop(32, 120, 640, 180, 140);
+	sm_tour_crop(33, 90, 1400, 180, 140);
+	for (char *ln = sm_cc_buf; ln && *ln;) { char *nl = strchr(ln, '\n'); if (nl) *nl = 0; slog("SweetMTL: %s", ln); ln = nl ? nl + 1 : NULL; }
+	/* video (YouTube does not play): /usr/local/bin/vtprobe now (VideoToolbox / AVAssetReader / AVPlayer on an H.264 clip),
+	 * up to 60 s, its lines from /private/var/tmp/vtprobe.txt logged as kept "perf vt" lines */
+	if (!access("/usr/local/bin/vtprobe", X_OK)) {
+		unlink("/private/var/tmp/vtprobe.txt");
+		pid_t vp = 0; char *va[] = { "vtprobe", "now", NULL }; extern char **environ;
+		int sr = posix_spawn(&vp, "/usr/local/bin/vtprobe", NULL, NULL, va, environ);
+		int st = 0, done = 0;
+		for (int i = 0; i < 120 && sr == 0 && !done; i++) { usleep(500000); if (waitpid(vp, &st, WNOHANG) == vp) done = 1; }
+		if (sr == 0 && !done) kill(vp, SIGKILL);
+		slog("SweetMTL: perf vt spawn %d pid %d %s status %#x", sr, vp, done ? "exited" : "HUNG (killed after 60 s)", st);
+		FILE *f = fopen("/private/var/tmp/vtprobe.txt", "r");
+		char ln[200]; int nn = 0;
+		while (f && fgets(ln, sizeof ln, f) && nn < 40) { ln[strcspn(ln, "\n")] = 0; slog("SweetMTL: perf %s", ln); nn++; }
+		if (f) fclose(f);
+		if (!nn) slog("SweetMTL: perf vt: no output");
+	}
 	/* thumbnail run208: module 1 spans x 89..544, y 380..820 of 1125x2436, the Focus module starts at y ~1132 */
 	sm_tour_crop(30, 60, 350, 180, 120);
 	sm_tour_crop(31, 80, 1095, 180, 100);

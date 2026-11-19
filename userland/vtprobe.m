@@ -39,6 +39,8 @@ static void lg(const char *fmt, ...)
 	fprintf(stderr, "%s\n", b);
 	if (nlines < 40) strlcpy(lines[nlines++], b, sizeof lines[0]);
 	say(b);
+	/* the plugin in backboardd runs `vtprobe now` at the end of the test tour and logs this file (kept lines) */
+	FILE *o = fopen("/private/var/tmp/vtprobe.txt", "a"); if (o) { fprintf(o, "%s\n", b); fclose(o); }
 }
 static const char *fcc(uint32_t c, char *b) { b[0] = c >> 24; b[1] = c >> 16; b[2] = c >> 8; b[3] = c; b[4] = 0; return b; }
 
@@ -141,8 +143,12 @@ static void probe(void)
 	}
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	if (argc > 1 && !strcmp(argv[1], "now")) {   /* spawned by the plugin: probe at once, then exit */
+		@autoreleasepool { lg("probe start (now)"); probe(); lg("probe done"); }
+		return 0;
+	}
 	@autoreleasepool {
 		FILE *f = fopen("/usr/local/etc/sweet_epoch", "r");
 		long ep = 0;
