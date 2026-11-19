@@ -3800,6 +3800,45 @@ static void sm_app_tour(void)
 	sm_tour_crop(31, 80, 1095, 180, 100);
 	sm_drag(540, 2392, 540, 1000, 24); sleep(3);
 }
+/* Wi-Fi (kernel sweetwifi=4): wifid looks for the radio's interface once, when it starts (z3sios: "en0 must exist
+ * before wifid"); our en0 appears only after the firmware is up, so a wifid that started earlier never sees it and
+ * Settings shows Wi-Fi off (run214). From backboardd (root): when en0 first exists, a wifid older than that is
+ * stopped once; launchd starts it again (or on the next request) and the new one finds en0. */
+extern unsigned int if_nametoindex(const char *);
+static int sm_pid_of(const char *want)
+{
+	static int pids[1024]; int n = proc_listallpids(pids, sizeof pids); if (n > 1024) n = 1024;
+	for (int i = 0; i < n; i++) { char nm[40] = "?"; proc_name(pids[i], nm, sizeof nm); if (!strcmp(nm, want)) return pids[i]; }
+	return 0;
+}
+static void *sm_wifid_kick(void *arg)
+{
+	(void)arg;
+	struct timeval t0; gettimeofday(&t0, NULL);
+	for (int t = 0; t < 900; t++) {
+		sleep(1);
+		if (!if_nametoindex("en0")) continue;
+		struct timeval now; gettimeofday(&now, NULL);
+		int pid = sm_pid_of("wifid");
+		long st = 0;
+		if (pid) {
+			struct kinfo_proc kp; size_t len = sizeof kp; int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
+			memset(&kp, 0, sizeof kp);
+			if (sysctl(mib, 4, &kp, &len, NULL, 0) == 0) st = kp.kp_proc.p_starttime.tv_sec;
+		}
+		slog("SweetMTL: step wifid: en0 seen %ld s after backboardd's plugin start (first look %s), wifid pid %d started %ld s %s it",
+		    (long)(now.tv_sec - t0.tv_sec), t ? "later" : "at once", pid, st ? (long)(now.tv_sec - st) : -1L, "before");
+		if (pid && (t == 0 || st < now.tv_sec - 1)) {
+			int r = kill(pid, SIGTERM);
+			sleep(5);
+			int np = sm_pid_of("wifid");
+			slog("SweetMTL: step wifid: stopped %d (%d), now %d", pid, r, np);
+		}
+		return NULL;
+	}
+	slog("SweetMTL: step wifid: no en0 in 15 min");
+	return NULL;
+}
 static void *sm_watchdog(void *arg)
 {
 	uint32_t last = 0; int dumps = 0;
@@ -4146,6 +4185,7 @@ static void sm_layer_hooks(void)
 		_smPort = port; sm_device = self;
 		static dispatch_once_t wonce;
 		if (pn && strcmp(pn, "malitest")) dispatch_once(&wonce, ^{ pthread_t t; pthread_create(&t, NULL, sm_watchdog, NULL); pthread_detach(t); });
+		if (pn && !strcmp(pn, "backboardd")) { static dispatch_once_t konce; dispatch_once(&konce, ^{ pthread_t t; pthread_create(&t, NULL, sm_wifid_kick, NULL); pthread_detach(t); }); }
 	}
 	return self;
 }
