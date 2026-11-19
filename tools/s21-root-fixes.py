@@ -110,6 +110,14 @@ def main(root):
                     del j['EnvironmentVariables']
                 changed = True
             print('backboardd CA_FORCE_TIMER:', j.get('EnvironmentVariables', {}).get('CA_FORCE_TIMER'))
+    # Wi-Fi (kernel sweetwifi=4): wifid's job is limited to device trees with a 'wlan' or 'marconi-wifi' node, which
+    # ours has not, so launchd never started it and Settings showed Wi-Fi off (run215; z3sios drops the key too). Without
+    # a radio it comes up, finds no interface and idles (z3sios measured no cost).
+    for j in pl.get('LaunchDaemons', {}).values():
+        if isinstance(j, dict) and j.get('Label') == 'com.apple.wifid' and '_LimitLoadToDeviceTree' in j:
+            del j['_LimitLoadToDeviceTree']
+            changed = True
+            print('wifid: device tree limit removed')
     if changed:
         st = os.stat(path)
         with open(path, 'wb') as f:
