@@ -1486,7 +1486,7 @@ sweet_mali_blit(IOMemoryDescriptor *srcmd, uint64_t srcoff, uint32_t srcbpr, uin
 			/* never again with CS_COPY4; this frame falls back to the CPU copy */
 			smb_v4 = 0;
 			smb_fail++;
-			sm_log("gpucomp: CS_COPY4 job status %llx: back to the 1-pixel copy", r);
+			sm_log("gpucomp: CS_COPY4 job status %llx: back to the 1-pixel copy (ok %llu fail %llu)", r, smb_ok, smb_fail);
 		} else {
 			smb_fail++;
 			if (++smb_failrun >= 3) {
@@ -1508,9 +1508,9 @@ sweet_mali_blit(IOMemoryDescriptor *srcmd, uint64_t srcoff, uint32_t srcbpr, uin
 		if (smb_ok == 1 || (smb_ok % 300) == 0) {
 			{ uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
 			  sm_log("gpucomp: ok=%llu fail=%llu at %llus", smb_ok, smb_fail, ns / 1000000000ULL); }
-			sm_log("gpucomp: avg flush %llu us job %llu us, full flushes %llu; copy4 %llu jobs avg %llu us (w %u src %llx/%u)",
-			    smb_fl_ns / 1000 / (smb_ok ? smb_ok : 1), smb_job_ns / 1000 / (smb_ok ? smb_ok : 1), smb_flushes,
-			    smb_n4, smb_job4_ns / 1000 / (smb_n4 ? smb_n4 : 1), w, srcoff, srcbpr);
+			sm_log("gpucomp: avg flush %llu us job %llu us, full flushes %llu", smb_fl_ns / 1000 / (smb_ok ? smb_ok : 1),
+			    smb_job_ns / 1000 / (smb_ok ? smb_ok : 1), smb_flushes);
+			sm_log("gpucomp: copy4 %llu jobs avg %llu us (last w %llu)", smb_n4, smb_job4_ns / 1000 / (smb_n4 ? smb_n4 : 1), (uint64_t)w);
 		}
 	}
 out:

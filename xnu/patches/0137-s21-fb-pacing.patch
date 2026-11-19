@@ -1,8 +1,8 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 31cb9e7..e86e06f 100644
+index 31cb9e7..18aeef6 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -46,6 +46,39 @@ static int sweet_fb_gpu = -1;           /* boot-arg sweetgpucomp=1 */
+@@ -46,6 +46,50 @@ static int sweet_fb_gpu = -1;           /* boot-arg sweetgpucomp=1 */
  extern "C" void sweet_mali_log_str(const char *s);   /* bsd/dev/sweet_mali.c: line into the pmsg log */
  static uint64_t sweet_fb_presents;
  
@@ -32,6 +32,17 @@ index 31cb9e7..e86e06f 100644
 + * two thirds on re-open: "presents 31 of 61 swaps", runs 188-193). */
 +static int sweet_fb_surf;
 +static volatile uint64_t sweet_fb_n_surf;
++/* boot-arg sweetfb_gate2=1: freshest completed frame. A gated swap replaced by a newer one before its GPU work finished
++ * is kept (fPrev) and shown as soon as it completes, while the newer one waits for its own work; each swap gets its own
++ * 12-tick allowance. Before, the allowance was counted across replacing swaps: during a GPU-bound animation every
++ * swap was replaced while in flight, and after 200 ms the newest one was shown half-drawn ("fb gate timeout"), the
++ * flash when an app is reopened (runs 201-203). */
++static int sweet_fb_gate2;
++static volatile uint64_t sweet_fb_n_prev;
++/* screen off: one GPU fill with black (a zero row, source stride 0) instead of seven CPU passes over the uncached
++ * panel memory, which showed as a darkening sweep from the top (user report 2026-11-19) */
++class IOBufferMemoryDescriptor;
++static IOBufferMemoryDescriptor *sweet_fb_zero;
 +static volatile uint64_t sweet_fb_n_swaps, sweet_fb_n_presents, sweet_fb_n_defer, sweet_fb_n_timeout, sweet_fb_n_kick,
 +    sweet_fb_n_vsync, sweet_fb_n_dropped;
 +/* pacing witnesses: swap-to-swap interval histogram in vsync periods (1, 2, 3, more; gaps over 250 ms = idle, not
@@ -42,7 +53,15 @@ index 31cb9e7..e86e06f 100644
  #if defined(SWEET)
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
-@@ -106,6 +139,9 @@ class AppleCLCD : public IOMobileFramebuffer {
+@@ -54,6 +98,7 @@ static uint64_t sweet_fb_presents;
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+@@ -106,6 +151,9 @@ class AppleCLCD : public IOMobileFramebuffer {
  	uint64_t            fVsyncCount;
  
  	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
@@ -52,7 +71,7 @@ index 31cb9e7..e86e06f 100644
  
  public:
  	uint64_t      fPhys;
-@@ -124,15 +160,53 @@ public:
+@@ -124,15 +172,57 @@ public:
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
@@ -63,6 +82,10 @@ index 31cb9e7..e86e06f 100644
 +	bool          fGateValid;     /* the pending swap has a fence ticket (fLock) */
 +	uint32_t      fGateSlot, fGateGen, fGateTicks;
 +	uint64_t      fGateTicket;
++	uint8_t       fPrev[SWEET_FB_SWAP_REC_SIZE];        /* sweetfb_gate2: superseded swap whose work was still running */
++	bool          fPrevValid;
++	uint32_t      fPrevSlot, fPrevGen;
++	uint64_t      fPrevTicket;
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void addClient(IOMobileFramebufferUserClient *client);
@@ -79,7 +102,7 @@ index 31cb9e7..e86e06f 100644
 +sweet_fb_gpu_kick(void)
 +{
 +	AppleCLCD *fb = sweet_fb_main;
-+	if (fb != NULL && fb->fKick != NULL && fb->fGateValid) {
++	if (fb != NULL && fb->fKick != NULL && (fb->fGateValid || fb->fPrevValid)) {
 +		fb->fKick->setTimeoutUS(1);
 +	}
 +}
@@ -107,13 +130,14 @@ index 31cb9e7..e86e06f 100644
  
  class IOMobileFramebufferUserClient : public IOUserClient {
  	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
-@@ -203,6 +277,23 @@ AppleCLCD::start(IOService *provider)
+@@ -203,6 +293,24 @@ AppleCLCD::start(IOService *provider)
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
 +	PE_parse_boot_argn("sweetvsync_abs", &sweet_fb_abs, sizeof(sweet_fb_abs));
 +	PE_parse_boot_argn("sweetfb_gate", &sweet_fb_gate, sizeof(sweet_fb_gate));
 +	PE_parse_boot_argn("sweetfb_surf", &sweet_fb_surf, sizeof(sweet_fb_surf));
++	PE_parse_boot_argn("sweetfb_gate2", &sweet_fb_gate2, sizeof(sweet_fb_gate2));
 +	PE_parse_boot_argn("sweetfbmark", &sweet_fb_mark, sizeof(sweet_fb_mark));
 +	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000ULL, &fPeriod);
 +	fKick = IOTimerEventSource::timerEventSource(this, &AppleCLCD::kickFired);
@@ -131,7 +155,7 @@ index 31cb9e7..e86e06f 100644
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
-@@ -223,8 +314,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -223,8 +331,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	uint64_t values[6] = {
  		(uint32_t)count, (uint32_t)(count >> 32),
  		(uint32_t)now, (uint32_t)(now >> 32),
@@ -143,7 +167,40 @@ index 31cb9e7..e86e06f 100644
  
  	IOLockLock(fb->fLock);
  	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
-@@ -247,24 +340,93 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -233,38 +343,140 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
+-		/* Fade out: halve every channel each vsync, then black, then idle. */
++		/* off: the panel goes black at once (GPU fill of a zero row, else CPU stores), then idle */
+ 		uint32_t step = fb->fFadeStep;
+-		if (step <= 6) {
+-			fb->fFadeStep = step + 1;
++		if (step == 0) {
++			fb->fFadeStep = 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
+-		if (step <= 6) {
+-			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
++		if (step == 0) {
++			bool done = false;
++			if (sweet_fb_gpu == 1) {
++				if (sweet_fb_zero == NULL) {
++					sweet_fb_zero = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, 16384, 4096);
++					if (sweet_fb_zero != NULL) {
++						bzero(sweet_fb_zero->getBytesNoCopy(), 16384);
++					}
++				}
++				done = sweet_fb_zero != NULL && fb->fRowBytes >= fb->fWidth * 4 && fb->fWidth * 4 <= 16384 &&
++				    sweet_mali_blit(sweet_fb_zero, 0, 0, fb->fPhys, fb->fRowBytes, (uint64_t)fb->fRowBytes * fb->fHeight, 0,
++				    fb->fWidth, fb->fHeight) == 0;
++			}
++			if (!done) {
++				for (uint32_t y = 0; y < fb->fHeight; y++) {
++					bzero((void *)(fb->fPixels + (uint64_t)y * fb->fRowBytes), (size_t)fb->fWidth * 4);
  				}
  			}
  		}
@@ -198,9 +255,30 @@ index 31cb9e7..e86e06f 100644
 +		return NULL;
 +	}
 +	if (fGateValid && !sweet_gpu_fence_ready(fGateSlot, fGateGen, fGateTicket)) {
++		if (fPrevValid && sweet_gpu_fence_ready(fPrevSlot, fPrevGen, fPrevTicket)) {
++			/* sweetfb_gate2: the older swap's work is done, the newer one's is not: show the older one now */
++			uint8_t *prec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++			if (prec == NULL) {
++				return NULL;
++			}
++			memcpy(prec, fPrev, SWEET_FB_SWAP_REC_SIZE);
++			fPrevValid = false;
++			fLastPresentAbs = mach_absolute_time();
++			sweet_fb_n_presents++;
++			sweet_fb_n_prev++;
++			if (!tick) {
++				sweet_fb_n_kick++;
++			}
++			if (sweet_fb_n_prev <= 2 || (sweet_fb_n_prev % 500) == 0) {
++				char ln[80];
++				snprintf(ln, sizeof(ln), "fb gate2: %llu older completed frames shown", sweet_fb_n_prev);
++				sweet_mali_log_str(ln);
++			}
++			return prec;
++		}
 +		if (!tick) {
 +			return NULL;   /* kick before completion (another process's work): wait for the right one */
- 		}
++		}
 +		if (fGateTicks < SWEET_FB_GATE_MAX_TICKS) {
 +			fGateTicks++;
 +			sweet_fb_n_defer++;
@@ -212,16 +290,17 @@ index 31cb9e7..e86e06f 100644
 +			snprintf(ln, sizeof(ln), "fb gate timeout %llu: ticket %llu not done after %u ticks, shown anyway",
 +			    sweet_fb_n_timeout, fGateTicket, fGateTicks);
 +			sweet_mali_log_str(ln);
-+		}
-+	}
+ 		}
+ 	}
 +	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
 +	if (rec == NULL) {
 +		return NULL;
- 	}
++	}
 +	memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
 +	fDirty = false;
 +	fGateValid = false;
 +	fGateTicks = 0;
++	fPrevValid = false;   /* older than what is shown now */
 +	fLastPresentAbs = mach_absolute_time();
 +	sweet_fb_n_presents++;
 +	if (!tick) {
@@ -245,7 +324,7 @@ index 31cb9e7..e86e06f 100644
  }
  
  void
-@@ -305,12 +467,65 @@ static uint64_t sweet_fb_swap_count;
+@@ -305,12 +517,80 @@ static uint64_t sweet_fb_swap_count;
   * default 10 Hz).
   */
  void
@@ -276,7 +355,22 @@ index 31cb9e7..e86e06f 100644
 +	}
  	IOLockLock(fLock);
 +	if (fDirty) {
-+		sweet_fb_n_dropped++;   /* the previous swap was never shown (latest wins) */
++		if (sweet_fb_gate2 && fGateValid && !fPowerOff && !sweet_gpu_fence_ready(fGateSlot, fGateGen, fGateTicket)) {
++			/* still rendering: keep it, it may complete before the new one and be shown in its place */
++			if (fPrevValid) {
++				sweet_fb_n_dropped++;
++			}
++			memcpy(fPrev, fPending, SWEET_FB_SWAP_REC_SIZE);
++			fPrevValid = true;
++			fPrevSlot = fGateSlot;
++			fPrevGen = fGateGen;
++			fPrevTicket = fGateTicket;
++		} else {
++			sweet_fb_n_dropped++;   /* the previous swap was never shown (latest wins) */
++		}
++	}
++	if (sweet_fb_gate2) {
++		fGateTicks = 0;   /* this swap's own allowance */
 +	}
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
@@ -312,7 +406,7 @@ index 31cb9e7..e86e06f 100644
  	if ((++sweet_fb_swap_count % 1000) == 0) {
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  	}
-@@ -430,7 +645,7 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -430,7 +710,7 @@ AppleCLCD::present(const uint8_t *rec)
  		sweet_mali_log_str(line);
  	}
  	/* S21 GPU compositing marker: 16x16 top-left, green = GPU copied this frame, red = CPU */
@@ -321,7 +415,7 @@ index 31cb9e7..e86e06f 100644
  		uint32_t c = cpu_layers == 0 ? 0xFF00FF00u : 0xFFFF0000u;
  		for (uint32_t y = 0; y < 16 && y < fHeight; y++) {
  			uint32_t *row = (uint32_t *)(fPixels + (uint64_t)(y + 120) * fRowBytes);
-@@ -539,7 +754,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -539,7 +819,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  			break;
  		}
  		memcpy(rec, args->structureInput, sizeof(rec));

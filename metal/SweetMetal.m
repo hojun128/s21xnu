@@ -336,7 +336,7 @@ static void sm_capture(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, u
 /* Thumbnail through the log (the rootfs is a RAM overlay, so files do not survive): 1/12 scale, RGB332,
  * base64 in 112-char lines "THn <seq> <data>"; the Mac rebuilds a PNG from the pstore log. */
 #include <zlib.h>
-#define SM_THDEF_MAX 16
+#define SM_THDEF_MAX 24
 static struct { uint8_t *px; uint32_t n, w, h, id; bool hi; } sm_thdef[SM_THDEF_MAX]; static int sm_nthdef;
 static void sm_thumb_emit(const uint8_t *px, uint32_t n, uint32_t w, uint32_t h, uint32_t id, bool hi);
 static void sm_thumb_ex(const uint8_t *c, uint32_t W, uint32_t H, uint32_t bpr, uint32_t id, uint32_t S, bool hi);
@@ -938,6 +938,9 @@ static void sm_pack_tls(void *dst, uint32_t tls)
 static uint32_t sm_astc_dim(uint32_t d);
 static uint32_t sm_clump(NSUInteger pf);
 static NSUInteger sm_target_pf = 80;   /* pixel format of the target sm_pass draws into (set by the caller) */
+/* draws that were not drawn: pass over SM_MAX_DRAWS, descriptor buffer full, unsupported primitive type, instanced */
+static volatile uint32_t sm_drop_many, sm_drop_room, sm_drop_type, sm_drop_inst;
+#define SM_MAX_DRAWS 256
 /* render-target writeback for 1/2-byte targets: the tile buffer stays RGBA8 (Mesa BFMT R8/RG8/A8) */
 static uint32_t sm_rt_writeback(NSUInteger pf) { return pf == 1 || pf == 10 || pf == 11 ? MALI_COLOR_FORMAT_R8 : pf == 30 ? MALI_COLOR_FORMAT_R8G8 : MALI_COLOR_FORMAT_R8G8B8A8; }
 static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w, uint32_t h, uint32_t stride,
@@ -1058,6 +1061,16 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		/* compact draw slots: 4 KiB of descriptors + the two shader binaries (was a fixed 64 KiB per draw, all of it
 		 * cache-flushed before and after every job: ~7 MiB x 4 per scrolling frame) */
 		uint32_t base = compact ? sm_slot_cur : 0x10000 + i * SM_DRAW_STRIDE;
+		{
+			/* passes may now hold more than 32 draws: stay inside the descriptor buffer */
+			uint64_t need = compact ? 0x1000 + ((r->vs ? r->vs->size : 0) + 127) + ((r->fs ? r->fs->size : (uint32_t)sizeof FS_GREEN) + 127) + 0x1000
+			                        : SM_DRAW_STRIDE;
+			if ((uint64_t)base + need > desc->size) {
+				sm_drop_room++;
+				static int nl; if (nl++ < 4) slog("SweetMTL: descriptor buffer full at draw %u of %u (pass %ux%u)", i, ndraw, w, h);
+				continue;
+			}
+		}
 		uint8_t *P = cpu + base; uint64_t PV = D + base;
 		memset(P, 0, 0x1000);
 		const sm_shader *vs = r->vs, *fs = r->fs;
@@ -1180,9 +1193,12 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 		uint32_t nvar = vs->nvar; if (fs && fs->nvar > nvar) nvar = fs->nvar;
 		void *vj = P;
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, PRIMITIVE, cfg) {
-			cfg.draw_mode = r->strip ? MALI_DRAW_MODE_TRIANGLE_STRIP : MALI_DRAW_MODE_TRIANGLES; cfg.index_count = r->vcount;
+			/* strip: 0 triangles, 1 triangle strip, 2 lines, 3 line strip (hairlines: table separators were dropped) */
+			cfg.draw_mode = r->strip == 1 ? MALI_DRAW_MODE_TRIANGLE_STRIP : r->strip == 2 ? MALI_DRAW_MODE_LINES :
+			    r->strip == 3 ? MALI_DRAW_MODE_LINE_STRIP : MALI_DRAW_MODE_TRIANGLES;
+			cfg.index_count = r->vcount;
 			cfg.index_type = r->index_type; cfg.base_vertex_offset = r->index_type ? r->base_vertex : (int32_t)r->vstart;
-			cfg.allow_rotating_primitives = true; cfg.secondary_shader = sec;
+			cfg.allow_rotating_primitives = r->strip < 2; cfg.secondary_shader = sec;   /* Mesa: never for lines */
 		}
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, INSTANCE_COUNT, cfg) { cfg.count = 1; }
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, ALLOCATION, cfg) {
@@ -1194,7 +1210,7 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 			if (r->has_scissor) { cfg.scissor_minimum_x = r->sc_x0; cfg.scissor_minimum_y = r->sc_y0; cfg.scissor_maximum_x = r->sc_x1; cfg.scissor_maximum_y = r->sc_y1; }
 			else { cfg.scissor_minimum_x = 0; cfg.scissor_minimum_y = 0; cfg.scissor_maximum_x = w - 1; cfg.scissor_maximum_y = h - 1; }
 		}
-		pan_section_pack(vj, MALLOC_VERTEX_JOB, PRIMITIVE_SIZE, cfg) {}
+		pan_section_pack(vj, MALLOC_VERTEX_JOB, PRIMITIVE_SIZE, cfg) { if (r->strip >= 2) cfg.constant = 1.0f; }   /* Metal lines: 1 px */
 		pan_section_pack(vj, MALLOC_VERTEX_JOB, INDICES, cfg) { cfg.address = r->index_va; }
 		/* forward pixel kill would drop the earlier draws' pixels under a draw that reads them back
 		 * (framebuffer fetch, blending) or may not write them (discard): luma_boost read 0 (run37) */
@@ -2066,7 +2082,9 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 	uint64_t _buf[31];
 	__unsafe_unretained SweetMTLTexture *_tex[8];
 	__unsafe_unretained SweetMTLSampler *_smp[8];
-	sm_drawrec _draws[32];
+	sm_drawrec _draws0[32];   /* inline room; */
+	sm_drawrec *_draws;       /* _draws0, or a heap array once a pass has more than 32 draws (Settings lists, run202) */
+	uint32_t _dcap;
 	uint32_t _ndraw, _skipped;
 	uint64_t _bufBase[31];
 	uint64_t _fbuf[31], _fbufBase[31];
@@ -2074,7 +2092,29 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 	BOOL _hasScissor;
 	uint32_t _mOff, _mN;   /* pass merge (sweetmerge=1): this pass draws sm_mbuf[_mOff.._mOff+_mN) instead of its own */
 }
-- (instancetype)init { self = [super init]; _keep = [NSMutableArray array]; return self; }
+- (instancetype)init { self = [super init]; _keep = [NSMutableArray array]; _draws = _draws0; _dcap = 32; return self; }
+- (void)dealloc { if (_draws && _draws != _draws0) free(_draws); }
+/* room for extra more draws (the array grows up to SM_MAX_DRAWS; was a fixed 32: later draws were dropped) */
+- (bool)sm_room:(uint32_t)extra
+{
+	static uint32_t maxd;
+	if (!maxd) {
+		char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; maxd = SM_MAX_DRAWS;
+		const char *q = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 ? strstr(ba, "sweetmaxdraws=") : NULL;   /* 32 = the old limit */
+		if (q) { maxd = (uint32_t)atoi(q + 14); if (maxd < 32) maxd = 32; if (maxd > SM_MAX_DRAWS) maxd = SM_MAX_DRAWS; }
+	}
+	if (!_draws) { _draws = _draws0; _dcap = 32; }
+	if (_ndraw + extra <= _dcap) return true;
+	uint32_t nc = _dcap * 2; if (nc > maxd) nc = maxd;
+	if (_ndraw + extra > nc) return false;
+	sm_drawrec *n = malloc(nc * sizeof(sm_drawrec));
+	if (!n) return false;
+	memcpy(n, _draws, _ndraw * sizeof(sm_drawrec));
+	if (_draws != _draws0) free(_draws);
+	_draws = n; _dcap = nc;
+	static int nl; if (nl++ < 4) slog("SweetMTL: pass grew to %u draw slots", nc);
+	return true;
+}
 - (void)endEncoding {}
 - (void)setRenderPipelineState:(id)ps { _pipeline = ps; }
 - (void)setViewport:(MTLViewport)vp {}
@@ -2125,6 +2165,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count instanceCount:(NSUInteger)ic
 {
 	if (ic == 1) [self drawPrimitives:type vertexStart:start vertexCount:count];
+	else if (ic) { sm_drop_inst++; static int nl; if (nl++ < 4) slog("SweetMTL: instanced draw dropped (%lu instances)", (unsigned long)ic); }
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)it indexBuffer:(id)ib indexBufferOffset:(NSUInteger)off
 {
@@ -2166,7 +2207,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 {
 	static int off = -1;
 	if (off < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; off = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetnosplit=1") ? 1 : 0; }
-	if (off || !_ndraw || _ndraw >= 32) return;
+	if (off || !_ndraw || ![self sm_room:1]) return;
 	sm_drawrec *r = &_draws[_ndraw - 1];
 	struct MALI_BLEND_FUNCTION f;
 	if (!r->blend_on || r->rgb_op != MTLBlendOperationAdd || sm_blend_func(r->rgb_op, r->rgb_sf, r->rgb_df, &f)) return;
@@ -2190,14 +2231,19 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 }
 - (sm_drawrec *)sm_record:(MTLPrimitiveType)type
 {
-	if (type != MTLPrimitiveTypeTriangle && type != MTLPrimitiveTypeTriangleStrip) {
+	static int lines = -1;
+	if (lines < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; lines = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetnolines=1") ? 0 : 1; }
+	bool line = type == MTLPrimitiveTypeLine || type == MTLPrimitiveTypeLineStrip;
+	if ((type != MTLPrimitiveTypeTriangle && type != MTLPrimitiveTypeTriangleStrip && !line) || (line && !lines)) {
+		sm_drop_type++;
 		static int nl; if (nl++ < 4) slog("SweetMTL: draw type %lu not supported yet", (unsigned long)type);
 		return NULL;
 	}
-	if (_ndraw >= 32) { static int nl; if (nl++ < 4) slog("SweetMTL: too many draws in one pass"); return NULL; }
+	if (![self sm_room:2]) { sm_drop_many++; static int nl; if (nl++ < 4) slog("SweetMTL: too many draws in one pass (%u)", _ndraw); return NULL; }
 	sm_drawrec *r = &_draws[_ndraw];
 	memset(r, 0, sizeof *r);
-	r->strip = type == MTLPrimitiveTypeTriangleStrip;
+	r->strip = type == MTLPrimitiveTypeTriangleStrip ? 1 : type == MTLPrimitiveTypeLine ? 2 : type == MTLPrimitiveTypeLineStrip ? 3 : 0;
+	if (r->strip >= 2) { static int nl; if (nl++ < 4) slog("SweetMTL: line draw (type %lu)", (unsigned long)type); }
 	if (_hasScissor && _target) {
 		uint32_t W = (uint32_t)_target.width, H = (uint32_t)_target.height;
 		uint32_t x0 = (uint32_t)_scissor.x, y0 = (uint32_t)_scissor.y;
@@ -3553,6 +3599,8 @@ static void sm_perf_report(const char *what, long now)
 		slog("SweetMTL: perf %s panel: %.1f presents/s (swaps %llu presents %llu dropped %llu gated %llu timeout %llu kick %llu surf %llu mode %llu) async %d full %u texwait %u drain %u merged %u hoisted %u",
 		    what, win ? d[1] * 1e9 / win : 0.0, d[0], d[1], d[6], d[2], d[3], d[4], d[15], f[7], sm_async, sm_q_full, sm_q_texwaits, sm_q_drains, sm_merge_saved, sm_merge_hoisted);
 	}
+	if (sm_drop_many | sm_drop_room | sm_drop_type | sm_drop_inst)
+		slog("SweetMTL: perf %s drops since boot: many %u room %u type %u instanced %u", what, sm_drop_many, sm_drop_room, sm_drop_type, sm_drop_inst);
 	if (sm_worst_ns >= 30000000ULL && sm_worst_dn) {
 		/* where the slowest command buffer of the window spent its time (largest items first, up to two lines) */
 		sm_wd t[48]; uint32_t n = sm_worst_dn; memcpy(t, sm_worst_d, n * sizeof *t);
@@ -3588,6 +3636,23 @@ static void sm_tour_shot(uint32_t shot)
 	sm_flush_now(tx.bo->gpu, (uint64_t)tx.bytesPerRow * tx.height);   /* GPU-only target: invalidate before the CPU read */
 	sm_thumb_ex(tx.bo->cpu, (uint32_t)tx.width, (uint32_t)tx.height, (uint32_t)tx.bytesPerRow, 0x100 | shot, 12, false);
 }
+/* full-resolution crop (x, y, w, h in target pixels), RGB565 zlib: fine detail such as dashed tile edges */
+static void sm_tour_crop(uint32_t shot, uint32_t x0, uint32_t y0, uint32_t cw, uint32_t ch)
+{
+	SweetMTLTexture *tx = sm_last_target;
+	if (!tx || !tx.bo || !tx.bo->cpu || x0 + cw > tx.width || y0 + ch > tx.height) { slog("SweetMTL: tour crop %u: no target", shot); return; }
+	sm_flush_now(tx.bo->gpu, (uint64_t)tx.bytesPerRow * tx.height);
+	uint32_t n = cw * ch * 2; uint8_t *px = malloc(n); if (!px) return;
+	const uint8_t *c = tx.bo->cpu; NSUInteger bpr = tx.bytesPerRow;
+	for (uint32_t y = 0; y < ch; y++) for (uint32_t x = 0; x < cw; x++) {
+		const uint8_t *q = c + (size_t)(y0 + y) * bpr + (size_t)(x0 + x) * 4;
+		uint16_t v = (uint16_t)(((q[2] >> 3) << 11) | ((q[1] >> 2) << 5) | (q[0] >> 3));
+		px[2 * (y * cw + x)] = (uint8_t)v; px[2 * (y * cw + x) + 1] = (uint8_t)(v >> 8);
+	}
+	slog("SweetMTL: tour crop %u at %u,%u of %lux%lu", shot, x0, y0, (unsigned long)tx.width, (unsigned long)tx.height);
+	if (sm_nthdef < SM_THDEF_MAX) { sm_thdef[sm_nthdef].px = px; sm_thdef[sm_nthdef].n = n; sm_thdef[sm_nthdef].w = cw; sm_thdef[sm_nthdef].h = ch; sm_thdef[sm_nthdef].hi = true; sm_thdef[sm_nthdef++].id = shot; }
+	else free(px);
+}
 static void sm_app_tour(void)
 {
 	static const struct { const char *n; int x, y; } A[] = {
@@ -3603,12 +3668,17 @@ static void sm_app_tour(void)
 			if (meas) sm_perf_reset();
 			kern_return_t k = sm_tap(A[i].x, A[i].y);
 			if (meas) {
-				/* mid-animation shot (the card zooming in: where a wrong shader or snapshot shows), ids 6x open, 5x reopen */
-				usleep(350000); sm_tour_shot((round ? 50 : 60) + i);
-				usleep(2650000); snprintf(w, sizeof w, "%s-%s", round ? "reopen" : "open", A[i].n); sm_perf_report(w, 0);
+				/* reopen: mid-animation shot (the card zooming in, where a stale or half-drawn frame flashes), ids 5x */
+				if (round) { usleep(350000); sm_tour_shot(50 + i); usleep(2650000); } else sleep(3);
+				snprintf(w, sizeof w, "%s-%s", round ? "reopen" : "open", A[i].n); sm_perf_report(w, 0);
 			}
 			sleep(meas ? 6 : 12);
 			if (round == 0) sm_tour_shot(40 + i);   /* the app as opened, ids 40-45 */
+			if (round == 0 && !strcmp(A[i].n, "Settings")) {
+				/* rows vanished while the list scrolled (user photo): two flicks, a shot mid-scroll (46) and settled (47) */
+				sm_drag(540, 1900, 540, 900, 20); usleep(150000); sm_tour_shot(46);
+				sm_drag(540, 1900, 540, 900, 20); usleep(1800000); sm_tour_shot(47);
+			}
 			uint32_t c1 = sm_commits;
 			slog("SweetMTL: app %s tap kr=%x commits +%u", A[i].n, k, c1 - c0);
 			if (meas) sm_perf_reset();
@@ -3618,6 +3688,13 @@ static void sm_app_tour(void)
 			slog("SweetMTL: app %s home commits +%u", A[i].n, sm_commits - c1);
 		}
 	}
+	/* Control Center (dashed lines along the module edges, user photo): open from the top-right corner, describe the
+	 * passes of its frames, whole-screen shot (48) and a 1:1 crop of the first module's top-left edge (30) */
+	sm_describe = 4;
+	sm_drag(1000, 8, 1000, 1300, 20); sleep(3);
+	sm_tour_shot(48);
+	sm_tour_crop(30, 30, 250, 180, 120);
+	sm_drag(540, 2392, 540, 1000, 24); sleep(3);
 }
 static void *sm_watchdog(void *arg)
 {
