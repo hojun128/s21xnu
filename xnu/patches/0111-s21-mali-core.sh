@@ -972,6 +972,10 @@ static struct g2dom {
 };
 #define G2_N (sizeof(g2) / sizeof(g2[0]))
 static uint32_t g2_ticks[8][2];
+/* boot-arg sweetgovturbo=1: the big clusters' real tops (A78 2808, X1 2912 MHz) as an extra rung that only the touch
+ * head (130 ms after a finger event) may pick; load alone stays capped at the old tops (2080/2288) for heat. The
+ * reopen hitch (run212 gap samples) is SpringBoard's main thread computing ~130 ms after the finger lifts. */
+static int g2_turbo;
 static uint64_t g2_busy_last, g2_tick_last, g2_touch_abs, g2_changes;
 
 void sweet_gov_touch(void);
@@ -1051,21 +1055,28 @@ gov2_run(void)
 	for (unsigned i = 0; i < G2_N; i++) {
 		struct g2dom *d = &g2[i];
 		int n = g2_nrung(d), want;
-		int cur = d->cur < 0 ? n - 1 : d->cur;
+		int turbo_rung = g2_turbo && d->ncpu && (d == &g2[1] || d == &g2[2]) ? n - 1 : -1;
+		int nload = turbo_rung >= 0 ? n - 1 : n;   /* rungs the load path may use */
+		int cur = d->cur < 0 ? nload - 1 : d->cur;
 		if (sweet_thermal_cap || idle) {
 			want = 0;
 		} else if (busy[i] >= (int)d->jump) {
-			want = n - 1;
+			want = touching_head && turbo_rung >= 0 ? turbo_rung : nload - 1;
 		} else {
-			uint64_t need = busy[i] > 0 ? (uint64_t)d->rung[cur] * (uint64_t)busy[i] / d->aim : 0;
+			uint64_t need = busy[i] > 0 ? (uint64_t)d->rung[cur < nload ? cur : nload - 1] * (uint64_t)busy[i] / d->aim : 0;
 			want = 0;
-			while (want < n - 1 && d->rung[want] < need) {
+			while (want < nload - 1 && d->rung[want] < need) {
 				want++;
 			}
-			if (touching_head && want < (int)d->head) {
+			if (touching_head && turbo_rung >= 0) {
+				want = turbo_rung;
+			} else if (touching_head && want < (int)d->head) {
 				want = (int)d->head;
 			} else if (touching_tail && want < (int)d->tail) {
 				want = (int)d->tail;
+			}
+			if (!touching_head && cur > nload - 1) {
+				cur = nload - 1;   /* off the turbo rung as soon as the head is over (no 300 ms hold up there) */
 			}
 			if (want < cur) {
 				want = now >= d->down_ok ? cur - 1 : cur;   /* down one rung at a time */
@@ -1183,6 +1194,11 @@ gov_start(void)
 			g2[1].head = 3; g2[1].tail = 2;
 			g2[2].head = 3; g2[2].tail = 2;
 			g2[3].head = 4; g2[3].tail = 3;
+		}
+		PE_parse_boot_argn("sweetgovturbo", &g2_turbo, sizeof(g2_turbo));
+		if (g2_turbo) {
+			g2[1].rung[4] = 2808000;
+			g2[2].rung[4] = 2912000;
 		}
 	}
 	PE_parse_boot_argn("sweetgov_gpu_ms", &gov_gpu_ms, sizeof(gov_gpu_ms));

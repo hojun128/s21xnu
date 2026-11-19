@@ -3774,6 +3774,9 @@ static void sm_app_tour(void)
 			sleep(meas ? 6 : 12);
 			if (round == 0) sm_tour_shot(40 + i);   /* the app as opened, ids 40-45 */
 			if (round == 0 && !strcmp(A[i].n, "Settings")) {
+				/* Wi-Fi (kernel sweetwifi=4): the Wi-Fi row (third, panel y ~915), the page after its scan (49), back */
+				sm_tap(400, 915); sleep(5); sm_tour_shot(49);
+				sm_tap(90, 175); usleep(1500000);
 				/* rows vanished while the list scrolled (user photo): two flicks, a shot mid-scroll (46) and settled (47) */
 				sm_drag(540, 1900, 540, 900, 20); usleep(150000); sm_tour_shot(46);
 				sm_drag(540, 1900, 540, 900, 20); usleep(1800000); sm_tour_shot(47);

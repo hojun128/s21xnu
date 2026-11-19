@@ -43,11 +43,18 @@ done
 for f in redwood_net.h redwood_sta.h redwood_input.h; do
 	cp "$z3s_tmp/$f" bsd/sys/
 done
+# their printf lines (wifid's Apple80211 requests, en0's events) go to the console, which this kernel does not keep:
+# routed to sweet_wifi_printf (bsd/dev/sweet_wifi.c: the persistent log, the first 150 lines kept)
+for f in redwood_net.c redwood_apple80211.c; do
+	perl -pi -e 's/\bprintf\(/sweet_wifi_printf(/g' "bsd/dev/$f"
+	perl -0pi -e 's/\A/int sweet_wifi_printf(const char *, ...) __attribute__((format(printf, 1, 2)));\n/' "bsd/dev/$f"
+done
 # the IOKit objects iOS finds the interface by: compiled as part of SweetMali.cpp (adding a line to files.arm64 here
 # breaks every later patch of that list, see 0127); its file-local helper renamed so it cannot clash
 {
 	printf '\n/* ---- N1709/z3sios iokit/Kernel/RedwoodWLAN.cpp (MIT), appended by 0142-s21-wifi.sh ---- */\n'
-	perl -pe 's/\bpublish\(/rw_publish(/g' "$z3s_tmp/RedwoodWLAN.cpp"
+	printf 'extern "C" int sweet_wifi_printf(const char *, ...) __attribute__((format(printf, 1, 2)));\n'
+	perl -pe 's/\bpublish\(/rw_publish(/g; s/\bIOLog\(/sweet_wifi_printf(/g' "$z3s_tmp/RedwoodWLAN.cpp"
 } >> iokit/Kernel/arm/SweetMali.cpp
 
 cat > bsd/dev/sweet_wifi.c <<'EOF_SWEET_SRC'
@@ -84,6 +91,7 @@ cat > bsd/dev/sweet_wifi.c <<'EOF_SWEET_SRC'
 #include <kern/kalloc.h>
 #include <kern/thread.h>
 #include <kern/sched_prim.h>
+#include <kern/locks.h>
 #include <machine/machine_routines.h>
 #include <vm/memory_types.h>
 #include <pexpert/pexpert.h>
@@ -225,6 +233,40 @@ redwood_adsp_fw_free(const uint8_t *data, uint64_t size)
 {
 	uint8_t *ours = __DECONST(uint8_t *, data);   /* kfree_data() erases its argument: an lvalue */
 	kfree_data(ours, size);
+}
+
+/* printf of redwood_net.c / redwood_apple80211.c / RedwoodWLAN.cpp (0142 renames their calls): lines assembled across
+ * calls, the first 150 as "wifi: " (kept for the recovery replay), later ones "wnet: " (persistent ring only) */
+static LCK_GRP_DECLARE(wp_grp, "sweet-wifi-printf");
+static LCK_MTX_DECLARE(wp_mtx, &wp_grp);
+static char wp_buf[180];
+static size_t wp_len;
+static unsigned wp_lines;
+int sweet_wifi_printf(const char *fmt, ...) __printflike(1, 2);
+int
+sweet_wifi_printf(const char *fmt, ...)
+{
+	char tmp[180];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(tmp, sizeof(tmp), fmt, ap);
+	va_end(ap);
+	lck_mtx_lock(&wp_mtx);
+	for (const char *c = tmp; *c; c++) {
+		if (*c != '\n' && wp_len < sizeof(wp_buf) - 1) {
+			wp_buf[wp_len++] = *c;
+		}
+		if (*c == '\n' || wp_len >= sizeof(wp_buf) - 1) {
+			char line[192];
+			wp_buf[wp_len] = 0;
+			snprintf(line, sizeof(line), "%s %s", wp_lines < 150 ? "wifi:" : "wnet:", wp_buf);
+			wp_lines++;
+			wp_len = 0;
+			sweet_mali_log_str(line);
+		}
+	}
+	lck_mtx_unlock(&wp_mtx);
+	return 0;
 }
 
 void redwood_virtio_net_init(void);
