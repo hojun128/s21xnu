@@ -126,7 +126,7 @@ mali_log(const char *fmt, ...)
 	/* ... and the clock settings and present-copy timings, which the 128 KiB ring loses by the end of a run (run164) */
 	if (!strncmp(line, "job ", 4) || !strncmp(line, "fault", 5) || !strncmp(line, "recover", 7) ||
 	    !strncmp(line, "dvfs", 4) || !strncmp(line, "gpucomp:", 8) || !strncmp(line, "chg:", 4) || !strncmp(line, "keys:", 5) ||
-	    !strncmp(line, "crash:", 6)) {
+	    !strncmp(line, "crash:", 6) || !strncmp(line, "wifi", 4)) {
 		/* several threads log (governor, charger, keys, exits): reserve the space atomically */
 		uint32_t n = (uint32_t)strlen(line);
 		uint32_t at = (uint32_t)OSAddAtomic((SInt32)(n + 1), (volatile SInt32 *)&mali_keep_len);
@@ -1273,8 +1273,10 @@ sweet_mali_boot(void)
 	{
 		extern int sweet_tmu_start(void);   /* 0140 */
 		extern int sweet_cputop_start(void);   /* 0141 */
+		extern int sweet_wifi_start(void);   /* 0142, boot-arg sweetwifi=N */
 		(void)sweet_tmu_start();
 		(void)sweet_cputop_start();
+		(void)sweet_wifi_start();
 	}
 	(void)sweet_s21keys_start();   /* S21 side keys (0125) */
 	(void)sweet_s21_battery_start();   /* iOS battery from the MAX77705 gauge (0127), sweetbattery=2 */

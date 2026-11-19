@@ -94,7 +94,8 @@ static volatile uint64_t sm_pf_ns, sm_pf_gpu_ns, sm_pf_max_ns, sm_pf_last, sm_pf
 static volatile uint32_t sm_pf_n, sm_pf_jobs, sm_pf_draws, sm_pf_gap[4];
 /* reopen stutter hunt: gaps >= 34 ms between commits in a perf window as " +offset:length" (ms), and the committing
  * thread (sampled by sm_gapwatch while a gap is open) */
-static char sm_gap_tl[120]; static volatile uint32_t sm_gap_sampled; static volatile mach_port_t sm_commit_th;
+static char sm_gap_tl[120]; static volatile uint32_t sm_gap_sampled; static volatile mach_port_t sm_commit_th, sm_ca_th;
+static char sm_gap_app[24];   /* process the tour is opening (gap sampler), "" = no sampling */
 static uint64_t sm_ns(void)
 {
 	static mach_timebase_info_data_t tb;
@@ -958,9 +959,10 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 	/* loadAction = Load: tile elimination as Mesa does it -- the preload runs only on tiles some draw touches
 	 * (INTERSECT), the tiles it reloads stay clean, and clean tiles are not written back, so a pass that draws a
 	 * small element over a full-screen target costs that element's tiles instead of 2 x 11 MB of memory traffic.
-	 * Clear passes keep clean-pixel writes (the clear colour must reach every tile). boot-arg sweettile=1 (test) */
+	 * Clear passes keep clean-pixel writes (the clear colour must reach every tile). On since run211 (reopen GPU time
+	 * 13.9 -> 8.7 ms a frame, tour 1v 93.5 -> 96.0 %, home pixels identical); boot-arg sweettile=0 = old */
 	static int tilekill = -1;
-	if (tilekill < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; tilekill = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweettile=1") ? 1 : 0; }
+	if (tilekill < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; tilekill = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweettile=0") ? 0 : 1; }
 	bool isect = preload && tilekill;
 	sm_jl_beginl(target_va, (uint64_t)stride * h);
 	sm_desc_span = 0x10000; uint32_t sm_slot_cur = 0x10000;
@@ -2824,6 +2826,7 @@ static void sm_tag_surfaces(NSArray *passes, uint64_t t)
 }
 - (void)commit
 {
+	sm_ca_th = pthread_mach_thread_np(pthread_self());   /* CoreAnimation's render thread (gap sampler) */
 	if (sm_async < 0) {
 		char ba[1024] = {0}; size_t bl = sizeof(ba) - 1;
 		/* on by default since runs 179-197 (boot-args are limited to 608 bytes); sweetasync=0 = synchronous commits */
@@ -3612,7 +3615,7 @@ static void sm_gap_line(const char *who, mach_port_name_t task, thread_act_t th,
 	}
 	thread_resume(th);
 	if (!np) return;
-	char ln[200]; int L = snprintf(ln, sizeof ln, "SweetMTL: perf gapstk +%llu %s:", (unsigned long long)ofs, who);
+	char ln[200]; int L = snprintf(ln, sizeof ln, "SweetMTL: perf gapstk %s:", who); (void)ofs;
 	for (int k = 0; k < np && L < (int)sizeof ln - 40; k++) {
 		Dl_info di; memset(&di, 0, sizeof di); char b[40];
 		if (pcs[k] && dladdr((void *)pcs[k], &di) && di.dli_fname) { const char *im = strrchr(di.dli_fname, '/'); snprintf(b, sizeof b, "%.12s+%lx", im ? im + 1 : di.dli_fname, (unsigned long)(pcs[k] - (uint64_t)di.dli_fbase)); }
@@ -3623,24 +3626,43 @@ static void sm_gap_line(const char *who, mach_port_name_t task, thread_act_t th,
 }
 static void *sm_gapwatch(void *arg)
 {
-	(void)arg; uint64_t done_for = 0; int sbpid = 0; mach_port_name_t sbt = 0;
+	/* per gap (no commit finished for 100 ms; the tour's tap holds the finger 90 ms): samples at 100 and 160 ms of
+	 * CoreAnimation's render thread, SpringBoard's main thread and the opened app's main thread; 2 gaps a window */
+	(void)arg; uint64_t gap_for = 0; int stage = 0, sbpid = 0, apid = 0; mach_port_name_t sbt = 0, apt = 0; char aname[24] = "";
 	for (;;) {
 		usleep(10000);
 		uint64_t last = sm_pf_last, win = sm_pf_win;
-		if (!win || !last || last < win || last == done_for || sm_gap_sampled >= 4 || !sm_commit_th) continue;
-		uint64_t now = sm_ns(); if (now - last < 50000000ULL || now - last > 400000000ULL) continue;
-		done_for = last; sm_gap_sampled++;
-		uint64_t ofs = (last - win) / 1000000;
-		sm_gap_line("bb", mach_task_self(), sm_commit_th, ofs);
-		if (!sbpid) {
-			static int pids[1024]; int n = proc_listallpids(pids, sizeof pids); if (n > 1024) n = 1024;
-			for (int i = 0; i < n && !sbpid; i++) { char nm[40] = "?"; proc_name(pids[i], nm, sizeof nm); if (!strcmp(nm, "SpringBoard")) sbpid = pids[i]; }
-			if (sbpid && task_for_pid(mach_task_self(), sbpid, &sbt)) sbt = 0;
+		if (!win || !last || last < win || !sm_ca_th || !sm_gap_app[0]) continue;
+		if (last != gap_for) { gap_for = last; stage = 0; }
+		uint64_t age = sm_ns() - last;
+		if (stage >= 2 || age > 400000000ULL || age < (stage ? 160000000ULL : 100000000ULL)) continue;
+		if (stage == 0) { if (sm_gap_sampled >= 2) { stage = 2; continue; } sm_gap_sampled++; }
+		stage++;
+		if (strcmp(aname, sm_gap_app)) {
+			strlcpy(aname, sm_gap_app, sizeof aname); apid = 0;
+			if (apt) { mach_port_deallocate(mach_task_self(), apt); apt = 0; }
 		}
-		if (sbt) { thread_act_array_t th = NULL; mach_msg_type_number_t tn = 0;
-			if (!task_threads(sbt, &th, &tn) && tn) { sm_gap_line("SB", sbt, th[0], ofs);
-				for (mach_msg_type_number_t i = 0; i < tn; i++) mach_port_deallocate(mach_task_self(), th[i]);
-				vm_deallocate(mach_task_self(), (vm_address_t)th, tn * sizeof *th); } }
+		if (!sbpid || !apid) {
+			static int pids[1024]; int n = proc_listallpids(pids, sizeof pids); if (n > 1024) n = 1024;
+			for (int i = 0; i < n; i++) {
+				char nm[40] = "?"; proc_name(pids[i], nm, sizeof nm);
+				if (!sbpid && !strcmp(nm, "SpringBoard")) { sbpid = pids[i]; if (task_for_pid(mach_task_self(), sbpid, &sbt)) sbt = 0; }
+				if (!apid && !strcmp(nm, aname)) { apid = pids[i]; if (task_for_pid(mach_task_self(), apid, &apt)) apt = 0; }
+			}
+		}
+		char tag[24]; snprintf(tag, sizeof tag, "%llu/%llu", (unsigned long long)((last - win) / 1000000), (unsigned long long)(age / 1000000));
+		char who[40];
+		snprintf(who, sizeof who, "%s CA", tag); sm_gap_line(who, mach_task_self(), sm_ca_th, 0);
+		mach_port_name_t ts[2] = { sbt, apt }; const char *tn[2] = { "SB", "app" };
+		for (int k = 0; k < 2; k++) {
+			if (!ts[k]) continue;
+			thread_act_array_t th = NULL; mach_msg_type_number_t tc = 0;
+			if (!task_threads(ts[k], &th, &tc) && tc) {
+				snprintf(who, sizeof who, "%s %s", tag, tn[k]); sm_gap_line(who, ts[k], th[0], 0);
+				for (mach_msg_type_number_t i = 0; i < tc; i++) mach_port_deallocate(mach_task_self(), th[i]);
+				vm_deallocate(mach_task_self(), (vm_address_t)th, tc * sizeof *th);
+			}
+		}
 	}
 	return NULL;
 }
@@ -3739,7 +3761,10 @@ static void sm_app_tour(void)
 		char w[32];
 		for (int round = 0; round < (meas ? 2 : 1); round++) {
 			uint32_t c0 = sm_commits;
-			if (meas) sm_perf_reset();
+			if (meas) {
+				const char *pn = !strcmp(A[i].n, "Settings") ? "Preferences" : !strcmp(A[i].n, "Safari") ? "MobileSafari" : "MobileSMS";
+				strlcpy(sm_gap_app, pn, sizeof sm_gap_app); sm_perf_reset();
+			}
 			kern_return_t k = sm_tap(A[i].x, A[i].y);
 			if (meas) {
 				/* reopen: mid-animation shot (the card zooming in, where a stale or half-drawn frame flashes), ids 5x */
@@ -3755,7 +3780,7 @@ static void sm_app_tour(void)
 			}
 			uint32_t c1 = sm_commits;
 			slog("SweetMTL: app %s tap kr=%x commits +%u", A[i].n, k, c1 - c0);
-			if (meas) sm_perf_reset();
+			if (meas) { sm_gap_app[0] = 0; sm_perf_reset(); }   /* closes: no stack samples */
 			sm_drag(540, 2392, 540, 1000, 24);
 			if (meas) { sleep(3); snprintf(w, sizeof w, "close%d-%s", round + 1, A[i].n); sm_perf_report(w, 0); sleep(1); }
 			else sleep(4);
