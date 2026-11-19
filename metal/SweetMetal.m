@@ -3693,7 +3693,9 @@ static void sm_app_tour(void)
 	sm_describe = 4;
 	sm_drag(1000, 8, 1000, 1300, 20); sleep(3);
 	sm_tour_shot(48);
-	sm_tour_crop(30, 30, 250, 180, 120);
+	/* thumbnail run208: module 1 spans x 89..544, y 380..820 of 1125x2436, the Focus module starts at y ~1132 */
+	sm_tour_crop(30, 60, 350, 180, 120);
+	sm_tour_crop(31, 80, 1095, 180, 100);
 	sm_drag(540, 2392, 540, 1000, 24); sleep(3);
 }
 static void *sm_watchdog(void *arg)
