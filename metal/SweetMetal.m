@@ -837,6 +837,7 @@ typedef struct {
 	uint64_t fbuf[31];               /* fragment-stage buffers (separate push block) */
 	struct { uint32_t fmt, off, bidx; } attr[16];
 	uint32_t stride[31];
+	uint64_t attr_va[16]; uint32_t attr_st[16];   /* attribute copied with Metal's missing components filled (sm_fill_attrs) */
 	struct { uint64_t va; uint32_t w, h, stride, fmt, pf, imp, swz, astc, nofl; } tex[8];   /* nofl: GPU-only memory, no cache flush */   /* astc: bw | bh << 8 | srgb << 16 */
 	struct { uint32_t nearest, wrap; } smp[8];
 	uint32_t ntex, nsmp;
@@ -1146,13 +1147,8 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 			uint32_t bi = r->attr[L].bidx;
 			uint64_t va = bi < 31 && r->buf[bi] ? r->buf[bi] + r->attr[L].off : (havedummy ? dummy.gpu : 0);  /* unbound attribute: zeroed page, never VA 0 */
 			uint32_t st = bi < 31 ? r->stride[bi] : 0;
+			if (r->attr_va[L]) { va = r->attr_va[L]; st = r->attr_st[L]; }   /* components filled (sm_record) */
 			memcpy(push + SMP_ATTR + 16 * L, &va, 8); memcpy(push + SMP_ATTR + 16 * L + 8, &st, 4);
-			/* the vertex format's component count (air2nir fills the rest with 0, 0, 0, 1 like Metal): Control Center's
-			 * float2 span positions were read as float4 with the colour as z/w (run223). Boot-arg sweetattrfill=0 off. */
-			static int fill = -1;
-			if (fill < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; fill = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetattrfill=0") ? 0 : 1; }
-			uint32_t f = r->attr[L].fmt, fw = !fill ? 0 : f >= 28 && f <= 31 ? f - 27 : f >= 25 && f <= 27 ? 0x10 | (f - 23) : f == 53 ? 0x11 : 0;
-			memcpy(push + SMP_ATTR + 16 * L + 12, &fw, 4);
 		}
 		float vp[6] = { w * 0.5f, -(float)h * 0.5f, 1.0f, w * 0.5f, h * 0.5f, 0.0f };
 		memcpy(push + SMP_VP, vp, sizeof vp);
@@ -2132,7 +2128,8 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 	uint32_t _dcap;
 	uint32_t _ndraw, _skipped;
 	uint64_t _bufBase[31];
-	const uint8_t *_bufCpu[31], *_bufCpuBase[31];   /* CPU view of the vertex buffers (Control Center line audit) */
+	const uint8_t *_bufCpu[31], *_bufCpuBase[31];   /* CPU view of the vertex buffers (line audit, component fill) */
+	uint64_t _bufCpuLen[31], _bufCpuBaseLen[31];       /* bytes readable from _bufCpu[i] */
 	uint64_t _fbuf[31], _fbufBase[31];
 	MTLScissorRect _scissor;
 	BOOL _hasScissor;
@@ -2169,12 +2166,13 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 - (void)setVertexBuffer:(id)buf offset:(NSUInteger)off atIndex:(NSUInteger)i
 {
 	if (i < 31) { _bufBase[i] = buf ? [(SweetMTLBuffer *)buf gpuAddress] : 0; _buf[i] = buf ? _bufBase[i] + off : 0; if (buf) [_keep addObject:buf];
-	  _bufCpuBase[i] = buf && [buf isKindOfClass:[SweetMTLBuffer class]] ? (const uint8_t *)[(SweetMTLBuffer *)buf contents] : NULL; _bufCpu[i] = _bufCpuBase[i] ? _bufCpuBase[i] + off : NULL; }
+	  _bufCpuBase[i] = buf && [buf isKindOfClass:[SweetMTLBuffer class]] ? (const uint8_t *)[(SweetMTLBuffer *)buf contents] : NULL; _bufCpu[i] = _bufCpuBase[i] ? _bufCpuBase[i] + off : NULL;
+	  _bufCpuBaseLen[i] = _bufCpuBase[i] ? [(SweetMTLBuffer *)buf length] : 0; _bufCpuLen[i] = _bufCpuBaseLen[i] > off ? _bufCpuBaseLen[i] - off : 0; if (!_bufCpuLen[i]) _bufCpu[i] = NULL; }
 }
 - (void)setVertexBytes:(const void *)p length:(NSUInteger)len atIndex:(NSUInteger)i
 {
 	uint8_t *c = NULL; uint64_t va = sm_ring_put(p, len, &c);
-	if (i < 31) { _bufBase[i] = 0; _buf[i] = va; _bufCpuBase[i] = NULL; _bufCpu[i] = va ? c : NULL; }
+	if (i < 31) { _bufBase[i] = 0; _buf[i] = va; _bufCpuBase[i] = NULL; _bufCpu[i] = va ? c : NULL; _bufCpuLen[i] = va ? len : 0; }
 }
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i
 {
@@ -2198,7 +2196,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 {
 	if (i < 31) { _fbufBase[i] = buf ? [(SweetMTLBuffer *)buf gpuAddress] : 0; _fbuf[i] = buf ? _fbufBase[i] + off : 0; if (buf) [_keep addObject:buf]; }
 }
-- (void)setVertexBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i { if (i < 31 && _bufBase[i]) { _buf[i] = _bufBase[i] + off; if (_bufCpuBase[i]) _bufCpu[i] = _bufCpuBase[i] + off; } }
+- (void)setVertexBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i { if (i < 31 && _bufBase[i]) { _buf[i] = _bufBase[i] + off; if (_bufCpuBase[i]) { _bufCpuLen[i] = _bufCpuBaseLen[i] > off ? _bufCpuBaseLen[i] - off : 0; _bufCpu[i] = _bufCpuLen[i] ? _bufCpuBase[i] + off : NULL; } } }
 - (void)setFragmentBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i { if (i < 31 && _fbufBase[i]) _fbuf[i] = _fbufBase[i] + off; }
 - (void)setFragmentBytes:(const void *)p length:(NSUInteger)len atIndex:(NSUInteger)i
 {
@@ -2341,6 +2339,37 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 		r->blend_on = _pipeline->_blend[0]; r->rgb_op = _pipeline->_blend[1]; r->a_op = _pipeline->_blend[2];
 		r->rgb_sf = _pipeline->_blend[3]; r->rgb_df = _pipeline->_blend[4]; r->a_sf = _pipeline->_blend[5]; r->a_df = _pipeline->_blend[6];
 		r->wmask = _pipeline->_blend[7];
+	}
+	if (_pipeline) {
+		/* Metal fills the components a vertex format lacks with (0, 0, 0, 1). The translated shaders load the declared
+		 * width, so a float4 input fed by Float2 read the next attribute's bytes as z/w: Control Center's line spans
+		 * (fixed_vert_*_spc: float4 position, Float2 + half4 colour) got w ~ 1e-11 and landed far off screen (run223).
+		 * Non-indexed draws: each short float/half attribute is copied into the ring as 4 components (a shader that
+		 * declares fewer reads the same leading bytes). Boot-arg sweetattrfill=0 off. */
+		static int fill = -1;
+		if (fill < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; fill = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetattrfill=0") ? 0 : 1; }
+		if (fill && !r->index_type && r->vcount && (uint64_t)r->vstart + r->vcount <= 65536) {
+			for (uint32_t L = 0; L < 16; L++) {
+				uint32_t f = r->attr[L].fmt, n = f >= 28 && f <= 30 ? f - 27 : f == 25 || f == 26 ? f - 23 : f == 53 ? 1 : 0;
+				uint32_t esz = f >= 28 ? 4 : 2, b = r->attr[L].bidx;
+				if (!n || b > 30 || !_bufCpu[b] || !r->stride[b]) continue;
+				uint64_t st = r->stride[b], first = r->vstart, need = (first + r->vcount - 1) * st + r->attr[L].off + n * esz;
+				if (need > _bufCpuLen[b]) { static int nl; if (nl++ < 4) slog("SweetMTL: attr fill: attribute %u past its buffer (%llu > %llu)", L, need, _bufCpuLen[b]); continue; }
+				uint32_t os = 4 * esz; uint8_t *c = NULL;
+				/* the block covers vertices 0 .. vstart + vcount - 1 so every address the shader forms stays inside it */
+				uint64_t va = sm_ring_put(NULL, (uint64_t)os * (first + r->vcount), &c);
+				if (!va || !c) continue;
+				c += first * os;
+				const uint8_t *src = _bufCpu[b] + r->attr[L].off + first * st;
+				for (uint32_t v = 0; v < r->vcount; v++, src += st, c += os) {
+					memcpy(c, src, n * esz);
+					if (esz == 4) { static const float d[4] = { 0, 0, 0, 1 }; memcpy(c + 4 * n, d + n, 4 * (4 - n)); }
+					else { static const uint16_t d[4] = { 0, 0, 0, 0x3C00 }; memcpy(c + 2 * n, d + n, 2 * (4 - n)); }
+				}
+				r->attr_va[L] = va; r->attr_st[L] = os;
+				{ static int nl; if (nl++ < 6) slog("SweetMTL: attr fill: %s location %u format %u -> %u bytes x %u", r->vs ? r->vs->name : "?", L, f, os, r->vcount); }
+			}
+		}
 	}
 	if (sm_ccaudit && r->strip >= 2 && r->vs) {
 		/* Control Center line spans never appear: which vertex shader, its varyings, and the first vertex data */

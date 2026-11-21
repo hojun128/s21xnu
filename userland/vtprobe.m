@@ -81,7 +81,16 @@ static void vt_session(CMFormatDescriptionRef fd, AVAsset *asset, AVAssetTrack *
 		CMSampleBufferRef sb = [o copyNextSampleBuffer];
 		if (!sb) break;
 		VTDecodeInfoFlags inf = 0;
-		if (fed == 0) lg("session: first decode call");
+		if (fed == 0) {
+			/* run221-224: the first DecodeFrame returns -12902 (kVTParameterErr) at once: what the reader hands over */
+			CMFormatDescriptionRef sfd = CMSampleBufferGetFormatDescription(sb);
+			CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+			lg("session: sbuf samples %ld ready %d valid %d bytes %zu fd %s same-fd %d", (long)CMSampleBufferGetNumSamples(sb),
+			    CMSampleBufferDataIsReady(sb), CMSampleBufferIsValid(sb), bb ? CMBlockBufferGetDataLength(bb) : 0,
+			    sfd ? "yes" : "no", sfd ? CMFormatDescriptionEqual(sfd, fd) : -1);
+			lg("session: first decode call");
+		}
+		if (CMSampleBufferGetNumSamples(sb) == 0) { CFRelease(sb); fed--; continue; }   /* marker buffers carry no frame */
 		dst2 = VTDecompressionSessionDecodeFrame(s, sb, 0, NULL, &inf);
 		if (fed == 0) lg("session: first decode returned %d, frames %d", (int)dst2, vt_frames);
 		CFRelease(sb);
