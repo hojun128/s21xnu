@@ -2241,6 +2241,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 	sm_drawrec *r = [self sm_record:type];
 	if (!r) return;
 	r->vcount = (uint32_t)count; r->vstart = (uint32_t)start;
+	[self sm_fill_attrs:r];   /* needs vcount/vstart */
 	_ndraw++;
 	[self sm_split_blend];
 }
@@ -2274,6 +2275,42 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 	b->a_sf = asf; b->a_df = adf;
 	_ndraw++;
 	static int nl; if (nl++ < 6) slog("SweetMTL: blend split: rgb %u/%u alpha %u/%u -> two draws", b->rgb_sf, r->rgb_df, b->a_sf, b->a_df);
+}
+- (void)sm_fill_attrs:(sm_drawrec *)r
+{
+	if (!r) return;
+	{
+		/* Metal fills the components a vertex format lacks with (0, 0, 0, 1). The translated shaders load the declared
+		 * width, so a float4 input fed by Float2 read the next attribute's bytes as z/w: Control Center's line spans
+		 * (fixed_vert_*_spc: float4 position, Float2 + half4 colour) got w ~ 1e-11 and landed far off screen (run223).
+		 * Non-indexed draws: each short float/half attribute is copied into the ring as 4 components (a shader that
+		 * declares fewer reads the same leading bytes). Boot-arg sweetattrfill=0 off. */
+		static int fill = -1;
+		if (fill < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; fill = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetattrfill=0") ? 0 : 1; }
+		if (fill && !r->index_type && r->vcount && (uint64_t)r->vstart + r->vcount <= 65536) {
+			for (uint32_t L = 0; L < 16; L++) {
+				uint32_t f = r->attr[L].fmt, n = f >= 28 && f <= 30 ? f - 27 : f == 25 || f == 26 ? f - 23 : f == 53 ? 1 : 0;
+				uint32_t esz = f >= 28 ? 4 : 2, b = r->attr[L].bidx;
+				if (!n || b > 30 || !_bufCpu[b] || !r->stride[b]) continue;
+				uint64_t st = r->stride[b], first = r->vstart, need = (first + r->vcount - 1) * st + r->attr[L].off + n * esz;
+				if (need > _bufCpuLen[b]) { static int nl; if (nl++ < 4) slog("SweetMTL: attr fill: attribute %u past its buffer (%llu > %llu)", L, need, _bufCpuLen[b]); continue; }
+				uint32_t os = 4 * esz; uint8_t *c = NULL;
+				/* the block covers vertices 0 .. vstart + vcount - 1 so every address the shader forms stays inside it */
+				uint64_t va = sm_ring_put(NULL, (uint64_t)os * (first + r->vcount), &c);
+				if (!va || !c) continue;
+				c += first * os;
+				const uint8_t *src = _bufCpu[b] + r->attr[L].off + first * st;
+				for (uint32_t v = 0; v < r->vcount; v++, src += st, c += os) {
+					memcpy(c, src, n * esz);
+					if (esz == 4) { static const float d[4] = { 0, 0, 0, 1 }; memcpy(c + 4 * n, d + n, 4 * (4 - n)); }
+					else { static const uint16_t d[4] = { 0, 0, 0, 0x3C00 }; memcpy(c + 2 * n, d + n, 2 * (4 - n)); }
+				}
+				r->attr_va[L] = va; r->attr_st[L] = os;
+				sm_fill_n++; if (r->strip >= 2) sm_fill_lines++;
+				{ static int nl; if (nl++ < 6) slog("SweetMTL: attr fill: %s location %u format %u -> %u bytes x %u", r->vs ? r->vs->name : "?", L, f, os, r->vcount); }
+			}
+		}
+	}
 }
 - (sm_drawrec *)sm_record:(MTLPrimitiveType)type
 {
@@ -2340,38 +2377,6 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 		r->blend_on = _pipeline->_blend[0]; r->rgb_op = _pipeline->_blend[1]; r->a_op = _pipeline->_blend[2];
 		r->rgb_sf = _pipeline->_blend[3]; r->rgb_df = _pipeline->_blend[4]; r->a_sf = _pipeline->_blend[5]; r->a_df = _pipeline->_blend[6];
 		r->wmask = _pipeline->_blend[7];
-	}
-	if (_pipeline) {
-		/* Metal fills the components a vertex format lacks with (0, 0, 0, 1). The translated shaders load the declared
-		 * width, so a float4 input fed by Float2 read the next attribute's bytes as z/w: Control Center's line spans
-		 * (fixed_vert_*_spc: float4 position, Float2 + half4 colour) got w ~ 1e-11 and landed far off screen (run223).
-		 * Non-indexed draws: each short float/half attribute is copied into the ring as 4 components (a shader that
-		 * declares fewer reads the same leading bytes). Boot-arg sweetattrfill=0 off. */
-		static int fill = -1;
-		if (fill < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; fill = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetattrfill=0") ? 0 : 1; }
-		if (fill && !r->index_type && r->vcount && (uint64_t)r->vstart + r->vcount <= 65536) {
-			for (uint32_t L = 0; L < 16; L++) {
-				uint32_t f = r->attr[L].fmt, n = f >= 28 && f <= 30 ? f - 27 : f == 25 || f == 26 ? f - 23 : f == 53 ? 1 : 0;
-				uint32_t esz = f >= 28 ? 4 : 2, b = r->attr[L].bidx;
-				if (!n || b > 30 || !_bufCpu[b] || !r->stride[b]) continue;
-				uint64_t st = r->stride[b], first = r->vstart, need = (first + r->vcount - 1) * st + r->attr[L].off + n * esz;
-				if (need > _bufCpuLen[b]) { static int nl; if (nl++ < 4) slog("SweetMTL: attr fill: attribute %u past its buffer (%llu > %llu)", L, need, _bufCpuLen[b]); continue; }
-				uint32_t os = 4 * esz; uint8_t *c = NULL;
-				/* the block covers vertices 0 .. vstart + vcount - 1 so every address the shader forms stays inside it */
-				uint64_t va = sm_ring_put(NULL, (uint64_t)os * (first + r->vcount), &c);
-				if (!va || !c) continue;
-				c += first * os;
-				const uint8_t *src = _bufCpu[b] + r->attr[L].off + first * st;
-				for (uint32_t v = 0; v < r->vcount; v++, src += st, c += os) {
-					memcpy(c, src, n * esz);
-					if (esz == 4) { static const float d[4] = { 0, 0, 0, 1 }; memcpy(c + 4 * n, d + n, 4 * (4 - n)); }
-					else { static const uint16_t d[4] = { 0, 0, 0, 0x3C00 }; memcpy(c + 2 * n, d + n, 2 * (4 - n)); }
-				}
-				r->attr_va[L] = va; r->attr_st[L] = os;
-				sm_fill_n++; if (r->strip >= 2) sm_fill_lines++;
-				{ static int nl; if (nl++ < 6) slog("SweetMTL: attr fill: %s location %u format %u -> %u bytes x %u", r->vs ? r->vs->name : "?", L, f, os, r->vcount); }
-			}
-		}
 	}
 	if (sm_ccaudit && r->strip >= 2 && r->vs) {
 		/* Control Center line spans never appear: which vertex shader, its varyings, and the first vertex data */

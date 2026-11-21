@@ -193,6 +193,21 @@ static void probe(void)
 #endif
 		[p pause];
 	}
+	/* mediaserverd's stderr (s21-root-fixes.py): CoreFoundation's report of the exception that killed it (run230) */
+	sleep(2);
+	FILE *ef = fopen("/private/var/tmp/mediaserverd.err", "r");
+	if (!ef) { lg("msd stderr: none"); return; }
+	char ln[512]; int on = 0, nl = 0;
+	while (fgets(ln, sizeof ln, ef) && nl < 40) {
+		if (strstr(ln, "Terminating app") || strstr(ln, "First throw")) on = 1;
+		if (!on) continue;
+		char *q = ln, *w = ln; int sp = 0;   /* squeeze runs of blanks so a frame fits one kept line */
+		for (; *q; q++) { if (*q == ' ' || *q == '\t' || *q == '\n') { if (!sp && w != ln) *w++ = ' '; sp = 1; } else { *w++ = *q; sp = 0; } }
+		*w = 0;
+		if (ln[0]) { lg("msd: %.150s", ln); nl++; }
+	}
+	fclose(ef);
+	if (!nl) lg("msd stderr: no exception report");
 }
 
 int main(int argc, char **argv)

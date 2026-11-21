@@ -118,6 +118,17 @@ def main(root):
             del j['_LimitLoadToDeviceTree']
             changed = True
             print('wifid: device tree limit removed')
+    # mediaserverd dies with an uncaught NSException when AVPlayer starts (run230: -[__NSCFNumber objectForKey:]); the
+    # crash note has no stack. CoreFoundation prints "First throw call stack" to stderr with CFLOG_FORCE_STDERR, so the
+    # job's stderr goes to a file vtprobe reads back.
+    for j in pl.get('LaunchDaemons', {}).values():
+        if isinstance(j, dict) and j.get('Label') == 'com.apple.mediaserverd':
+            env = j.setdefault('EnvironmentVariables', {})
+            if env.get('CFLOG_FORCE_STDERR') != '1' or j.get('StandardErrorPath') != '/private/var/tmp/mediaserverd.err':
+                env['CFLOG_FORCE_STDERR'] = '1'
+                j['StandardErrorPath'] = '/private/var/tmp/mediaserverd.err'
+                changed = True
+            print('mediaserverd stderr:', j.get('StandardErrorPath'))
     if changed:
         st = os.stat(path)
         with open(path, 'wb') as f:
