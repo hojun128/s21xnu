@@ -155,11 +155,11 @@ static void probe(void)
 	CMFormatDescriptionRef fd = (__bridge CMFormatDescriptionRef)fds[0];
 	CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(fd);
 	lg("video %s %dx%d, audio track %s", fcc(CMFormatDescriptionGetMediaSubType(fd), a), d.width, d.height, au ? "yes" : "no");
-	pb_layout(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, 640, 360);
-	pb_layout(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, 1280, 720);
-	pb_layout(kCVPixelFormatType_32BGRA, 640, 360);
-	for (vt_fmt = 0; vt_fmt < 4; vt_fmt++) vt_session(fd, asset, tr, false);
-	vt_fmt = 1; vt_session(fd, asset, tr, true);
+	if (getenv("VTPROBE_PB")) {   /* plane layout (run223: bytes per row 0, fixed in the kernel) */
+		pb_layout(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, 640, 360);
+		pb_layout(kCVPixelFormatType_32BGRA, 640, 360);
+	}
+	vt_fmt = 0; vt_session(fd, asset, tr, false);   /* run229: 20/20 frames once the marker buffer is skipped */
 	{
 		NSError *e = nil;
 		AVAssetReader *rd = [AVAssetReader assetReaderWithAsset:asset error:&e];

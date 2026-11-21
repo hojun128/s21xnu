@@ -35,6 +35,7 @@ static id sm_dbg_tex[4];          /* textures to thumbnail at the end of the run
 static volatile int sm_describe;   /* >0: describe the draws of the next passes (set after the unlock swipe) */
 /* Control Center audit (tour): every pass and draw of the latest frame (a frame = commits less than 30 ms apart), dumped
  * once CC has settled: which draws make the glyphs that do not appear (user photo: Wi-Fi/BT/torch/volume glyphs missing) */
+static volatile uint32_t sm_fill_n, sm_fill_lines;   /* attribute fills (sm_record), lines among them */
 static volatile int sm_ccaudit; static char sm_cc_buf[48 * 1024]; static size_t sm_cc_len; static uint64_t sm_cc_last;
 static void sm_cc_add(const char *fmt, ...) __printflike(1, 2);
 static void sm_cc_add(const char *fmt, ...)
@@ -2367,6 +2368,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 					else { static const uint16_t d[4] = { 0, 0, 0, 0x3C00 }; memcpy(c + 2 * n, d + n, 2 * (4 - n)); }
 				}
 				r->attr_va[L] = va; r->attr_st[L] = os;
+				sm_fill_n++; if (r->strip >= 2) sm_fill_lines++;
 				{ static int nl; if (nl++ < 6) slog("SweetMTL: attr fill: %s location %u format %u -> %u bytes x %u", r->vs ? r->vs->name : "?", L, f, os, r->vcount); }
 			}
 		}
@@ -3911,7 +3913,8 @@ static void sm_app_tour(void)
 	/* glyph areas 1:1: Wi-Fi button (module 1 row 2 left) and the torch tile (bottom row left) */
 	sm_tour_crop(32, 120, 640, 180, 140);
 	sm_tour_crop(33, 90, 1400, 180, 140);
-	for (char *ln = sm_cc_buf; ln && *ln;) { char *nl = strchr(ln, '\n'); if (nl) *nl = 0; slog("SweetMTL: %s", ln); ln = nl ? nl + 1 : NULL; }
+	slog("SweetMTL: perf attrfill: %u attributes filled since boot, %u in line draws", sm_fill_n, sm_fill_lines);
+	if (getenv("SWEET_CC_PASSES")) for (char *ln = sm_cc_buf; ln && *ln;) { char *nl = strchr(ln, '\n'); if (nl) *nl = 0; slog("SweetMTL: %s", ln); ln = nl ? nl + 1 : NULL; }
 	for (char *ln = sm_ccl_buf; ln && *ln;) { char *nl = strchr(ln, '\n'); if (nl) *nl = 0; slog("SweetMTL: %s", ln); ln = nl ? nl + 1 : NULL; }
 	/* video (YouTube does not play): /usr/local/bin/vtprobe now (VideoToolbox / AVAssetReader / AVPlayer on an H.264 clip),
 	 * up to 60 s, its lines from /private/var/tmp/vtprobe.txt logged as kept "perf vt" lines */
