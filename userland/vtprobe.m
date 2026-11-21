@@ -193,6 +193,32 @@ static void probe(void)
 #endif
 		[p pause];
 	}
+	{
+		/* run234: the player gets ready and shows a frame but stays at rate 0 (no audio route on this port): does a
+		 * video-only item play? */
+		AVMutableComposition *c = [AVMutableComposition composition];
+		AVMutableCompositionTrack *vt = [c addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid];
+		NSError *ce = nil;
+		[vt insertTimeRange:CMTimeRangeMake(kCMTimeZero, asset.duration) ofTrack:tr atTime:kCMTimeZero error:&ce];
+		AVPlayerItem *it = [AVPlayerItem playerItemWithAsset:c];
+		AVPlayerItemVideoOutput *vo = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:
+			@{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) }];
+		[it addOutput:vo];
+		AVPlayer *p = [AVPlayer playerWithPlayerItem:it];
+		[p play];
+		int got = 0;
+		for (int i = 0; i < 40; i++) {
+			[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+			CMTime t = [vo itemTimeForHostTime:CACurrentMediaTime()];
+			if ([vo hasNewPixelBufferForItemTime:t]) { CVPixelBufferRef pb = [vo copyPixelBufferForItemTime:t itemTimeForDisplay:NULL]; if (pb) { got++; CFRelease(pb); } }
+		}
+		lg("video-only player: insert %ld, item status %ld error %ld, time %.2f s, rate %.2f, frames %d, timeControl %ld wait %s",
+		    (long)ce.code, (long)it.status, (long)it.error.code, CMTimeGetSeconds(it.currentTime), p.rate, got, (long)p.timeControlStatus,
+		    p.reasonForWaitingToPlay ? p.reasonForWaitingToPlay.UTF8String : "-");
+		AVPlayerItemErrorLog *el = it.errorLog;
+		for (AVPlayerItemErrorLogEvent *ev in el.events) lg("video-only player: error log %ld %s", (long)ev.errorStatusCode, ev.errorComment.UTF8String ?: "-");
+		[p pause];
+	}
 	/* mediaserverd's stderr (s21-root-fixes.py): CoreFoundation's report of the exception that killed it (run230) */
 	sleep(2);
 	FILE *ef = fopen("/private/var/tmp/mediaserverd.err", "r");
