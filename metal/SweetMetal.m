@@ -1147,6 +1147,12 @@ static uint32_t sm_pass(sm_bo *desc, sm_bo *heap, uint64_t target_va, uint32_t w
 			uint64_t va = bi < 31 && r->buf[bi] ? r->buf[bi] + r->attr[L].off : (havedummy ? dummy.gpu : 0);  /* unbound attribute: zeroed page, never VA 0 */
 			uint32_t st = bi < 31 ? r->stride[bi] : 0;
 			memcpy(push + SMP_ATTR + 16 * L, &va, 8); memcpy(push + SMP_ATTR + 16 * L + 8, &st, 4);
+			/* the vertex format's component count (air2nir fills the rest with 0, 0, 0, 1 like Metal): Control Center's
+			 * float2 span positions were read as float4 with the colour as z/w (run223). Boot-arg sweetattrfill=0 off. */
+			static int fill = -1;
+			if (fill < 0) { char ba[1024] = {0}; size_t bl = sizeof(ba) - 1; fill = sysctlbyname("kern.bootargs", ba, &bl, NULL, 0) == 0 && strstr(ba, "sweetattrfill=0") ? 0 : 1; }
+			uint32_t f = r->attr[L].fmt, fw = !fill ? 0 : f >= 28 && f <= 31 ? f - 27 : f >= 25 && f <= 27 ? 0x10 | (f - 23) : f == 53 ? 0x11 : 0;
+			memcpy(push + SMP_ATTR + 16 * L + 12, &fw, 4);
 		}
 		float vp[6] = { w * 0.5f, -(float)h * 0.5f, 1.0f, w * 0.5f, h * 0.5f, 0.0f };
 		memcpy(push + SMP_VP, vp, sizeof vp);

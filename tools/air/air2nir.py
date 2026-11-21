@@ -1,5 +1,5 @@
 """AIR (Metal LLVM IR) -> Mesa nir_builder C code. v0: straight-line functions.
-Push-constant ABI (bytes):  0..63  buffer[i] GPU VA (u64)       64..191 attr[L] {u64 va, u32 stride, u32 pad}
+Push-constant ABI (bytes):  0..63  buffer[i] GPU VA (u64)       64..191 attr[L] {u64 va, u32 stride, u32 fmt: float count | 0x10 half}
                            192..215 viewport scale.xyz, offset.xyz (f32)
                            216..223 function-constant "defined" mask (bit k)   256..511 function constant k at 256+4k
 Texture i -> pan_res_handle(4, i), sampler i -> pan_res_handle(3, i), constexpr samplers -> sampler 15.
@@ -461,7 +461,20 @@ class Fn:
                 stride = self.tmp('nir_load_push_constant(b, 1, 32, nir_imm_int(b, 0), .base = %d, .range = 4)' % (PUSH_ATTR + 16 * L + 8))
                 vid = self.tmp('nir_load_vertex_id(b)')
                 addr = self.tmp('nir_iadd(b, %s, nir_u2u64(b, nir_imul(b, %s, %s)))' % (base, vid, stride))
-                self.vals[name] = self.tmp('nir_load_global(b, %s, 4, %d, %d)' % (addr, n, BITS[s]))
+                raw = self.tmp('nir_load_global(b, %s, 4, %d, %d)' % (addr, n, BITS[s]))
+                if n >= 2 and s in ('float', 'half'):
+                    # Metal fills components the vertex format lacks with (0, 0, 0, 1): a float2 position read as float4
+                    # took the colour bytes as z/w and threw Control Center's line spans off screen (run223). Push word
+                    # attr[L] + 12 = component count of a float format, 0x10 | count of a half format, 0 = unknown.
+                    fw = self.tmp('nir_load_push_constant(b, 1, 32, nir_imm_int(b, 0), .base = %d, .range = 4)' % (PUSH_ATTR + 16 * L + 12))
+                    c = fw if BITS[s] == 32 else self.tmp('nir_iadd_imm(b, %s, -16)' % fw)
+                    ok = self.tmp('nir_ult(b, nir_iadd_imm(b, %s, -1), nir_imm_int(b, 4))' % c)
+                    ch = []
+                    for i in range(n):
+                        use = self.tmp('nir_iand(b, %s, nir_uge(b, nir_imm_int(b, %d), %s))' % (ok, i, c))
+                        ch.append(self.tmp('nir_bcsel(b, %s, nir_imm_floatN_t(b, %s, %d), nir_channel(b, %s, %d))' % (use, '1.0' if i == 3 else '0.0', BITS[s], raw, i)))
+                    raw = self.tmp('nir_vec%d(b, %s)' % (n, ', '.join(ch)))
+                self.vals[name] = raw
             elif a['kind'] == 'buffer':
                 self.vals[name] = ('ptr', self.tmp('nir_load_push_constant(b, 1, 64, nir_imm_int(b, 0), .base = %d, .range = 8)' % (PUSH_BUF + 8 * a['loc'])),
                                    re.sub(r'\s*addrspace\(\d+\)\*$', '', ty))
