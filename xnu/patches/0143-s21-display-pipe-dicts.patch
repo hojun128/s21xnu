@@ -1,0 +1,23 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -315,5 +315,19 @@
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	{
++		/* dictionaries, as VideoToolbox (FigGetAlignmentForIOSurfaceOutputToDisplayService) and QuartzCore read
++		 * them: the plain number made mediaserverd throw -[__NSCFNumber objectForKey:] when AVPlayer started (run231) */
++		OSDictionary *al = OSDictionary::withCapacity(1), *sr = OSDictionary::withCapacity(1);
++		OSNumber *n64 = OSNumber::withNumber(64ULL, 32);
++		if (al != NULL && sr != NULL && n64 != NULL) {
++			al->setObject("PlaneBaseAlignmentLinear", n64);
++			sr->setObject("StrideLinearHorizontal", n64);
++			setProperty("DisplayPipePlaneBaseAlignment", al);
++			setProperty("DisplayPipeStrideRequirements", sr);
++		}
++		OSSafeReleaseNULL(al);
++		OSSafeReleaseNULL(sr);
++		OSSafeReleaseNULL(n64);
++	}
+ 	registerService();
