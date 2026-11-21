@@ -3003,7 +3003,7 @@ static void sm_tag_surfaces(NSArray *passes, uint64_t t)
 		bool bgra = sm_is_bgra(e.target.pixelFormat);
 		if (e->_ndraw) {
 			static sm_bo heap; static bool haveheap;
-			if (!haveheap) { haveheap = sm_bo_alloc(&heap, sm_is_poster(getprogname()) ? (1u << 20) : (16u << 20)); /* never written by the CPU (kernel pages come zeroed): no flush. 16 MiB: with Control Center's line spans drawn, 4 MiB ran out (job status 0x60, run231) */ }
+			if (!haveheap) { haveheap = sm_bo_alloc(&heap, sm_is_poster(getprogname()) ? (1u << 20) : (12u << 20)); /* never written by the CPU (kernel pages come zeroed): no flush. 12 MiB: with Control Center's line spans drawn 4 MiB ran out (job status 0x60, run231); the kernel refuses BOs over 15 MiB (16 MiB: every pass skipped, run232-233) */ }
 			if (!haveheap) { _status = 5; continue; }
 			bool generic = true;
 			for (uint32_t i = 0; i < e->_ndraw; i++) if (!e->_draws[i].vs) generic = false;
