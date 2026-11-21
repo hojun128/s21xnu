@@ -43,6 +43,15 @@ static void sm_cc_add(const char *fmt, ...)
 	va_list ap; va_start(ap, fmt); int n = vsnprintf(sm_cc_buf + sm_cc_len, sizeof sm_cc_buf - sm_cc_len, fmt, ap); va_end(ap);
 	if (n > 0) { sm_cc_len += (size_t)n < sizeof sm_cc_buf - sm_cc_len ? (size_t)n : 0; sm_cc_buf[sm_cc_len++] = '\n'; sm_cc_buf[sm_cc_len] = 0; }
 }
+/* line-draw details, recorded at draw time (sm_cc_buf restarts with each frame burst at commit) */
+static char sm_ccl_buf[4096]; static size_t sm_ccl_len;
+static void sm_ccl_add(const char *fmt, ...) __printflike(1, 2);
+static void sm_ccl_add(const char *fmt, ...)
+{
+	if (sm_ccl_len > sizeof sm_ccl_buf - 200) return;
+	va_list ap; va_start(ap, fmt); int n = vsnprintf(sm_ccl_buf + sm_ccl_len, sizeof sm_ccl_buf - sm_ccl_len, fmt, ap); va_end(ap);
+	if (n > 0) { sm_ccl_len += (size_t)n < sizeof sm_ccl_buf - sm_ccl_len ? (size_t)n : 0; sm_ccl_buf[sm_ccl_len++] = '\n'; sm_ccl_buf[sm_ccl_len] = 0; }
+}
 
 /* Lines worth keeping are also collected here and replayed at the end of a test run: the 128 KiB pmsg ring
  * otherwise loses them under the thumbnails (run53). */
@@ -2117,6 +2126,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 	uint32_t _dcap;
 	uint32_t _ndraw, _skipped;
 	uint64_t _bufBase[31];
+	const uint8_t *_bufCpu[31], *_bufCpuBase[31];   /* CPU view of the vertex buffers (Control Center line audit) */
 	uint64_t _fbuf[31], _fbufBase[31];
 	MTLScissorRect _scissor;
 	BOOL _hasScissor;
@@ -2152,12 +2162,13 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 - (void)setFrontFacingWinding:(MTLWinding)w {}
 - (void)setVertexBuffer:(id)buf offset:(NSUInteger)off atIndex:(NSUInteger)i
 {
-	if (i < 31) { _bufBase[i] = buf ? [(SweetMTLBuffer *)buf gpuAddress] : 0; _buf[i] = buf ? _bufBase[i] + off : 0; if (buf) [_keep addObject:buf]; }
+	if (i < 31) { _bufBase[i] = buf ? [(SweetMTLBuffer *)buf gpuAddress] : 0; _buf[i] = buf ? _bufBase[i] + off : 0; if (buf) [_keep addObject:buf];
+	  _bufCpuBase[i] = buf && [buf isKindOfClass:[SweetMTLBuffer class]] ? (const uint8_t *)[(SweetMTLBuffer *)buf contents] : NULL; _bufCpu[i] = _bufCpuBase[i] ? _bufCpuBase[i] + off : NULL; }
 }
 - (void)setVertexBytes:(const void *)p length:(NSUInteger)len atIndex:(NSUInteger)i
 {
-	uint64_t va = sm_ring_put(p, len, NULL);
-	if (i < 31) { _bufBase[i] = 0; _buf[i] = va; }
+	uint8_t *c = NULL; uint64_t va = sm_ring_put(p, len, &c);
+	if (i < 31) { _bufBase[i] = 0; _buf[i] = va; _bufCpuBase[i] = NULL; _bufCpu[i] = va ? c : NULL; }
 }
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i
 {
@@ -2181,7 +2192,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 {
 	if (i < 31) { _fbufBase[i] = buf ? [(SweetMTLBuffer *)buf gpuAddress] : 0; _fbuf[i] = buf ? _fbufBase[i] + off : 0; if (buf) [_keep addObject:buf]; }
 }
-- (void)setVertexBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i { if (i < 31 && _bufBase[i]) _buf[i] = _bufBase[i] + off; }
+- (void)setVertexBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i { if (i < 31 && _bufBase[i]) { _buf[i] = _bufBase[i] + off; if (_bufCpuBase[i]) _bufCpu[i] = _bufCpuBase[i] + off; } }
 - (void)setFragmentBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i { if (i < 31 && _fbufBase[i]) _fbuf[i] = _fbufBase[i] + off; }
 - (void)setFragmentBytes:(const void *)p length:(NSUInteger)len atIndex:(NSUInteger)i
 {
@@ -2324,6 +2335,20 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 		r->blend_on = _pipeline->_blend[0]; r->rgb_op = _pipeline->_blend[1]; r->a_op = _pipeline->_blend[2];
 		r->rgb_sf = _pipeline->_blend[3]; r->rgb_df = _pipeline->_blend[4]; r->a_sf = _pipeline->_blend[5]; r->a_df = _pipeline->_blend[6];
 		r->wmask = _pipeline->_blend[7];
+	}
+	if (sm_ccaudit && r->strip >= 2 && r->vs) {
+		/* Control Center line spans never appear: which vertex shader, its varyings, and the first vertex data */
+		static uint32_t nl; static uint64_t last;
+		if (sm_ns() - last > 2000000000ULL) nl = 0;
+		last = sm_ns();
+		if (nl++ < 3) {
+			uint32_t b = r->attr[0].fmt ? r->attr[0].bidx : 0; if (b > 30) b = 0;
+			const uint8_t *c = _bufCpu[b]; uint32_t w[12] = {0};
+			if (c) memcpy(w, c + (r->index_type ? 0 : (size_t)r->vstart * (r->stride[b] ? r->stride[b] : 16)), sizeof w);
+			sm_ccl_add("perf ccl vs %.40s sec%u nvar%u idx%u a0 %u/%u/%u st%u b%u", r->vs->name, r->vs->flags & 1, r->vs->nvar, r->index_type,
+			    r->attr[0].fmt, r->attr[0].off, r->attr[0].bidx, r->stride[b], b);
+			sm_ccl_add("perf ccl d %s %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", c ? "" : "nocpu", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11]);
+		}
 	}
 	for (uint32_t k = 0; k < 8; k++) {
 		SweetMTLTexture *t = _tex[k];
@@ -3844,7 +3869,7 @@ static void sm_app_tour(void)
 	}
 	/* Control Center (dashed lines along the module edges, user photo): open from the top-right corner, describe the
 	 * passes of its frames, whole-screen shot (48) and a 1:1 crop of the first module's top-left edge (30) */
-	sm_describe = 4; sm_cc_len = 0; sm_ccaudit = 1;
+	sm_describe = 4; sm_cc_len = 0; sm_ccl_len = 0; sm_ccl_buf[0] = 0; sm_ccaudit = 1;
 	sm_drag(1000, 8, 1000, 1300, 20); sleep(3);
 	sm_ccaudit = 0;
 	sm_tour_shot(48);
@@ -3852,6 +3877,7 @@ static void sm_app_tour(void)
 	sm_tour_crop(32, 120, 640, 180, 140);
 	sm_tour_crop(33, 90, 1400, 180, 140);
 	for (char *ln = sm_cc_buf; ln && *ln;) { char *nl = strchr(ln, '\n'); if (nl) *nl = 0; slog("SweetMTL: %s", ln); ln = nl ? nl + 1 : NULL; }
+	for (char *ln = sm_ccl_buf; ln && *ln;) { char *nl = strchr(ln, '\n'); if (nl) *nl = 0; slog("SweetMTL: %s", ln); ln = nl ? nl + 1 : NULL; }
 	/* video (YouTube does not play): /usr/local/bin/vtprobe now (VideoToolbox / AVAssetReader / AVPlayer on an H.264 clip),
 	 * up to 60 s, its lines from /private/var/tmp/vtprobe.txt logged as kept "perf vt" lines */
 	if (!access("/usr/local/bin/vtprobe", X_OK)) {

@@ -11,6 +11,7 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <QuartzCore/QuartzCore.h>
+#import <IOSurface/IOSurfaceRef.h>
 #include <TargetConditionals.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -93,6 +94,39 @@ static void vt_session(CMFormatDescriptionRef fd, AVAsset *asset, AVAssetTrack *
 	VTDecompressionSessionInvalidate(s); CFRelease(s);
 }
 
+
+/* run222: mediaserverd died in H264SW writing a decoded row (SIGBUS, protection failure at a page start + 0x40): does
+ * the IOSurface mapping of a video pixel buffer cover every plane? Plane ranges against the mapped region (vm_region). */
+static void pb_layout(OSType pf, int w, int h)
+{
+	char a[5];
+	CVPixelBufferRef pb = NULL;
+	NSDictionary *at = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+	CVReturn cr = CVPixelBufferCreate(NULL, w, h, pf, (__bridge CFDictionaryRef)at, &pb);
+	if (cr || !pb) { lg("pb %s %dx%d: create %d", fcc(pf, a), w, h, cr); return; }
+	IOSurfaceRef sf = CVPixelBufferGetIOSurface(pb);
+	CVPixelBufferLockBaseAddress(pb, 0);
+	uint8_t *base = sf ? IOSurfaceGetBaseAddress(sf) : CVPixelBufferGetBaseAddress(pb);
+	size_t alloc = sf ? IOSurfaceGetAllocSize(sf) : CVPixelBufferGetDataSize(pb);
+	vm_address_t ra = (vm_address_t)base; vm_size_t rs = 0; vm_region_basic_info_data_64_t bi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t on;
+	kern_return_t kr = vm_region_64(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &cnt, &on);
+	lg("pb %s %dx%d: surf %d alloc %zu planes %zu, region +%lld size %llu prot %d (kr %d)", fcc(pf, a), w, h, sf != NULL, alloc,
+	    CVPixelBufferGetPlaneCount(pb), (long long)((uint8_t *)ra - base), (unsigned long long)rs, kr ? -1 : bi.protection, kr);
+	size_t np = CVPixelBufferGetPlaneCount(pb);
+	for (size_t i = 0; i < np; i++) {
+		uint8_t *pa = CVPixelBufferGetBaseAddressOfPlane(pb, i);
+		size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, i), ph = CVPixelBufferGetHeightOfPlane(pb, i), pw = CVPixelBufferGetWidthOfPlane(pb, i);
+		long long off = (long long)(pa - base), end = off + (long long)(bpr * ph);
+		lg("pb   plane %zu: off %lld %zux%zu bpr %zu end %lld%s sf(off %zu bpr %zu h %zu)", i, off, pw, ph, bpr, end,
+		    end > (long long)rs ? " PAST MAPPING" : "", sf ? (size_t)((uint8_t *)IOSurfaceGetBaseAddressOfPlane(sf, i) - base) : 0,
+		    sf ? IOSurfaceGetBytesPerRowOfPlane(sf, i) : 0, sf ? IOSurfaceGetHeightOfPlane(sf, i) : 0);
+	}
+	size_t el = 0, er = 0, et = 0, eb = 0; CVPixelBufferGetExtendedPixels(pb, &el, &er, &et, &eb);
+	lg("pb   extended l%zu r%zu t%zu b%zu, data size %zu", el, er, et, eb, CVPixelBufferGetDataSize(pb));
+	CVPixelBufferUnlockBaseAddress(pb, 0);
+	CFRelease(pb);
+}
+
 static void probe(void)
 {
 	NSURL *u = [NSURL fileURLWithPath:@"/usr/local/share/vt/test.mp4"];
@@ -112,6 +146,9 @@ static void probe(void)
 	CMFormatDescriptionRef fd = (__bridge CMFormatDescriptionRef)fds[0];
 	CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(fd);
 	lg("video %s %dx%d, audio track %s", fcc(CMFormatDescriptionGetMediaSubType(fd), a), d.width, d.height, au ? "yes" : "no");
+	pb_layout(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, 640, 360);
+	pb_layout(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, 1280, 720);
+	pb_layout(kCVPixelFormatType_32BGRA, 640, 360);
 	for (vt_fmt = 0; vt_fmt < 4; vt_fmt++) vt_session(fd, asset, tr, false);
 	vt_fmt = 1; vt_session(fd, asset, tr, true);
 	{

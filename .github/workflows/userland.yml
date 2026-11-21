@@ -28,7 +28,7 @@ jobs:
             n=$(basename "$f" .m)
             xcrun clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -fobjc-arc \
               -framework Foundation -framework Metal -framework IOKit -framework AVFoundation -framework CoreMedia \
-              -framework VideoToolbox -framework CoreVideo -framework QuartzCore "$f" -o "out/$n"
+              -framework VideoToolbox -framework CoreVideo -framework QuartzCore -framework IOSurface "$f" -o "out/$n"
             codesign -f -s - "out/$n"
           done
           mkdir -p out/SweetMetal.bundle
