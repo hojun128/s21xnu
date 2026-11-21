@@ -701,7 +701,7 @@
 +		const struct sweet_surface_plane *pl = &s->planes[i];
 +		put32(p, 0x00, pl->width);
 +		put32(p, 0x04, pl->height);
-+		put32(p, 0x08, pl->bytesPerRow);
++		put32(p, 0x10, pl->bytesPerRow);   /* IOSurfaceClient + 0xe0 + 0x80 * plane */
 +		put32(p, 0x0c, pl->offset);
 +		put32(p, 0x14, pl->size);
 +		memcpy(p + 0x18, &pl->bytesPerElement, 2);
