@@ -90,6 +90,27 @@ static void slog(const char *fmt, ...)
 	}
 	if (sm_conn) IOConnectCallMethod(sm_conn, 5, NULL, 0, b, strlen(b), NULL, NULL, NULL, NULL);
 }
+/* video diagnostics printed once more at the very end of a test run, after the last thumbnails (run238: the web
+ * test's lines were pushed out of the 128 KiB ring and the kept set was already full) */
+static char sm_late_buf[10240]; static size_t sm_late_len;
+static pthread_mutex_t sm_late_mx = PTHREAD_MUTEX_INITIALIZER;
+static void sm_late(const char *fmt, ...) __printflike(1, 2);
+static void sm_late(const char *fmt, ...)
+{
+	char b[150];
+	va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+	slog("SweetMTL: %s", b);
+	pthread_mutex_lock(&sm_late_mx);
+	size_t n = strlen(b);
+	if (sm_late_len + n + 2 < sizeof sm_late_buf) { memcpy(sm_late_buf + sm_late_len, b, n); sm_late_len += n; sm_late_buf[sm_late_len++] = '\n'; sm_late_buf[sm_late_len] = 0; }
+	pthread_mutex_unlock(&sm_late_mx);
+}
+static void sm_late_dump(void)
+{
+	pthread_mutex_lock(&sm_late_mx);
+	for (char *ln = sm_late_buf; ln && *ln;) { char *nl = strchr(ln, '\n'); if (nl) *nl = 0; char b[160]; snprintf(b, sizeof b, "late: %s", ln); if (sm_conn) IOConnectCallMethod(sm_conn, 5, NULL, 0, b, strlen(b), NULL, NULL, NULL, NULL); ln = nl ? nl + 1 : NULL; }
+	pthread_mutex_unlock(&sm_late_mx);
+}
 
 
 /* ------------------------------------------------------------------ GPU core
@@ -1492,6 +1513,9 @@ static NSString *sm_match_variant(NSString *base, NSDictionary *cv)
 	static int nl;
 	if (nl++ < 40) slog("SweetMTL: %s + %lu constants -> %s (%lu mismatches)", base.UTF8String, (unsigned long)cv.count,
 	    best ? best.UTF8String : "none", (unsigned long)(best ? bestMiss : 0));
+	if ([base containsString:@"ybr"] || (best && [best containsString:@"ybr"]) || cv[@"fc_plane_count0"] && [cv[@"fc_plane_count0"] intValue] >= 2) {
+		static int ny; if (ny++ < 6) sm_late("yuv shader %s: %s miss %lu", getprogname(), best ? best.UTF8String + (strncmp(best.UTF8String, "com.apple.coreanimation.frag.", 29) ? 0 : 29) : "none", (unsigned long)(best ? bestMiss : 0));
+	}
 	if (bestMiss > 0 && best) slog("SweetMTL: near %s miss %lu", best.UTF8String + (strncmp(best.UTF8String, "com.apple.coreanimation.frag.", 29) ? 0 : 29), (unsigned long)bestMiss);
 	if (bestMiss > 0) {
 		/* no exact specialization: dump the non-zero constants so the variant can be built offline */
@@ -1916,6 +1940,10 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 	} else if (!sm_bo_import(&_store, base, (uint64_t)_bytesPerRow * _height)) return nil;
 	_surface = ios; CFRetain(ios);
 	_bo = &_store;
+	if (IOSurfaceGetPlaneCount(ios) >= 2) {   /* video frames (YUV): does the compositor ever get one? */
+		static int nv; if (nv++ < 6) { OSType f = IOSurfaceGetPixelFormat(ios); sm_late("vsurf %s id %u '%c%c%c%c' plane %lu %lux%lu bpr %lu mtl pf %lu", getprogname(), IOSurfaceGetID(ios),
+		    (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f, (unsigned long)plane, (unsigned long)_width, (unsigned long)_height, (unsigned long)_bytesPerRow, (unsigned long)_pixelFormat); }
+	}
 	static int nl; if (nl++ < (sm_is_poster(getprogname()) ? 16 : 8)) slog("SweetMTL: iosurface %u %lux%lu bpr %lu fmt %lu -> gpu %llx", IOSurfaceGetID(ios),
 	    (unsigned long)_width, (unsigned long)_height, (unsigned long)_bytesPerRow, (unsigned long)_pixelFormat, _store.gpu);
 	return self;
@@ -3945,9 +3973,9 @@ static void sm_app_tour(void)
 		slog("SweetMTL: perf vt spawn %d pid %d %s status %#x", sr, vp, done ? "exited" : "HUNG (killed after 60 s)", st);
 		FILE *f = fopen("/private/var/tmp/vtprobe.txt", "r");
 		char ln[200]; int nn = 0;
-		while (f && fgets(ln, sizeof ln, f) && nn < 40) { ln[strcspn(ln, "\n")] = 0; slog("SweetMTL: perf %s", ln); nn++; }
+		while (f && fgets(ln, sizeof ln, f) && nn < 40) { ln[strcspn(ln, "\n")] = 0; sm_late("perf %s", ln); nn++; }
 		if (f) fclose(f);
-		if (!nn) slog("SweetMTL: perf vt: no output");
+		if (!nn) sm_late("perf vt: no output");
 	}
 	/* thumbnail run208: module 1 spans x 89..544, y 380..820 of 1125x2436, the Focus module starts at y ~1132 */
 	sm_tour_crop(30, 60, 350, 180, 120);
@@ -3968,12 +3996,12 @@ static void sm_app_tour(void)
 			if (waitpid(vp, &st, WNOHANG) == vp) done = 1;
 		}
 		if (sr == 0 && !done) kill(vp, SIGKILL);
-		slog("SweetMTL: perf vt web spawn %d pid %d %s status %#x", sr, vp, done ? "exited" : "HUNG (killed after 75 s)", st);
+		sm_late("perf vt web spawn %d pid %d %s status %#x", sr, vp, done ? "exited" : "HUNG (killed after 75 s)", st);
 		FILE *f = fopen("/private/var/tmp/vtprobe.txt", "r");
 		char ln[200]; int nn = 0;
-		while (f && fgets(ln, sizeof ln, f) && nn < 90) { ln[strcspn(ln, "\n")] = 0; slog("SweetMTL: perf %s", ln); nn++; }
+		while (f && fgets(ln, sizeof ln, f) && nn < 90) { ln[strcspn(ln, "\n")] = 0; sm_late("perf %s", ln); nn++; }
 		if (f) fclose(f);
-		if (!nn) slog("SweetMTL: perf vt web: no output");
+		if (!nn) sm_late("perf vt web: no output");
 		sm_drag(540, 2392, 540, 1000, 24); sleep(3);
 	}
 }
@@ -4106,6 +4134,7 @@ static void *sm_watchdog(void *arg)
 				} else {
 					slog("SweetMTL: late thumb at %lds commits=%u gpuoff=%d", (long)ts.tv_sec, c, sm_gpu_off);
 					sm_thumb_flush();   /* the home shot (22) replaces the final Safari shot: two rgb565 shots overflow the ring */
+					sm_late_dump();
 					slog("SweetMTL: last thumb taken, rebooting to recovery");   /* the kernel replays the kept lines */
 					IOConnectCallMethod(sm_conn, 7, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
 				}
