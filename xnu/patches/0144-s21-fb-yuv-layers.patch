@@ -1,0 +1,153 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -189,6 +189,7 @@
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec, task_t task);
+ 	void present(const uint8_t *rec);
++	void sweet_fb_yuv_layer(const uint8_t *rec, uint32_t layer);   /* patch 0144 */
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -511,7 +512,110 @@
+ 
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
++
++/*
++ * S21 patch 0144: 2-plane YCbCr 4:2:0 layers ('420v' video range, '420f' full range). CoreAnimation hands inline
++ * video (Safari, YouTube) to a display layer of its own; the copy below only handles 4-byte BGRA surfaces, so those
++ * layers were skipped and the video boxes stayed black (runs 238-240: WebKit played the clips, frames decoded).
++ * Converted on the CPU with nearest-neighbour scaling from the layer's source rect (a) to its destination rect (b),
++ * after the BGRA layers (no blending here: the video is drawn last). BT.601 below 720 lines, BT.709 from 720.
++ * Boot-arg sweetfbyuv=0: such layers are skipped as before.
++ */
++static int sweet_fb_yuv_on = -1;
++static uint32_t sweet_fb_yuv_logged;
++
++static bool
++sweet_fb_is_yuv(SweetSurface *s)
++{
++	if (sweet_fb_yuv_on < 0) {
++		int v = 1;
++		PE_parse_boot_argn("sweetfbyuv", &v, sizeof(v));
++		sweet_fb_yuv_on = v != 0;
++	}
++	return sweet_fb_yuv_on && s->planeCount == 2 && (s->pixelFormat == 0x34323076U || s->pixelFormat == 0x34323066U);
++}
+ 
++static inline uint8_t
++sweet_fb_clamp8(int v)
++{
++	return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v;
++}
++
++void
++AppleCLCD::sweet_fb_yuv_layer(const uint8_t *rec, uint32_t layer)
++{
++	SweetSurface *s = sweet_surface_copy(get32(rec, 0x54 + 4 * layer));
++	if (s == NULL) {
++		return;
++	}
++	const uint8_t *a = rec + 0x64 + 16 * layer;
++	const uint8_t *b = rec + 0xc4 + 16 * layer;
++	const struct sweet_surface_plane *py = &s->planes[0], *pc = &s->planes[1];
++	int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4), sw = (int32_t)get32(a, 8), sh = (int32_t)get32(a, 12);
++	int32_t dx = (int32_t)get32(b, 0) - fOffX, dy = (int32_t)get32(b, 4) - fOffY, dw = (int32_t)get32(b, 8), dh = (int32_t)get32(b, 12);
++	uintptr_t base = s->kernelAddress();
++	uint64_t len = s->memory != NULL ? s->memory->getLength() : 0;
++	if (sw <= 0 || sh <= 0) {
++		sx = sy = 0;
++		sw = (int32_t)py->width;
++		sh = (int32_t)py->height;
++	}
++	if (sx < 0 || sy < 0 || sx + sw > (int32_t)py->width || sy + sh > (int32_t)py->height) {
++		sx = sy = 0;
++		sw = (int32_t)py->width;
++		sh = (int32_t)py->height;
++	}
++	bool ok = base != 0 && dw > 0 && dh > 0 && sw > 0 && sh > 0 && fPixels != 0 &&
++	    (uint64_t)py->offset + (uint64_t)py->bytesPerRow * py->height <= len &&
++	    (uint64_t)pc->offset + (uint64_t)pc->bytesPerRow * pc->height <= len &&
++	    pc->width * 2 >= py->width && pc->height * 2 >= py->height;
++	uint64_t t0 = mach_absolute_time();
++	if (ok) {
++		bool full = s->pixelFormat == 0x34323066U, hd = py->height >= 720;
++		/* x256 coefficients: Y scale, Cr->R, Cb->G, Cr->G, Cb->B */
++		int ky = full ? 256 : 298, yo = full ? 0 : 16;
++		int crr = hd ? (full ? 403 : 459) : (full ? 359 : 409);
++		int cbg = hd ? (full ? 48 : 55) : (full ? 88 : 100);
++		int crg = hd ? (full ? 120 : 136) : (full ? 183 : 208);
++		int cbb = hd ? (full ? 475 : 541) : (full ? 454 : 516);
++		const uint8_t *yb = (const uint8_t *)base + py->offset, *cb = (const uint8_t *)base + pc->offset;
++		uint32_t xstep = (uint32_t)(((uint64_t)sw << 16) / (uint32_t)dw), ystep = (uint32_t)(((uint64_t)sh << 16) / (uint32_t)dh);
++		int32_t x0 = dx < 0 ? -dx : 0, y0 = dy < 0 ? -dy : 0;
++		int32_t x1 = dw, y1 = dh;
++		if (dx + x1 > (int32_t)fWidth) {
++			x1 = (int32_t)fWidth - dx;
++		}
++		if (dy + y1 > (int32_t)fHeight) {
++			y1 = (int32_t)fHeight - dy;
++		}
++		for (int32_t y = y0; y < y1; y++) {
++			uint32_t syy = (uint32_t)sy + (uint32_t)(((uint64_t)y * ystep) >> 16);
++			const uint8_t *yr = yb + (uint64_t)syy * py->bytesPerRow;
++			const uint8_t *cr = cb + (uint64_t)(syy >> 1) * pc->bytesPerRow;
++			uint32_t *out = (uint32_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes) + dx;
++			uint32_t fx = (uint32_t)x0 * xstep;
++			for (int32_t x = x0; x < x1; x++, fx += xstep) {
++				uint32_t sxx = (uint32_t)sx + (fx >> 16);
++				int Y = ((int)yr[sxx] - yo) * ky;
++				int U = (int)cr[(sxx & ~1U)] - 128, V = (int)cr[(sxx & ~1U) + 1] - 128;
++				int R = (Y + crr * V + 128) >> 8, G = (Y - cbg * U - crg * V + 128) >> 8, B = (Y + cbb * U + 128) >> 8;
++				out[x] = 0xFF000000U | ((uint32_t)sweet_fb_clamp8(R) << 16) | ((uint32_t)sweet_fb_clamp8(G) << 8) | sweet_fb_clamp8(B);
++			}
++		}
++	}
++	if (sweet_fb_yuv_logged < 8 || (ok && (sweet_fb_yuv_logged % 900) == 0)) {
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		char line[176];
++		snprintf(line, sizeof(line), "fb yuv layer %u %c%c%c%c %ux%u (uv %ux%u) src %d,%d %dx%d -> %d,%d %dx%d %s %llu us",
++		    layer, (char)(s->pixelFormat >> 24), (char)(s->pixelFormat >> 16), (char)(s->pixelFormat >> 8), (char)s->pixelFormat,
++		    py->width, py->height, pc->width, pc->height, sx, sy, sw, sh, dx, dy, dw, dh, ok ? "drawn" : "SKIPPED", ns / 1000);
++		sweet_mali_log_str(line);
++	}
++	sweet_fb_yuv_logged++;
++	s->release();
++}
++
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+@@ -615,6 +719,7 @@
+ 	}
+ 
+ 	uint32_t gpu_layers = 0, cpu_layers = 0;
++	uint32_t yuv_mask = 0;          /* patch 0144: YCbCr layers, drawn after the others */
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -638,6 +743,11 @@
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
++		if (sweet_fb_is_yuv(s)) {
++			yuv_mask |= 1u << layer;
++			s->release();
++			continue;
++		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+@@ -702,6 +812,11 @@
+ 			}
+ 		}
+ 		s->release();
++	}
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if (yuv_mask & (1u << layer)) {
++			sweet_fb_yuv_layer(rec, layer);
++		}
+ 	}
+ 	/* S21: report what reaches the panel (pmsg survives the autorec reboot): first presents, then every 600th */
+ 	if ((++sweet_fb_presents <= 6 || (sweet_fb_presents % 600) == 0) && fPixels != 0) {
