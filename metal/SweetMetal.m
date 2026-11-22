@@ -105,6 +105,9 @@ static void sm_late(const char *fmt, ...)
 	if (sm_late_len + n + 2 < sizeof sm_late_buf) { memcpy(sm_late_buf + sm_late_len, b, n); sm_late_len += n; sm_late_buf[sm_late_len++] = '\n'; sm_late_buf[sm_late_len] = 0; }
 	pthread_mutex_unlock(&sm_late_mx);
 }
+/* backboardd during the web video test (`vtprobe web`): what CoreAnimation asks for while Safari's video plays */
+static volatile int sm_webwin;
+static volatile uint32_t sm_ww_draws, sm_ww_yuvtex, sm_ww_yuvbind, sm_ww_fn, sm_ww_pipe, sm_ww_views;
 static void sm_late_dump(void)
 {
 	pthread_mutex_lock(&sm_late_mx);
@@ -1541,6 +1544,7 @@ static NSString *sm_match_variant(NSString *base, NSDictionary *cv)
 - (id)newFunctionWithName:(NSString *)name
 {
 	SweetMTLFunction *f = [SweetMTLFunction new]; f.name = name;
+	if (sm_webwin && sm_ww_fn++ < 24) sm_late("webwin fn %.100s", name.UTF8String);
 	slog("SweetMTL: function %s -> %s", name.UTF8String, sm_find(name) ? "translated" : "NOT in pack");
 	return f;
 }
@@ -1548,6 +1552,7 @@ static NSString *sm_match_variant(NSString *base, NSDictionary *cv)
 {
 	if (err) *err = nil;
 	NSString *use = (sp && sm_find(sp)) ? sp : name;
+	if (sm_webwin && sm_ww_fn++ < 24) sm_late("webwin fn %.60s sp %.60s -> %s", name.UTF8String, sp ? sp.UTF8String : "-", sm_find(use) ? "pack" : "MISSING");
 	if (use == name && !sm_find(name) && cv) {
 		NSString *v = sm_match_variant(name, sm_fc_read(cv));
 		if (v) use = v;
@@ -1844,6 +1849,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 	memcpy(_swz, src->_swz, 4);
 	if (sm_astc(src->_pixelFormat, NULL, NULL) && !sm_astc(pf, NULL, NULL)) _pixelFormat = src->_pixelFormat;   /* decoded store stays BGRA8 */
 	_bo = &_store;
+	if (sm_webwin && sm_ww_views++ < 12) sm_late("webwin view %lux%lu pf%lu -> pf%lu", (unsigned long)_width, (unsigned long)_height, (unsigned long)src->_pixelFormat, (unsigned long)pf);
 	static int nl; if (nl++ < 8) slog("SweetMTL: texture view %lux%lu pf%lu -> pf%lu", (unsigned long)_width, (unsigned long)_height, (unsigned long)src->_pixelFormat, (unsigned long)pf);
 	return self;
 }
@@ -1950,6 +1956,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 	} else if (!sm_bo_import(&_store, base, (uint64_t)_bytesPerRow * _height)) return nil;
 	_surface = ios; CFRetain(ios);
 	_bo = &_store;
+	if (_pixelFormat == 500 && sm_webwin) sm_ww_yuvtex++;
 	if (_pixelFormat == 500 && plane == 0 && IOSurfaceGetPlaneCount(ios) >= 2 && !getenv("SWEET_NO_YUV"))
 		_chroma = [[SweetMTLTexture alloc] initWithDevice:dev pf:30 iosurface:ios plane:1];
 	if (IOSurfaceGetPlaneCount(ios) >= 2) {   /* video frames (YUV): does the compositor ever get one? */
@@ -2225,6 +2232,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 		 * fixed_frag_*: plane_count 2). Luma at 3/4 also fills 5/6 with the chroma plane; a pf 500 texture bound
 		 * at 5/6 itself stands for its chroma. */
 		SweetMTLTexture *c = [(SweetMTLTexture *)t sm_chroma];
+		sm_ww_yuvbind++;
 		static int nb; if (nb++ < 12) sm_late("yuv bind %s slot %lu %lux%lu chroma %s", getprogname(), (unsigned long)i, (unsigned long)[t width], (unsigned long)[t height], c ? "yes" : "no");
 		if (c && (i == 5 || i == 6)) t = c;
 		else if (c && (i == 3 || i == 4)) { _tex[i + 2] = c; [_keep addObject:c]; }
@@ -2265,6 +2273,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)it indexBuffer:(id)ib indexBufferOffset:(NSUInteger)off
 {
+	if (sm_webwin) sm_ww_draws++;
 	sm_drawrec *r = [self sm_record:type];
 	if (!r) return;
 	r->vcount = (uint32_t)count;
@@ -2288,6 +2297,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 }
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
 {
+	if (sm_webwin) sm_ww_draws++;
 	sm_drawrec *r = [self sm_record:type];
 	if (!r) return;
 	r->vcount = (uint32_t)count; r->vstart = (uint32_t)start;
@@ -4009,6 +4019,7 @@ static void sm_app_tour(void)
 	if (!access("/usr/local/bin/vtprobe", X_OK) && !access("/usr/local/share/vt/page.html", R_OK) && !getenv("SWEET_NO_WEB")) {
 		unlink("/private/var/tmp/vtprobe.txt");
 		pid_t vp = 0; char *va[] = { "vtprobe", "web", NULL }; extern char **environ;
+		sm_webwin = 1;
 		int sr = posix_spawn(&vp, "/usr/local/bin/vtprobe", NULL, NULL, va, environ);
 		int st = 0, done = 0;
 		for (int i = 0; i < 150 && sr == 0 && !done; i++) {
@@ -4018,6 +4029,8 @@ static void sm_app_tour(void)
 			if (waitpid(vp, &st, WNOHANG) == vp) done = 1;
 		}
 		if (sr == 0 && !done) kill(vp, SIGKILL);
+		sm_webwin = 0;
+		sm_late("webwin totals: draws %u, pf500 textures %u, pf500 binds %u, functions %u, pipelines %u, views %u", sm_ww_draws, sm_ww_yuvtex, sm_ww_yuvbind, sm_ww_fn, sm_ww_pipe, sm_ww_views);
 		sm_late("perf vt web spawn %d pid %d %s status %#x", sr, vp, done ? "exited" : "HUNG (killed after 75 s)", st);
 		FILE *f = fopen("/private/var/tmp/vtprobe.txt", "r");
 		char ln[200]; int nn = 0;
@@ -4466,6 +4479,7 @@ static void sm_layer_hooks(void)
 	if (err) *err = nil;
 	SweetMTLRenderPipelineState *ps = [SweetMTLRenderPipelineState new];
 	ps.vsName = d.vertexFunction.name; ps.fsName = d.fragmentFunction.name;
+	if (sm_webwin && sm_ww_pipe++ < 16) sm_late("webwin pipe vs %.50s fs %.80s", ps.vsName.UTF8String ?: "-", ps.fsName.UTF8String ?: "-");
 	ps.vs = sm_find(ps.vsName); ps.fs = sm_find(ps.fsName);
 	for (id fobj in @[ d.vertexFunction ?: (id)[NSNull null], d.fragmentFunction ?: (id)[NSNull null] ]) {
 		if (![fobj isKindOfClass:[SweetMTLFunction class]]) continue;
