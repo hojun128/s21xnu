@@ -261,12 +261,47 @@ AppleM2ScalerCSCDriverUserClient::externalMethod(uint32_t selector, IOExternalMe
 		if (r) {
 			nfail++;
 		}
-		if (nt <= 12 || (r && nfail <= 12) || (nt % 1000) == 0) {
+		/* the first 8 transfers of each calling process (run251: SpringBoard's snapshots used up a global budget) */
+		char pn[20] = "?";
+		proc_selfname(pn, sizeof(pn));
+		static char pnames[6][20];
+		static uint32_t pcount[6];
+		int slot = -1;
+		for (int i = 0; i < 6; i++) {
+			if (pnames[i][0] && !strncmp(pnames[i], pn, sizeof(pn))) {
+				slot = i;
+				break;
+			}
+			if (!pnames[i][0]) {
+				strlcpy(pnames[i], pn, sizeof(pnames[i]));
+				slot = i;
+				break;
+			}
+		}
+		bool say = slot >= 0 && ++pcount[slot] <= 8;
+		if (say || (r && nfail <= 12) || (nt % 1000) == 0) {
 			uint64_t ns = 0;
 			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 			char line[176];
-			snprintf(line, sizeof(line), "fb scaler xfer %u: %u -> %u %s (%s) %llu us, %u failed", nt, w[0], w[1], r ? "FAILED" : "done", why, ns / 1000, nfail);
+			snprintf(line, sizeof(line), "fb scaler xfer %u %.12s: %u -> %u %s (%s) %llu us, %u failed, flags %x", nt, pn, w[0], w[1], r ? "FAILED" : "done", why, ns / 1000, nfail,
+			    args->structureInputSize >= 0x24 ? w[8] : 0);
 			sweet_mali_log_str(line);
+			if (say && pcount[slot] <= 2) {
+				/* every non-zero word of the request (rects, options) */
+				int L = snprintf(line, sizeof(line), "fb scaler req %.12s:", pn);
+				for (uint32_t o = 8; o + 4 <= args->structureInputSize; o += 4) {
+					uint32_t v = w[o / 4];
+					if (!v) {
+						continue;
+					}
+					if (L > 150) {
+						sweet_mali_log_str(line);
+						L = snprintf(line, sizeof(line), "fb scaler req +");
+					}
+					L += snprintf(line + L, sizeof(line) - (size_t)L, " %03x=%x", o, v);
+				}
+				sweet_mali_log_str(line);
+			}
 		}
 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
 			args->scalarOutput[i] = 0;
