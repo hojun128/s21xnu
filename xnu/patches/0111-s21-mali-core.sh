@@ -111,6 +111,8 @@ static struct {
 
 static char mali_keep[24576];
 static uint32_t mali_keep_len;
+static char mali_keep_fb[4096];          /* display lines ("fb "): own room, the main buffer is full of dvfs/wifi by the time video plays */
+static uint32_t mali_keep_fb_len;
 static void mali_log(const char *fmt, ...) __printflike(1, 2);
 static void
 mali_log(const char *fmt, ...)
@@ -134,6 +136,13 @@ mali_log(const char *fmt, ...)
 			memcpy(mali_keep + at, line, n);
 			mali_keep[at + n] = '\n';
 		}
+	} else if (!strncmp(line, "fb ", 3)) {
+		uint32_t n = (uint32_t)strlen(line);
+		uint32_t at = (uint32_t)OSAddAtomic((SInt32)(n + 1), (volatile SInt32 *)&mali_keep_fb_len);
+		if (at + n + 1 <= sizeof(mali_keep_fb)) {
+			memcpy(mali_keep_fb + at, line, n);
+			mali_keep_fb[at + n] = '\n';
+		}
 	}
 }
 
@@ -142,6 +151,17 @@ void
 sweet_mali_keep_dump(void)
 {
 	char ln[192];
+	for (uint32_t j = 0, fe = mali_keep_fb_len < sizeof(mali_keep_fb) ? mali_keep_fb_len : (uint32_t)sizeof(mali_keep_fb); j < fe;) {
+		uint32_t n = 0;
+		while (j < fe && mali_keep_fb[j] != '\n' && n < sizeof(ln) - 4) {
+			ln[n++] = mali_keep_fb[j++];
+		}
+		ln[n] = 0;
+		j++;
+		if (n) {
+			s21_plog(ln);
+		}
+	}
 	uint32_t i = 0, end = mali_keep_len < sizeof(mali_keep) ? mali_keep_len : (uint32_t)sizeof(mali_keep);
 	while (i < end) {
 		uint32_t n = 0;

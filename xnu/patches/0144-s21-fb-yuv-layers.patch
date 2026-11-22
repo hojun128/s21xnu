@@ -8,7 +8,7 @@
  };
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
-@@ -511,7 +512,110 @@
+@@ -511,6 +512,114 @@
  
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
@@ -34,7 +34,7 @@
 +	}
 +	return sweet_fb_yuv_on && s->planeCount == 2 && (s->pixelFormat == 0x34323076U || s->pixelFormat == 0x34323066U);
 +}
- 
++
 +static inline uint8_t
 +sweet_fb_clamp8(int v)
 +{
@@ -107,19 +107,23 @@
 +		uint64_t ns = 0;
 +		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 +		char line[176];
-+		snprintf(line, sizeof(line), "fb yuv layer %u %c%c%c%c %ux%u (uv %ux%u) src %d,%d %dx%d -> %d,%d %dx%d %s %llu us",
++		uint32_t mid = 0;
++		int32_t mx = dx + dw / 2, my = dy + dh / 2;
++		if (ok && mx >= 0 && my >= 0 && mx < (int32_t)fWidth && my < (int32_t)fHeight) {
++			mid = *(const uint32_t *)(fPixels + (uint64_t)my * fRowBytes + (uint64_t)mx * 4);
++		}
++		snprintf(line, sizeof(line), "fb yuv layer %u %c%c%c%c %ux%u src %d,%d %dx%d -> %d,%d %dx%d %s %llu us mid %08x",
 +		    layer, (char)(s->pixelFormat >> 24), (char)(s->pixelFormat >> 16), (char)(s->pixelFormat >> 8), (char)s->pixelFormat,
-+		    py->width, py->height, pc->width, pc->height, sx, sy, sw, sh, dx, dy, dw, dh, ok ? "drawn" : "SKIPPED", ns / 1000);
++		    py->width, py->height, sx, sy, sw, sh, dx, dy, dw, dh, ok ? "drawn" : "SKIPPED", ns / 1000, mid);
 +		sweet_mali_log_str(line);
 +	}
 +	sweet_fb_yuv_logged++;
 +	s->release();
 +}
-+
+ 
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
-  * A swap only records the frame: copying 10 MB into the panel on every
-@@ -615,6 +719,7 @@
+@@ -615,6 +724,7 @@
  	}
  
  	uint32_t gpu_layers = 0, cpu_layers = 0;
@@ -127,19 +131,19 @@
  	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
  		uint32_t id = get32(rec, 0x54 + 4 * layer);
  		const uint8_t *a = rec + 0x64 + 16 * layer;
-@@ -638,6 +743,11 @@
- 			OSSafeReleaseNULL(s);
- 			continue;
+@@ -636,6 +746,11 @@
  		}
+ 		if (s == NULL || s == fSurface) {
+ 			OSSafeReleaseNULL(s);
++			continue;
++		}
 +		if (sweet_fb_is_yuv(s)) {
 +			yuv_mask |= 1u << layer;
 +			s->release();
-+			continue;
-+		}
+ 			continue;
+ 		}
  		uintptr_t src = s->kernelAddress();
- 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
- 		if (w <= 0 || h <= 0) {
-@@ -702,6 +812,11 @@
+@@ -702,6 +817,11 @@
  			}
  		}
  		s->release();
