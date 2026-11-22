@@ -123,15 +123,37 @@
  
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
-@@ -615,6 +724,7 @@
+@@ -615,6 +724,29 @@
  	}
  
  	uint32_t gpu_layers = 0, cpu_layers = 0;
 +	uint32_t yuv_mask = 0;          /* patch 0144: YCbCr layers, drawn after the others */
++	{
++		/* the first swaps with more than layer 0 enabled (run242: mask 7 while Safari played two videos, but the
++		 * extra layers' ids read 0): every non-zero word of the record, to find where those layers really are */
++		static uint32_t dumped;
++		if ((mask & ~1U & 0xF) != 0 && dumped < 5) {
++			dumped++;
++			char line[176];
++			int L = snprintf(line, sizeof(line), "fb rec %u mask %x:", dumped, mask);
++			for (uint32_t o = 0; o + 4 <= SWEET_FB_SWAP_REC_SIZE; o += 4) {
++				uint32_t v = get32(rec, o);
++				if (v == 0) {
++					continue;
++				}
++				if (L > 150) {
++					sweet_mali_log_str(line);
++					L = snprintf(line, sizeof(line), "fb rec %u +", dumped);
++				}
++				L += snprintf(line + L, sizeof(line) - (size_t)L, " %03x=%x", o, v);
++			}
++			sweet_mali_log_str(line);
++		}
++	}
  	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
  		uint32_t id = get32(rec, 0x54 + 4 * layer);
  		const uint8_t *a = rec + 0x64 + 16 * layer;
-@@ -638,6 +748,29 @@
+@@ -638,6 +770,29 @@
  			OSSafeReleaseNULL(s);
  			continue;
  		}
@@ -161,7 +183,7 @@
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
  		if (w <= 0 || h <= 0) {
-@@ -703,6 +836,11 @@
+@@ -703,6 +858,11 @@
  		}
  		s->release();
  	}

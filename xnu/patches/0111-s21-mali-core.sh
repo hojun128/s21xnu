@@ -111,7 +111,7 @@ static struct {
 
 static char mali_keep[24576];
 static uint32_t mali_keep_len;
-static char mali_keep_fb[4096];          /* display lines ("fb "): own room, the main buffer is full of dvfs/wifi by the time video plays */
+static char mali_keep_fb[8192];          /* display lines ("fb "): own room, the main buffer is full of dvfs/wifi by the time video plays */
 static uint32_t mali_keep_fb_len;
 static void mali_log(const char *fmt, ...) __printflike(1, 2);
 static void
