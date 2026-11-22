@@ -4690,6 +4690,15 @@ static void sm_layer_hooks(void)
 - (BOOL)supportsPublicXR10Formats { return sm_is_poster(getprogname()); }
 - (BOOL)supportsBGR10A2 { return NO; }
 - (BOOL)supportsRGBA10A2Gamma { return NO; }
+/* 8-bit 4:2:0 two-plane YCbCr (pf 500, CA's video frames '420v'/'420f'): luma R8 + chroma RG8 sibling (sm_pf_info 500,
+ * setFragmentTexture). Inherited from _MTLDevice this answered NO and CoreAnimation made the texture of every video frame
+ * but never drew it: Safari/YouTube video boxes black (runs 239-247: 180 pf500 textures, 0 binds). SWEET_NO_YCBCR=1: NO. */
+- (BOOL)supportsYCBCRFormats { static int on = -1; if (on < 0) { on = getenv("SWEET_NO_YCBCR") ? 0 : 1; slog("SweetMTL: supportsYCBCRFormats asked -> %d", on); } return on; }
+- (BOOL)supportsYCBCRFormatsXR { return NO; }
+- (BOOL)supportsYCBCRFormatsPQ { return NO; }
+- (BOOL)supportsYCBCRFormats12 { return NO; }
+- (BOOL)supportsYCBCRPackedFormatsXR { return NO; }
+- (BOOL)supportsYCBCRPackedFormatsPQ { return NO; }
 - (BOOL)supportsYCBCRPackedFormats12 { return NO; }
 - (BOOL)supportsExtendedYUVFormats { return NO; }
 - (BOOL)supportsCompressedTextureViewSPI { return NO; }
