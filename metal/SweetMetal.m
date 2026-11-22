@@ -1,6 +1,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <pthread/qos.h>
+#include <mach/mach_time.h>
 #include <objc/message.h>
 /*
  * SweetMetal.bundle: Metal driver plugin for the S21 Mali-G78 (phase 1 skeleton).
