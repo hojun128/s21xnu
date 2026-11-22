@@ -1984,6 +1984,15 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 	_surface = ios; CFRetain(ios);
 	_bo = &_store;
 	if (_pixelFormat == 500 && sm_webwin) sm_ww_yuvtex++;
+	if (pf == 500 && plane == 0 && sm_ww_on()) {
+		/* does this process see the decoded picture? average of luma / chroma bytes on a sparse grid */
+		const uint8_t *y0 = IOSurfaceGetBaseAddressOfPlane(ios, 0), *c0 = IOSurfaceGetBaseAddressOfPlane(ios, 1);
+		size_t yw = IOSurfaceGetWidthOfPlane(ios, 0), yh = IOSurfaceGetHeightOfPlane(ios, 0), yb = IOSurfaceGetBytesPerRowOfPlane(ios, 0), cb = IOSurfaceGetBytesPerRowOfPlane(ios, 1);
+		uint64_t sy = 0, sc = 0, n = 0, nz = 0;
+		for (size_t y = 0; y0 && c0 && y < yh; y += 16) for (size_t x = 0; x < yw; x += 16) { uint8_t v = y0[y * yb + x]; sy += v; nz += v != 0; sc += c0[(y / 2) * cb + (x & ~(size_t)1)]; n++; }
+		static int nl; if (nl++ < 4) sm_ww("frame surf %u seed %u luma avg %llu nonzero %llu/%llu chroma avg %llu base %p", IOSurfaceGetID(ios), IOSurfaceGetSeed(ios),
+		    n ? sy / n : 0, nz, n, n ? sc / n : 0, y0);
+	}
 	{ OSType f4 = IOSurfaceGetPixelFormat(ios);
 	  if (pf == 500 || f4 == 0x34323076 || f4 == 0x34323066 || IOSurfaceGetPlaneCount(ios) >= 2)
 		sm_ww("tex surf %u '%c%c%c%c' %zux%zu plane %lu pf %lu", IOSurfaceGetID(ios), (char)(f4 >> 24), (char)(f4 >> 16), (char)(f4 >> 8), (char)f4,
