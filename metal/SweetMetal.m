@@ -1775,6 +1775,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 - (uint32_t)maliSwizzle;
 - (uint32_t)bpp;
 - (SweetMTLTexture *)sm_chroma;
+- (IOSurfaceRef)iosurface;
 @property (atomic) uint64_t smLastUse;   /* async commits: sequence number of the last queued command buffer that uses it */
 @end
 @implementation SweetMTLTexture {
@@ -2236,6 +2237,17 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 		static int nb; if (nb++ < 12) sm_late("yuv bind %s slot %lu %lux%lu chroma %s", getprogname(), (unsigned long)i, (unsigned long)[t width], (unsigned long)[t height], c ? "yes" : "no");
 		if (c && (i == 5 || i == 6)) t = c;
 		else if (c && (i == 3 || i == 4)) { _tex[i + 2] = c; [_keep addObject:c]; }
+	}
+	if (sm_webwin && t && [t isKindOfClass:[SweetMTLTexture class]]) {
+		/* web window: every distinct IOSurface the compositor samples (what does Safari's video arrive as?) */
+		IOSurfaceRef ios = [(SweetMTLTexture *)t iosurface];
+		if (ios) {
+			static uint32_t ids[24], nids; uint32_t sid = IOSurfaceGetID(ios); bool seen = false;
+			for (uint32_t k = 0; k < nids; k++) seen |= ids[k] == sid;
+			if (!seen && nids < 24) { ids[nids++] = sid; OSType f = IOSurfaceGetPixelFormat(ios);
+				sm_late("webwin samples surface %u '%c%c%c%c' %zux%zu planes %zu slot %lu pf %lu", sid, (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f,
+				    IOSurfaceGetWidth(ios), IOSurfaceGetHeight(ios), IOSurfaceGetPlaneCount(ios), (unsigned long)i, (unsigned long)[t pixelFormat]); }
+		}
 	}
 	if (i < 8) { _tex[i] = t; if (t) [_keep addObject:t]; }
 }
@@ -2931,6 +2943,7 @@ static NSArray *sm_plan_passes(NSArray *passes, uint64_t desc_cap)
 	SweetMTLRenderEncoder *e = [SweetMTLRenderEncoder new];
 	MTLRenderPassColorAttachmentDescriptor *ca = d.colorAttachments[0];
 	e.target = (SweetMTLTexture *)ca.texture;
+	if (sm_webwin && e.target && [e.target pixelFormat] == 500) { static int nr; if (nr++ < 6) sm_late("webwin renders INTO pf500 %lux%lu", (unsigned long)[e.target width], (unsigned long)[e.target height]); }
 	e.clear = ca.loadAction == MTLLoadActionClear;
 	e.load = ca.loadAction == MTLLoadActionLoad;
 	MTLClearColor c = ca.clearColor;
@@ -4618,6 +4631,9 @@ static void sm_layer_hooks(void)
 }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)ios plane:(NSUInteger)plane
 {
+	if (sm_webwin && d.pixelFormat == 500) { static int nc; if (nc++ < 8) { OSType f = IOSurfaceGetPixelFormat(ios);
+		sm_late("webwin pf500 texture: surface %u '%c%c%c%c' %zux%zu plane %lu usage %lx storage %lu", IOSurfaceGetID(ios), (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f,
+		    IOSurfaceGetWidth(ios), IOSurfaceGetHeight(ios), (unsigned long)plane, (unsigned long)d.usage, (unsigned long)d.storageMode); } }
 	return [[SweetMTLTexture alloc] initWithDevice:self descriptor:d iosurface:ios plane:plane];
 }
 - (uint64_t)registryID { return 0x53574545; }
