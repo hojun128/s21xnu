@@ -126,7 +126,7 @@ static void sm_ww(const char *fmt, ...) __printflike(1, 2);
 static void sm_ww(const char *fmt, ...)
 {
 	static int n;
-	if (!sm_ww_on() || n >= 20 || !sm_conn) return;
+	if (!sm_ww_on() || n >= 60 || !sm_conn) return;
 	n++;
 	char b[160]; const char *pn = getprogname();
 	int L = snprintf(b, sizeof b, "ww %.10s ", pn ? pn : "?");
@@ -1804,6 +1804,42 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 - (IOSurfaceRef)iosurface;
 @property (atomic) uint64_t smLastUse;   /* async commits: sequence number of the last queued command buffer that uses it */
 @end
+
+/* backboardd: CoreAnimation makes a texture of every video frame (YCbCr pf 500) and never draws it (runs 239-252).
+ * The first such textures are handed out wrapped in this proxy, which logs every message CoreAnimation sends them
+ * ("ww backboardd yuvmsg ..."); the plug-in's own entry points unwrap it (sm_unwrap). SWEET_NO_YUVPROXY=1: off. */
+@interface SweetLogProxy : NSProxy
+@property (nonatomic, strong) id target;
+@end
+@implementation SweetLogProxy
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel { return [_target methodSignatureForSelector:sel]; }
+- (void)forwardInvocation:(NSInvocation *)inv
+{
+	static NSMutableSet *seen; static dispatch_once_t once; dispatch_once(&once, ^{ seen = [NSMutableSet new]; });
+	NSString *k = NSStringFromSelector(inv.selector); BOOL first = NO;
+	@synchronized (seen) { if (seen.count < 64 && ![seen containsObject:k]) { [seen addObject:k]; first = YES; } }
+	[inv invokeWithTarget:_target];
+	if (first) {
+		const char *ty = inv.methodSignature.methodReturnType; long long rv = 0;
+		if (inv.methodSignature.methodReturnLength && inv.methodSignature.methodReturnLength <= 8 && ty[0] != '@' && ty[0] != '{') [inv getReturnValue:&rv];
+		sm_ww("yuvmsg %.60s -> %s %llx", k.UTF8String, ty, rv);
+		static int nl; if (nl++ < 64) slog("SweetMTL: yuv proxy msg %s -> %s %llx", k.UTF8String, ty, rv);
+	}
+}
+- (BOOL)respondsToSelector:(SEL)sel
+{
+	BOOL r = [_target respondsToSelector:sel];
+	static NSMutableSet *seen; static dispatch_once_t once; dispatch_once(&once, ^{ seen = [NSMutableSet new]; });
+	NSString *k = NSStringFromSelector(sel); BOOL first = NO;
+	@synchronized (seen) { if (seen.count < 32 && ![seen containsObject:k]) { [seen addObject:k]; first = YES; } }
+	if (first) sm_ww("yuvresponds %.60s -> %d", k.UTF8String, r);
+	return r;
+}
+- (BOOL)isKindOfClass:(Class)c { return [_target isKindOfClass:c]; }
+- (BOOL)conformsToProtocol:(Protocol *)p { return [_target conformsToProtocol:p]; }
+@end
+static inline id sm_unwrap(id t) { return (t && object_getClass(t) == [SweetLogProxy class]) ? ((SweetLogProxy *)t).target : t; }
+
 @implementation SweetMTLTexture {
 	sm_bo _store; IOSurfaceRef _surface;
 	id _parent;                 /* buffer whose memory this texture aliases (newTextureWithDescriptor:offset:...) */
@@ -2279,6 +2315,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 }
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i
 {
+	t = sm_unwrap(t);
 	if (sm_is_poster(getprogname())) { static int nl; if (nl++ < 24) slog("SweetMTL: poster tex set %lu <- %s %lux%lu pf%lu", (unsigned long)i, t ? object_getClassName(t) : "nil",
 	    t ? (unsigned long)[t width] : 0, t ? (unsigned long)[t height] : 0, t ? (unsigned long)[t pixelFormat] : 0); }
 	if (t && [t isKindOfClass:[SweetMTLTexture class]] && [t pixelFormat] == 500) {
@@ -2602,6 +2639,7 @@ typedef struct {
 - (void)setComputePipelineState:(id)ps { _ps = [ps isKindOfClass:[SweetMTLComputePipelineState class]] ? ps : nil; if (ps) [_keep addObject:ps]; }
 - (void)setTexture:(id)t atIndex:(NSUInteger)i
 {
+	t = sm_unwrap(t);
 	if (i < 4) { _tex[i] = [t isKindOfClass:[SweetMTLTexture class]] ? t : nil; if (t) [_keep addObject:t]; }
 }
 - (void)setBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
@@ -2729,6 +2767,7 @@ typedef struct {
 - (void)copyFromTexture:(id)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)sz
     toTexture:(id)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO
 {
+	src = sm_unwrap(src); dst = sm_unwrap(dst);
 	[self sm_dst:dst];
 	[self sm_add:^{ [self sm_copyTex:src ss:ss sl:sl so:so sz:sz dst:dst ds:ds dl:dl dO:dO]; }];
 }
@@ -2753,6 +2792,7 @@ typedef struct {
 - (void)copyFromTexture:(id)t sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)sz
     toBuffer:(id)b destinationOffset:(NSUInteger)dof destinationBytesPerRow:(NSUInteger)dbpr destinationBytesPerImage:(NSUInteger)dbpi
 {
+	t = sm_unwrap(t);
 	{ static int nl; if (nl++ < 6) slog("SweetMTL: blit tex->buffer %lux%lu pf%lu bpr %lu", (unsigned long)sz.width, (unsigned long)sz.height, (unsigned long)[t pixelFormat], (unsigned long)dbpr); }
 	[self sm_add:^{
 		if (ss || sl || ![b respondsToSelector:@selector(contents)] || [b length] < dof + dbpr * (sz.height ? sz.height - 1 : 0) + sz.width) return;
@@ -2762,6 +2802,7 @@ typedef struct {
 - (void)copyFromTexture:(id)t sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)sz
     toBuffer:(id)b destinationOffset:(NSUInteger)dof destinationBytesPerRow:(NSUInteger)dbpr destinationBytesPerImage:(NSUInteger)dbpi options:(NSUInteger)opt
 {
+	t = sm_unwrap(t);
 	[self copyFromTexture:t sourceSlice:ss sourceLevel:sl sourceOrigin:so sourceSize:sz toBuffer:b destinationOffset:dof destinationBytesPerRow:dbpr destinationBytesPerImage:dbpi];
 }
 - (void)sm_copyTex:(id)src ss:(NSUInteger)ss sl:(NSUInteger)sl so:(MTLOrigin)so sz:(MTLSize)sz dst:(id)dst ds:(NSUInteger)ds dl:(NSUInteger)dl dO:(MTLOrigin)dO
@@ -2780,6 +2821,7 @@ typedef struct {
 }
 - (void)copyFromTexture:(id)src toTexture:(id)dst
 {
+	src = sm_unwrap(src); dst = sm_unwrap(dst);
 	[self sm_dst:dst];
 	[self copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
 	    sourceSize:MTLSizeMake(MIN([src width], [dst width]), MIN([src height], [dst height]), 1)
@@ -2996,7 +3038,7 @@ static NSArray *sm_plan_passes(NSArray *passes, uint64_t desc_cap)
 {
 	SweetMTLRenderEncoder *e = [SweetMTLRenderEncoder new];
 	MTLRenderPassColorAttachmentDescriptor *ca = d.colorAttachments[0];
-	e.target = (SweetMTLTexture *)ca.texture;
+	e.target = (SweetMTLTexture *)sm_unwrap(ca.texture);
 	if (sm_webwin && e.target && [e.target pixelFormat] == 500) { static int nr; if (nr++ < 6) sm_late("webwin renders INTO pf500 %lux%lu", (unsigned long)[e.target width], (unsigned long)[e.target height]); }
 	e.clear = ca.loadAction == MTLLoadActionClear;
 	e.load = ca.loadAction == MTLLoadActionLoad;
@@ -4688,7 +4730,11 @@ static void sm_layer_hooks(void)
 	if (sm_webwin && d.pixelFormat == 500) { static int nc; if (nc++ < 8) { OSType f = IOSurfaceGetPixelFormat(ios);
 		sm_late("webwin pf500 texture: surface %u '%c%c%c%c' %zux%zu plane %lu usage %lx storage %lu", IOSurfaceGetID(ios), (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f,
 		    IOSurfaceGetWidth(ios), IOSurfaceGetHeight(ios), (unsigned long)plane, (unsigned long)d.usage, (unsigned long)d.storageMode); } }
-	return [[SweetMTLTexture alloc] initWithDevice:self descriptor:d iosurface:ios plane:plane];
+	SweetMTLTexture *tex = [[SweetMTLTexture alloc] initWithDevice:self descriptor:d iosurface:ios plane:plane];
+	if (tex && d.pixelFormat == 500 && !getenv("SWEET_NO_YUVPROXY") && !strcmp(getprogname(), "backboardd")) {
+		static int np; if (np++ < 400) { SweetLogProxy *px = [SweetLogProxy alloc]; px.target = tex; return px; }
+	}
+	return tex;
 }
 - (uint64_t)registryID { return 0x53574545; }
 - (NSString *)vendorName { return @"ARM"; }
