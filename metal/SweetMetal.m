@@ -3954,6 +3954,28 @@ static void sm_app_tour(void)
 	sm_tour_crop(31, 80, 1095, 180, 100);
 	slog("SweetMTL: perf cc drops since boot: many %u room %u type %u instanced %u", sm_drop_many, sm_drop_room, sm_drop_type, sm_drop_inst);
 	sm_drag(540, 2392, 540, 1000, 24); sleep(3);
+	/* web video (user: "YouTube does not play" with Wi-Fi up): `vtprobe web` serves page.html + MP4 + HLS on 127.0.0.1
+	 * only and opens it in Safari; shots 56 (20 s) and 57 (45 s) show the page, its lines are logged as "perf vt: web" */
+	if (!access("/usr/local/bin/vtprobe", X_OK) && !access("/usr/local/share/vt/page.html", R_OK) && !getenv("SWEET_NO_WEB")) {
+		unlink("/private/var/tmp/vtprobe.txt");
+		pid_t vp = 0; char *va[] = { "vtprobe", "web", NULL }; extern char **environ;
+		int sr = posix_spawn(&vp, "/usr/local/bin/vtprobe", NULL, NULL, va, environ);
+		int st = 0, done = 0;
+		for (int i = 0; i < 150 && sr == 0 && !done; i++) {
+			usleep(500000);
+			if (i == 40) sm_tour_shot(56);
+			if (i == 90) sm_tour_shot(57);
+			if (waitpid(vp, &st, WNOHANG) == vp) done = 1;
+		}
+		if (sr == 0 && !done) kill(vp, SIGKILL);
+		slog("SweetMTL: perf vt web spawn %d pid %d %s status %#x", sr, vp, done ? "exited" : "HUNG (killed after 75 s)", st);
+		FILE *f = fopen("/private/var/tmp/vtprobe.txt", "r");
+		char ln[200]; int nn = 0;
+		while (f && fgets(ln, sizeof ln, f) && nn < 90) { ln[strcspn(ln, "\n")] = 0; slog("SweetMTL: perf %s", ln); nn++; }
+		if (f) fclose(f);
+		if (!nn) slog("SweetMTL: perf vt web: no output");
+		sm_drag(540, 2392, 540, 1000, 24); sleep(3);
+	}
 }
 /* Wi-Fi (kernel sweetwifi=4): wifid looks for the radio's interface once, when it starts (z3sios: "en0 must exist
  * before wifid"); our en0 appears only after the firmware is up, so a wifid that started earlier never sees it and

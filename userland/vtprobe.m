@@ -250,8 +250,158 @@ static void probe(void)
 	if (!nl) lg("msd stderr: no exception report");
 }
 
+/* ---- web test (`vtprobe web`, spawned by the plugin after the test tour): Safari plays /usr/local/share/vt/page.html,
+ * a progressive MP4 and an fMP4 HLS stream (YouTube's two ways on an iPhone without MSE), served by a tiny HTTP server
+ * bound to 127.0.0.1 only (loopback: nothing outside the phone can reach it) that lives for WEB_SECS and then exits
+ * with the probe. The page reports its media events back as GET /log?m=... */
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <objc/message.h>
+#define WEB_PORT 8321
+#define WEB_SECS 55
+static const char *web_root = "/usr/local/share/vt";
+static int web_reqs;
+static void url_decode(char *s)
+{
+	char *o = s;
+	for (; *s; s++) {
+		if (*s == '%' && s[1] && s[2]) { char h[3] = { s[1], s[2], 0 }; *o++ = (char)strtol(h, NULL, 16); s += 2; }
+		else if (*s == '+') *o++ = ' ';
+		else *o++ = *s;
+	}
+	*o = 0;
+}
+static const char *web_type(const char *p)
+{
+	const char *e = strrchr(p, '.');
+	if (!e) return "application/octet-stream";
+	if (!strcmp(e, ".html")) return "text/html; charset=utf-8";
+	if (!strcmp(e, ".mp4")) return "video/mp4";
+	if (!strcmp(e, ".m3u8")) return "application/vnd.apple.mpegurl";
+	if (!strcmp(e, ".m4s")) return "video/iso.segment";
+	return "application/octet-stream";
+}
+static void web_reply(int c, int code, const char *type, long long len, const char *extra)
+{
+	char h[512];
+	int n = snprintf(h, sizeof h, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %lld\r\nAccept-Ranges: bytes\r\n"
+	    "Cache-Control: no-store\r\nConnection: close\r\n%s\r\n", code, code == 200 ? "OK" : code == 206 ? "Partial Content" : "Not Found",
+	    type, len, extra ? extra : "");
+	write(c, h, (size_t)n);
+}
+static void *web_conn(void *arg)
+{
+	int c = (int)(intptr_t)arg;
+	char rq[4096]; int got = 0;
+	while (got < (int)sizeof rq - 1) {
+		ssize_t r = read(c, rq + got, sizeof rq - 1 - got);
+		if (r <= 0) break;
+		got += (int)r; rq[got] = 0;
+		if (strstr(rq, "\r\n\r\n")) break;
+	}
+	rq[got] = 0;
+	char meth[8] = "", path[2048] = "";
+	if (sscanf(rq, "%7s %2047s", meth, path) != 2) { close(c); return NULL; }
+	if (!strncmp(path, "/log?m=", 7)) {
+		url_decode(path + 7);
+		lg("web: %.140s", path + 7);
+		web_reply(c, 200, "text/plain", 0, NULL);
+		close(c);
+		return NULL;
+	}
+	char *q = strchr(path, '?'); if (q) *q = 0;
+	long long a = -1, b = -1;
+	char *rg = strcasestr(rq, "\r\nRange: bytes=");
+	if (rg) sscanf(rg + 15, "%lld-%lld", &a, &b);
+	if (++web_reqs <= 24) lg("web req %s %.80s range %lld-%lld", meth, path, a, b);
+	char fp[2300];
+	snprintf(fp, sizeof fp, "%s%s", web_root, !strcmp(path, "/") ? "/page.html" : path);
+	struct stat st;
+	int fd = strstr(path, "..") ? -1 : open(fp, O_RDONLY);
+	if (fd < 0 || fstat(fd, &st)) { web_reply(c, 404, "text/plain", 0, NULL); if (fd >= 0) close(fd); close(c); return NULL; }
+	long long size = st.st_size, from = 0, to = size - 1;
+	int code = 200; char ex[128] = "";
+	if (a >= 0) { from = a; if (b >= 0 && b < size) to = b; code = 206; snprintf(ex, sizeof ex, "Content-Range: bytes %lld-%lld/%lld\r\n", from, to, size); }
+	if (from > to || from >= size) { from = 0; to = -1; }
+	web_reply(c, code, web_type(fp), to - from + 1, ex);
+	if (strcmp(meth, "HEAD")) {
+		char buf[65536]; long long left = to - from + 1;
+		lseek(fd, from, SEEK_SET);
+		while (left > 0) {
+			ssize_t r = read(fd, buf, left < (long long)sizeof buf ? (size_t)left : sizeof buf);
+			if (r <= 0 || write(c, buf, (size_t)r) != r) break;
+			left -= r;
+		}
+	}
+	close(fd); close(c);
+	return NULL;
+}
+static void *web_server(void *arg)
+{
+	int s = (int)(intptr_t)arg;
+	for (;;) {
+		int c = accept(s, NULL, NULL);
+		if (c < 0) continue;
+		int one = 1; setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+		pthread_t t; if (pthread_create(&t, NULL, web_conn, (void *)(intptr_t)c)) close(c); else pthread_detach(t);
+	}
+	return NULL;
+}
+static void web_test(void)
+{
+	int s = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+	struct sockaddr_in sa = { .sin_len = sizeof sa, .sin_family = AF_INET, .sin_port = htons(WEB_PORT) };
+	sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (s < 0 || bind(s, (struct sockaddr *)&sa, sizeof sa) || listen(s, 16)) { lg("web: server failed (errno %d)", errno); return; }
+	pthread_t t; pthread_create(&t, NULL, web_server, (void *)(intptr_t)s); pthread_detach(t);
+	NSURL *u = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%d/page.html", WEB_PORT]];
+	/* Safari opens the page: LaunchServices first, FrontBoard's open-application with a payload URL second */
+	dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW);
+	Class lsw = NSClassFromString(@"LSApplicationWorkspace");
+	BOOL ok = NO; NSError *e = nil;
+	if (lsw) {
+		id ws = ((id (*)(id, SEL))objc_msgSend)(lsw, NSSelectorFromString(@"defaultWorkspace"));
+		SEL sel = NSSelectorFromString(@"openURL:withOptions:error:");
+		if (ws && [ws respondsToSelector:sel]) ok = ((BOOL (*)(id, SEL, id, id, NSError **))objc_msgSend)(ws, sel, u, nil, &e);
+	}
+	lg("web: LaunchServices open %d (%ld %s)", ok, (long)e.code, e ? e.domain.UTF8String : "-");
+	if (!ok) {
+		dlopen("/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices", RTLD_NOW);
+		Class fbs = NSClassFromString(@"FBSSystemService");
+		id svc = fbs ? ((id (*)(id, SEL))objc_msgSend)(fbs, NSSelectorFromString(@"sharedService")) : nil;
+		SEL sel = NSSelectorFromString(@"openApplication:options:withResult:");
+		if (svc && [svc respondsToSelector:sel]) {
+			__block long rc = -1; dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+			void (^done)(NSError *) = ^(NSError *er) { rc = er ? er.code : 0; dispatch_semaphore_signal(sem); };
+			((void (*)(id, SEL, id, id, id))objc_msgSend)(svc, sel, @"com.apple.mobilesafari",
+			    @{ @"__PayloadURL": u, @"__UnlockDevice": @YES, @"__ActivateSuspended": @YES }, done);
+			dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+			lg("web: FrontBoard open result %ld", rc);
+		} else lg("web: no FrontBoard service");
+	}
+	for (int i = 0; i < WEB_SECS; i++) [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:1]];
+	lg("web: done, %d requests", web_reqs);
+}
+
 int main(int argc, char **argv)
 {
+	if (argc > 1 && !strcmp(argv[1], "web")) {
+		@autoreleasepool {
+			for (int i = 0; i < 5 && !gc; i++) {
+				io_service_t sv = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("SweetMali"));
+				if (sv) IOServiceOpen(sv, mach_task_self(), 0, &gc);
+			}
+			lg("web start"); web_test();
+		}
+		return 0;
+	}
 	if (argc > 1 && !strcmp(argv[1], "now")) {   /* spawned by the plugin: probe at once, then exit */
 		@autoreleasepool { lg("probe start (now)"); probe(); lg("probe done"); }
 		return 0;
