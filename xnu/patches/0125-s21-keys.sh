@@ -179,6 +179,13 @@ sk_wait(unsigned ms)
 }
 
 static int sk_use_pwr = 1, sk_use_vol = 1;
+/*
+ * vol+ and vol- held together for 3 s (power up) = warm reboot to TWRP with the kept lines replayed
+ * into pmsg, so an interactive session can end without the 7 s force-off that clears the log.
+ * Boot-arg sweetkeyrec=0 off.
+ */
+static int sk_keyrec = 1;
+extern void sweet_reboot_recovery_ext(const char *why);
 
 static void
 sk_thread(void *arg, wait_result_t wr)
@@ -186,6 +193,7 @@ sk_thread(void *arg, wait_result_t wr)
 	(void)arg; (void)wr;
 	int state[3] = {0, 0, 0}, cand[3] = {0, 0, 0}, cnt[3] = {0, 0, 0};
 	unsigned pwr_fail = 0;
+	unsigned combo = 0;
 	for (;;) {
 		int now[3] = {state[0], state[1], state[2]};
 		if (sk_use_vol) {
@@ -230,6 +238,14 @@ sk_thread(void *arg, wait_result_t wr)
 				cand[k] = state[k];
 			}
 		}
+		if (sk_keyrec && sk_use_vol && state[1] && state[2] && !state[0]) {
+			if (++combo == 100) {
+				sk_log("keys: vol+ and vol- held 3 s, reboot to recovery");
+				sweet_reboot_recovery_ext("keys vol+ vol-");
+			}
+		} else {
+			combo = 0;
+		}
 		sk_wait(30);
 	}
 }
@@ -245,6 +261,7 @@ sweet_s21keys_start(void)
 	sk_started = 1;
 	PE_parse_boot_argn("sweets21keys", &on, sizeof(on));
 	PE_parse_boot_argn("sweets21pwr", &sk_use_pwr, sizeof(sk_use_pwr));
+	PE_parse_boot_argn("sweetkeyrec", &sk_keyrec, sizeof(sk_keyrec));
 	if (!on) {
 		sk_log("keys: off (sweets21keys=0)");
 		return -1;
