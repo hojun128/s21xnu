@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <sys/ioctl.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -222,6 +223,54 @@ static unsigned plays;
 static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
 static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 (iOS sets it once it routes there) */
 
+/*
+ * The first KEEP_MAX lines also go to the kernel's keep log (SweetMali selector 9), which is
+ * replayed into the persistent log right before a reboot to TWRP: the root file system is a RAM
+ * overlay, so /private/var/tmp/mediaserverd.err is gone after an interactive session.
+ */
+#define KEEP_MAX 48
+typedef unsigned int io_object_t_;
+extern const mach_port_t kIOMasterPortDefault;
+extern CFMutableDictionaryRef IOServiceMatching(const char *name);
+extern io_object_t_ IOServiceGetMatchingService(mach_port_t master, CFDictionaryRef matching);
+extern kern_return_t IOServiceOpen(io_object_t_ service, task_port_t owner, uint32_t type, io_object_t_ *connect);
+extern kern_return_t IOObjectRelease(io_object_t_ object);
+extern kern_return_t IOConnectCallStructMethod(mach_port_t connection, uint32_t selector,
+    const void *input, size_t input_size, void *output, size_t *output_size);
+
+static void
+keep_in_kernel(const char *line, int n)
+{
+	static io_object_t_ conn;
+	static int tried, kept;
+	if (kept >= KEEP_MAX) {
+		return;
+	}
+	if (!tried) {
+		tried = 1;
+		io_object_t_ s = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("SweetMali"));
+		if (s) {
+			if (IOServiceOpen(s, mach_task_self(), 0, &conn) != KERN_SUCCESS) {
+				conn = 0;
+			}
+			IOObjectRelease(s);
+		}
+	}
+	if (!conn) {
+		return;
+	}
+	while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
+		n--;
+	}
+	if (n > 150) {
+		n = 150;
+	}
+	if (n > 0) {
+		kept++;
+		(void)IOConnectCallStructMethod(conn, 9, line, (size_t)n, NULL, NULL);
+	}
+}
+
 static void
 say(const char *format, ...)
 {
@@ -236,6 +285,7 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+	keep_in_kernel(line, n);
 }
 
 /* The volume control's scale: a straight line of decibels over VOLUME_RANGE_DB. */

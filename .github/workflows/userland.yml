@@ -37,7 +37,7 @@ jobs:
           cp metal/Info.plist out/SweetMetal.bundle/Info.plist
           codesign -f -s - out/SweetMetal.bundle/SweetMetal
           mkdir -p out/SweetAudio.driver
-          xcrun clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -bundle -framework CoreFoundation \
+          xcrun clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -bundle -framework CoreFoundation -framework IOKit \
             audio/SweetAudio.c -o out/SweetAudio.driver/SweetAudio
           cp audio/Info.plist out/SweetAudio.driver/Info.plist
           codesign -f -s - out/SweetAudio.driver/SweetAudio
