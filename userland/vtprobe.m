@@ -362,6 +362,8 @@ static void web_test(void)
 	if (s < 0 || bind(s, (struct sockaddr *)&sa, sizeof sa) || listen(s, 16)) { lg("web: server failed (errno %d)", errno); return; }
 	pthread_t t; pthread_create(&t, NULL, web_server, (void *)(intptr_t)s); pthread_detach(t);
 	NSURL *u = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%d/page.html", WEB_PORT]];
+	/* every process's Metal plug-in logs its video work while this flag is on (SweetMali selector 16) */
+	if (gc) { uint64_t on = 1, o = 0; uint32_t oc = 1; IOConnectCallMethod(gc, 16, &on, 1, NULL, 0, &o, &oc, NULL, NULL); }
 	/* Safari opens the page: LaunchServices first, FrontBoard's open-application with a payload URL second */
 	dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW);
 	Class lsw = NSClassFromString(@"LSApplicationWorkspace");
@@ -387,6 +389,7 @@ static void web_test(void)
 		} else lg("web: no FrontBoard service");
 	}
 	for (int i = 0; i < WEB_SECS; i++) [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:1]];
+	if (gc) { uint64_t off = 0, o = 0; uint32_t oc = 1; IOConnectCallMethod(gc, 16, &off, 1, NULL, 0, &o, &oc, NULL, NULL); }
 	lg("web: done, %d requests", web_reqs);
 }
 

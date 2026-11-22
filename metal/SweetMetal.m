@@ -108,6 +108,30 @@ static void sm_late(const char *fmt, ...)
 /* backboardd during the web video test (`vtprobe web`): what CoreAnimation asks for while Safari's video plays */
 static volatile int sm_webwin;
 static volatile uint32_t sm_ww_draws, sm_ww_yuvtex, sm_ww_yuvbind, sm_ww_fn, sm_ww_pipe, sm_ww_views;
+/* every process during the web video test (kernel flag, SweetMali selector 16, set by `vtprobe web`): lines "ww <process> ..."
+ * kept by the kernel in the display keep buffer; the black video surfaces may come from Safari/WebKit, not backboardd */
+static bool sm_ww_on(void)
+{
+	static uint64_t next; static bool on;
+	uint64_t now = mach_absolute_time();
+	if (now >= next && sm_conn) {
+		uint64_t in = 2, out = 0; uint32_t oc = 1;
+		on = IOConnectCallMethod(sm_conn, 16, &in, 1, NULL, 0, &out, &oc, NULL, NULL) == KERN_SUCCESS && oc == 1 && out == 1;
+		next = now + 12000000;   /* ~0.5 s at 24 MHz */
+	}
+	return on;
+}
+static void sm_ww(const char *fmt, ...) __printflike(1, 2);
+static void sm_ww(const char *fmt, ...)
+{
+	static int n;
+	if (!sm_ww_on() || n >= 20 || !sm_conn) return;
+	n++;
+	char b[160]; const char *pn = getprogname();
+	int L = snprintf(b, sizeof b, "ww %.10s ", pn ? pn : "?");
+	va_list ap; va_start(ap, fmt); vsnprintf(b + L, sizeof b - (size_t)L, fmt, ap); va_end(ap);
+	IOConnectCallMethod(sm_conn, 5, NULL, 0, b, strlen(b), NULL, NULL, NULL, NULL);
+}
 static void sm_late_dump(void)
 {
 	pthread_mutex_lock(&sm_late_mx);
@@ -1552,6 +1576,7 @@ static NSString *sm_match_variant(NSString *base, NSDictionary *cv)
 {
 	if (err) *err = nil;
 	NSString *use = (sp && sm_find(sp)) ? sp : name;
+	sm_ww("fn %.50s sp %.50s -> %s", name.UTF8String, sp ? sp.UTF8String : "-", sm_find(use) ? "pack" : "MISSING");
 	if (sm_webwin && sm_ww_fn++ < 24) sm_late("webwin fn %.60s sp %.60s -> %s", name.UTF8String, sp ? sp.UTF8String : "-", sm_find(use) ? "pack" : "MISSING");
 	if (use == name && !sm_find(name) && cv) {
 		NSString *v = sm_match_variant(name, sm_fc_read(cv));
@@ -1958,6 +1983,10 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 	_surface = ios; CFRetain(ios);
 	_bo = &_store;
 	if (_pixelFormat == 500 && sm_webwin) sm_ww_yuvtex++;
+	{ OSType f4 = IOSurfaceGetPixelFormat(ios);
+	  if (pf == 500 || f4 == 0x34323076 || f4 == 0x34323066 || IOSurfaceGetPlaneCount(ios) >= 2)
+		sm_ww("tex surf %u '%c%c%c%c' %zux%zu plane %lu pf %lu", IOSurfaceGetID(ios), (char)(f4 >> 24), (char)(f4 >> 16), (char)(f4 >> 8), (char)f4,
+		    IOSurfaceGetWidth(ios), IOSurfaceGetHeight(ios), (unsigned long)plane, (unsigned long)pf); }
 	if (_pixelFormat == 500 && plane == 0 && IOSurfaceGetPlaneCount(ios) >= 2 && !getenv("SWEET_NO_YUV"))
 		_chroma = [[SweetMTLTexture alloc] initWithDevice:dev pf:30 iosurface:ios plane:1];
 	if (IOSurfaceGetPlaneCount(ios) >= 2) {   /* video frames (YUV): does the compositor ever get one? */
@@ -2208,7 +2237,21 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 	static int nl; if (nl++ < 4) slog("SweetMTL: pass grew to %u draw slots", nc);
 	return true;
 }
-- (void)endEncoding {}
+- (void)endEncoding
+{
+	IOSurfaceRef ts = _target ? [_target iosurface] : NULL;
+	if (ts && !(IOSurfaceGetWidth(ts) == 1125 && IOSurfaceGetHeight(ts) == 2436) && sm_ww_on()) {
+		static uint32_t seen[8], ns; uint32_t sid = IOSurfaceGetID(ts); bool k = false;
+		for (uint32_t i = 0; i < ns; i++) k |= seen[i] == sid;
+		if (!k && ns < 8) {
+			seen[ns++] = sid; OSType f = IOSurfaceGetPixelFormat(ts);
+			IOSurfaceRef t3 = _tex[3] ? [_tex[3] iosurface] : NULL; OSType g = t3 ? IOSurfaceGetPixelFormat(t3) : 0;
+			sm_ww("pass into surf %u '%c%c%c%c' %zux%zu draws %u fs %.40s t3 %u '%c%c%c%c' pf %lu", sid, (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f,
+			    IOSurfaceGetWidth(ts), IOSurfaceGetHeight(ts), _ndraw, _pipeline.fsName.UTF8String ?: "-", t3 ? IOSurfaceGetID(t3) : 0,
+			    g ? (char)(g >> 24) : '-', g ? (char)(g >> 16) : '-', g ? (char)(g >> 8) : '-', g ? (char)g : '-', _tex[3] ? (unsigned long)[_tex[3] pixelFormat] : 0);
+		}
+	}
+}
 - (void)setRenderPipelineState:(id)ps { _pipeline = ps; }
 - (void)setViewport:(MTLViewport)vp {}
 - (void)setCullMode:(MTLCullMode)m {}
@@ -2559,6 +2602,7 @@ typedef struct {
 - (void)setSamplerState:(id)s atIndex:(NSUInteger)i {}
 - (void)sm_record:(MTLSize)cnt tg:(MTLSize)t how:(const char *)how
 {
+	sm_ww("compute %.50s %lux%lu t0 pf %lu", _ps ? _ps.fnName.UTF8String : "?", (unsigned long)cnt.width, (unsigned long)cnt.height, _tex[0] ? (unsigned long)[_tex[0] pixelFormat] : 0);
 	static int nl;
 	if (nl++ < 12) slog("SweetMTL: compute %s %s count %lux%lux%lu tg %lux%lux%lu", how, _ps ? _ps.fnName.UTF8String : "?",
 	    (unsigned long)cnt.width, (unsigned long)cnt.height, (unsigned long)cnt.depth, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth);

@@ -73,6 +73,7 @@ enum {
 	kSMFence = 14,          /* GPU fence tickets of this task for the present gate: op 0 issue -> ticket, 1 done(ticket), 2 query,
 	                         * 3 tag [ticket, IOSurface ids...] (surface gate) */
 	kSMFBStats = 15,        /* framebuffer pacing counters (SweetFramebuffer.cpp sweet_fb_stats), 16 scalars */
+	kSMWebWin = 16,         /* web video test window flag for every process's Metal plug-in: in [op] 0 off, 1 on, 2 query; out [flag] */
 };
 
 /*
@@ -759,6 +760,18 @@ SweetMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			args->scalarOutput[1] = o1;
 		}
 		args->scalarOutputCount = outs < 2 ? outs : 2;
+		return kIOReturnSuccess;
+	}
+	if (selector == kSMWebWin) {
+		static volatile uint32_t sm_webwin_flag;
+		uint64_t op = args->scalarInputCount >= 1 ? args->scalarInput[0] : 2;
+		if (op == 0 || op == 1) {
+			sm_webwin_flag = (uint32_t)op;
+		}
+		if (outs >= 1) {
+			args->scalarOutput[0] = sm_webwin_flag;
+		}
+		args->scalarOutputCount = outs < 1 ? outs : 1;
 		return kIOReturnSuccess;
 	}
 	if (selector == kSMFBStats) {
