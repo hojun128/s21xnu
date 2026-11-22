@@ -36,7 +36,12 @@ jobs:
             -I$G -I$M/src/panfrost/lib -I$M/src/panfrost -I$M/include -I$M/src -I$M/src/panfrost/include -I$M/src/compiler -framework Foundation -framework IOKit -framework IOSurface -framework Metal -Wl,-U,'_OBJC_CLASS_$__MTLDevice' -Wl,-U,'_OBJC_METACLASS_$__MTLDevice' metal/SweetMetal.m metal/astc_dec.c -lz -o out/SweetMetal.bundle/SweetMetal
           cp metal/Info.plist out/SweetMetal.bundle/Info.plist
           codesign -f -s - out/SweetMetal.bundle/SweetMetal
-          ls -la out out/SweetMetal.bundle
+          mkdir -p out/SweetAudio.driver
+          xcrun clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -bundle -framework CoreFoundation \
+            audio/SweetAudio.c -o out/SweetAudio.driver/SweetAudio
+          cp audio/Info.plist out/SweetAudio.driver/Info.plist
+          codesign -f -s - out/SweetAudio.driver/SweetAudio
+          ls -la out out/SweetMetal.bundle out/SweetAudio.driver
       - uses: actions/upload-artifact@v4
         with:
           name: ios-tools

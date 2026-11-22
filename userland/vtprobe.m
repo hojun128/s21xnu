@@ -170,6 +170,19 @@ static void probe(void)
 		if ([rd startReading]) { CMSampleBufferRef sb; while (n < 30 && (sb = [o copyNextSampleBuffer])) { n++; CFRelease(sb); } }
 		lg("asset reader decoded: %d frames, status %ld, error %ld", n, (long)rd.status, (long)rd.error.code);
 	}
+#if TARGET_OS_IOS
+	{
+		/* the silent audio device (audio/SweetAudio.c): does the session get a route? */
+		AVAudioSession *as = [AVAudioSession sharedInstance];
+		NSError *e1 = nil, *e2 = nil;
+		BOOL c = [as setCategory:AVAudioSessionCategoryPlayback error:&e1];
+		BOOL a = [as setActive:YES error:&e2];
+		lg("audio session: category %d (%ld), active %d (%ld), outputs %lu, sample rate %.0f", c, (long)e1.code, a, (long)e2.code,
+		    (unsigned long)as.currentRoute.outputs.count, as.sampleRate);
+		for (AVAudioSessionPortDescription *o in as.currentRoute.outputs)
+			lg("audio session: output %s '%s' uid %s", o.portType.UTF8String, o.portName.UTF8String, o.UID.UTF8String);
+	}
+#endif
 	{
 		AVPlayerItem *it = [AVPlayerItem playerItemWithAsset:asset];
 		AVPlayerItemVideoOutput *vo = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:
@@ -223,8 +236,9 @@ static void probe(void)
 	sleep(2);
 	FILE *ef = fopen("/private/var/tmp/mediaserverd.err", "r");
 	if (!ef) { lg("msd stderr: none"); return; }
-	char ln[512]; int on = 0, nl = 0;
+	char ln[512]; int on = 0, nl = 0, na = 0;
 	while (fgets(ln, sizeof ln, ef) && nl < 40) {
+		if (strstr(ln, "sweetaudio:") && na < 16) { ln[strcspn(ln, "\n")] = 0; lg("msd: %.160s", strstr(ln, "sweetaudio:")); na++; continue; }
 		if (strstr(ln, "Terminating app") || strstr(ln, "First throw")) on = 1;
 		if (!on) continue;
 		char *q = ln, *w = ln; int sp = 0;   /* squeeze runs of blanks so a frame fits one kept line */

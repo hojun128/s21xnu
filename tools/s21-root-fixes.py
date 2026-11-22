@@ -54,12 +54,18 @@ def main(root):
     print('health dirs ready')
     # mediaserverd spun at ~50 % of a core: the virtual audio HAL plug-in cannot load without an audio device, and the
     # MediaToolbox recorder server keeps retrying (as PixOS: plug-in moved aside, recorder server off)
+    # With our silent audio device (audio/SweetAudio.c, installed by push_rootfs.sh) there is a device for it, and it is
+    # what builds the speaker route that playback needs: then the plug-in goes back.
     import glob, shutil
     hal = os.path.join(root, 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin')
-    if os.path.exists(hal):
-        dst = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled')
-        os.makedirs(dst, exist_ok=True)
-        shutil.move(hal, os.path.join(dst, 'VirtualAudio.plugin'))
+    off = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin')
+    sweet = os.path.isdir(os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL/SweetAudio.driver'))
+    if sweet and not os.path.exists(hal) and os.path.exists(off):
+        shutil.move(off, hal)
+        print('VirtualAudio.plugin back in place (SweetAudio.driver present)')
+    elif not sweet and os.path.exists(hal):
+        os.makedirs(os.path.dirname(off), exist_ok=True)
+        shutil.move(hal, off)
         print('VirtualAudio.plugin moved aside')
     # The CPU hog itself (plugin hog sampler, run200): BTAudioHALPlugin inside mediaserverd reconnects to the Bluetooth
     # daemon's XPC service from its connection-invalidated handler at once; there is no Bluetooth stack here, so each
