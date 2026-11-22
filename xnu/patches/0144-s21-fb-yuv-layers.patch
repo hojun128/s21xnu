@@ -131,27 +131,45 @@
  	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
  		uint32_t id = get32(rec, 0x54 + 4 * layer);
  		const uint8_t *a = rec + 0x64 + 16 * layer;
-@@ -636,6 +746,11 @@
- 		}
- 		if (s == NULL || s == fSurface) {
+@@ -638,6 +748,29 @@
  			OSSafeReleaseNULL(s);
-+			continue;
+ 			continue;
+ 		}
++		{
++			/* every new kind of layer (layer, format, size, element, planes) once: what CoreAnimation hands the display */
++			static uint32_t seen[24], nseen;
++			uint32_t key = (layer << 28) ^ s->pixelFormat ^ (s->width << 12) ^ s->height ^ ((uint32_t)s->planeCount << 24);
++			bool known = false;
++			for (uint32_t k = 0; k < nseen; k++) {
++				known |= seen[k] == key;
++			}
++			if (!known && nseen < 24) {
++				seen[nseen++] = key;
++				char line[176];
++				snprintf(line, sizeof(line), "fb layer %u id %u %c%c%c%c %ux%u bpr %u bpe %u ew %u eh %u planes %u a %d,%d %ux%u b %d,%d %dx%d",
++				    layer, id, (char)(s->pixelFormat >> 24), (char)(s->pixelFormat >> 16), (char)(s->pixelFormat >> 8), (char)s->pixelFormat,
++				    s->width, s->height, s->bytesPerRow, s->bytesPerElement, s->elementWidth, s->elementHeight, s->planeCount,
++				    sx, sy, get32(a, 8), get32(a, 12), dx, dy, w, h);
++				sweet_mali_log_str(line);
++			}
 +		}
 +		if (sweet_fb_is_yuv(s)) {
 +			yuv_mask |= 1u << layer;
 +			s->release();
- 			continue;
- 		}
++			continue;
++		}
  		uintptr_t src = s->kernelAddress();
-@@ -702,6 +817,11 @@
- 			}
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+@@ -703,6 +836,11 @@
  		}
  		s->release();
-+	}
+ 	}
 +	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
 +		if (yuv_mask & (1u << layer)) {
 +			sweet_fb_yuv_layer(rec, layer);
 +		}
- 	}
++	}
  	/* S21: report what reaches the panel (pmsg survives the autorec reboot): first presents, then every 600th */
  	if ((++sweet_fb_presents <= 6 || (sweet_fb_presents % 600) == 0) && fPixels != 0) {
+ 		char line[160];
