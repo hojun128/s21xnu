@@ -1706,6 +1706,9 @@ static uint32_t sm_pf_info(NSUInteger pf, uint32_t *fmt, uint32_t *swz)
 	case 10: case 11: f = MALI_R8_UNORM << 12; w = SM_SWZ(0, 4, 4, 5); b = 1; break;   /* R8Unorm(_sRGB) */
 	case 25:  f = MALI_R16F << 12; w = SM_SWZ(0, 4, 4, 5); b = 2; break;                /* R16Float */
 	case 30:  f = MALI_RG8_UNORM << 12; w = SM_SWZ(0, 1, 4, 5); b = 2; break;           /* RG8Unorm */
+	/* MTLPixelFormatYCBCR8_420_2P (private, CA's video frames '420v'/'420f'): the texture itself is the luma plane;
+	 * its chroma plane (RG8, half size) is a sibling texture bound in the shader's chroma slot (see setFragmentTexture) */
+	case 500: f = MALI_R8_UNORM << 12; w = SM_SWZ(0, 4, 4, 5); b = 1; break;
 	case 55:  f = MALI_R32F << 12; w = SM_SWZ(0, 4, 4, 5); b = 4; break;                /* R32Float */
 	case 65:  f = MALI_RG16F << 12; w = SM_SWZ(0, 1, 4, 5); b = 4; break;               /* RG16Float */
 	case 115: f = MALI_RGBA16F << 12; b = 8; break;                                      /* RGBA16Float */
@@ -1766,6 +1769,7 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 - (uint32_t)maliFormat;
 - (uint32_t)maliSwizzle;
 - (uint32_t)bpp;
+- (SweetMTLTexture *)sm_chroma;
 @property (atomic) uint64_t smLastUse;   /* async commits: sequence number of the last queued command buffer that uses it */
 @end
 @implementation SweetMTLTexture {
@@ -1780,7 +1784,9 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 	bool _junk;                 /* ASTC whose blocks are mostly the magenta error colour (broken app snapshots) */
 	int8_t _wbOK;               /* shadow write-back target writable: -1 unknown, 0 no, 1 yes */
 	bool _priv, _cpuDirty;      /* MTLStorageModePrivate: only the GPU touches it, so no cache flush unless we wrote it on the CPU */
+	SweetMTLTexture *_chroma;   /* 2-plane YCbCr surface (pf 500): plane 1 as RG8 */
 }
+- (SweetMTLTexture *)sm_chroma { return _chroma; }
 - (bool)sm_isShadowed { return _hasShadow; }
 - (bool)sm_allZero { return _allZero; }
 - (bool)sm_junk { return _junk; }
@@ -1922,8 +1928,12 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)ios plane:(NSUInteger)plane
 {
+	return [self initWithDevice:dev pf:d.pixelFormat iosurface:ios plane:plane];
+}
+- (instancetype)initWithDevice:(id)dev pf:(NSUInteger)pf iosurface:(IOSurfaceRef)ios plane:(NSUInteger)plane
+{
 	self = [super init];
-	_device = dev; _pixelFormat = d.pixelFormat;
+	_device = dev; _pixelFormat = pf;
 	_width = IOSurfaceGetWidthOfPlane(ios, plane) ?: IOSurfaceGetWidth(ios);
 	_height = IOSurfaceGetHeightOfPlane(ios, plane) ?: IOSurfaceGetHeight(ios);
 	_bytesPerRow = IOSurfaceGetBytesPerRowOfPlane(ios, plane) ?: IOSurfaceGetBytesPerRow(ios);
@@ -1940,9 +1950,12 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 	} else if (!sm_bo_import(&_store, base, (uint64_t)_bytesPerRow * _height)) return nil;
 	_surface = ios; CFRetain(ios);
 	_bo = &_store;
+	if (_pixelFormat == 500 && plane == 0 && IOSurfaceGetPlaneCount(ios) >= 2 && !getenv("SWEET_NO_YUV"))
+		_chroma = [[SweetMTLTexture alloc] initWithDevice:dev pf:30 iosurface:ios plane:1];
 	if (IOSurfaceGetPlaneCount(ios) >= 2) {   /* video frames (YUV): does the compositor ever get one? */
-		static int nv; if (nv++ < 6) { OSType f = IOSurfaceGetPixelFormat(ios); sm_late("vsurf %s id %u '%c%c%c%c' plane %lu %lux%lu bpr %lu mtl pf %lu", getprogname(), IOSurfaceGetID(ios),
-		    (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f, (unsigned long)plane, (unsigned long)_width, (unsigned long)_height, (unsigned long)_bytesPerRow, (unsigned long)_pixelFormat); }
+		static int nv; if (nv++ < 6) { OSType f = IOSurfaceGetPixelFormat(ios); sm_late("vsurf %s id %u '%c%c%c%c' plane %lu %lux%lu bpr %lu mtl pf %lu chroma %s", getprogname(), IOSurfaceGetID(ios),
+		    (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f, (unsigned long)plane, (unsigned long)_width, (unsigned long)_height, (unsigned long)_bytesPerRow, (unsigned long)_pixelFormat,
+		    _chroma ? "yes" : "no"); }
 	}
 	static int nl; if (nl++ < (sm_is_poster(getprogname()) ? 16 : 8)) slog("SweetMTL: iosurface %u %lux%lu bpr %lu fmt %lu -> gpu %llx", IOSurfaceGetID(ios),
 	    (unsigned long)_width, (unsigned long)_height, (unsigned long)_bytesPerRow, (unsigned long)_pixelFormat, _store.gpu);
@@ -2207,6 +2220,15 @@ static uint32_t sm_mtl2mali_swz(uint8_t c) { return c == 0 ? 4 : c == 1 ? 5 : c 
 {
 	if (sm_is_poster(getprogname())) { static int nl; if (nl++ < 24) slog("SweetMTL: poster tex set %lu <- %s %lux%lu pf%lu", (unsigned long)i, t ? object_getClassName(t) : "nil",
 	    t ? (unsigned long)[t width] : 0, t ? (unsigned long)[t height] : 0, t ? (unsigned long)[t pixelFormat] : 0); }
+	if (t && [t isKindOfClass:[SweetMTLTexture class]] && [t pixelFormat] == 500) {
+		/* CA's YCbCr images: img_tex_0A/1A (slots 3/4) luma, img_tex_0B/1B (slots 5/6) chroma (QuartzCore
+		 * fixed_frag_*: plane_count 2). Luma at 3/4 also fills 5/6 with the chroma plane; a pf 500 texture bound
+		 * at 5/6 itself stands for its chroma. */
+		SweetMTLTexture *c = [(SweetMTLTexture *)t sm_chroma];
+		static int nb; if (nb++ < 12) sm_late("yuv bind %s slot %lu %lux%lu chroma %s", getprogname(), (unsigned long)i, (unsigned long)[t width], (unsigned long)[t height], c ? "yes" : "no");
+		if (c && (i == 5 || i == 6)) t = c;
+		else if (c && (i == 3 || i == 4)) { _tex[i + 2] = c; [_keep addObject:c]; }
+	}
 	if (i < 8) { _tex[i] = t; if (t) [_keep addObject:t]; }
 }
 - (void)setFragmentTextures:(id const *)ts withRange:(NSRange)r
